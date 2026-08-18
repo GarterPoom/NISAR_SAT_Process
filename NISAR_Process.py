@@ -66,6 +66,11 @@ from rasterio.windows import Window
 # Import window_bounds to convert pixel-based window coordinates to geographic bounds
 from rasterio.windows import bounds as window_bounds
 
+# Import from_bounds / transform to map a destination window back to a SOURCE pixel window
+# so we can slice the HDF5 dataset instead of loading it in full for every tile
+from rasterio.windows import from_bounds as window_from_bounds
+from rasterio.windows import transform as window_transform
+
 
 # --- CONFIGURATION & CONSTANTS ---
 
@@ -212,6 +217,54 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
             
             # Yield the sub-region window to the caller
             yield Window(column_offset, row_offset, tile_width, tile_height)
+
+
+def compute_source_window(
+    dst_win_bounds: tuple[float, float, float, float],
+    src_transform: Affine,
+    src_height: int,
+    src_width: int,
+    pad: int = 2,
+) -> Window:
+    """
+    Maps a destination tile's geographic bounds back onto the SOURCE dataset's
+    pixel grid, so we can read only the small chunk of the HDF5 array that a
+    given output tile actually needs (instead of loading the whole scene).
+
+    A small pixel margin ('pad') is added on every side and the result is
+    clipped to the valid extent of the source array, so resampling near tile
+    edges still has the neighboring pixels it needs.
+
+    Args:
+        dst_win_bounds: (left, bottom, right, top) bounds of the destination tile.
+        src_transform: Affine transform of the SOURCE dataset.
+        src_height: Total height (rows) of the source dataset.
+        src_width: Total width (columns) of the source dataset.
+        pad: Extra pixels of margin to include on each side.
+
+    Returns:
+        Window: A pixel window into the source dataset (already clipped to
+        valid bounds; may have zero width/height if the tile falls entirely
+        outside the source data extent).
+    """
+    left, bottom, right, top = dst_win_bounds
+
+    # Convert the destination tile's geographic bounds into source pixel coordinates
+    raw_window = window_from_bounds(left, bottom, right, top, transform=src_transform)
+
+    # Round outward (floor/ceil) and pad, so we never end up short a pixel due to rounding
+    row_start = math.floor(raw_window.row_off) - pad
+    col_start = math.floor(raw_window.col_off) - pad
+    row_stop = math.ceil(raw_window.row_off + raw_window.height) + pad
+    col_stop = math.ceil(raw_window.col_off + raw_window.width) + pad
+
+    # Clip to the valid extent of the source array so we never index out of bounds
+    row_start = max(0, row_start)
+    col_start = max(0, col_start)
+    row_stop = min(src_height, row_stop)
+    col_stop = min(src_width, col_stop)
+
+    return Window(col_start, row_start, max(0, col_stop - col_start), max(0, row_stop - row_start))
 
 
 def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
@@ -405,7 +458,11 @@ def export_layer(
                 
                 # Create a 'Window' object defining the current rectangular sub-region of the output
                 win = Window(col_off, row_off, win_w, win_h)
-                
+
+                # Geographic bounds of this destination tile - used both to find the matching
+                # chunk of the SOURCE dataset below and later for the DEM/RTC step.
+                win_bounds = window_bounds(win, dst_transform)
+
                 # Create a buffer to hold the resampled/reprojected data for this specific tile
                 # We use float32 as a general-purpose buffer
                 tile_buffer = np.empty((win.height, win.width), dtype=np.float32)
@@ -413,14 +470,34 @@ def export_layer(
                 # --- STEP A: WINDOWED REPROJECTION (Resampling) ---
                 # This is the most important step. It pulls only the data needed for this 
                 # specific 10m window from the source HDF5 and resamples it into the buffer.
+                #
+                # NOTE: source_dataset is a plain h5py.Dataset, not a rasterio/GDAL dataset,
+                # so rasterio.warp.reproject() cannot do a lazy/windowed read on it the way it
+                # does for the DEM (rasterio.band(dem_dataset, 1)). Passing source_dataset
+                # directly forces the ENTIRE scene into memory on every tile. Instead, we work
+                # out which small slice of the source array this tile needs and read only that.
+                src_win = compute_source_window(win_bounds, transform, height, width)
+
+                if src_win.width <= 0 or src_win.height <= 0:
+                    # This destination tile falls completely outside the source data extent.
+                    # Fill with nodata and skip straight to writing this tile.
+                    db_tile = np.full((win.height, win.width), -9999.0, dtype=np.float32)
+                    dst.write(db_tile, 1, window=win)
+                    continue
+
+                # Read only the required chunk from the HDF5 dataset (cheap: a few MB, not GB)
+                source_chunk = source_dataset[src_win.toslices()]
+                # Affine transform describing just this small chunk, for src_transform below
+                src_chunk_transform = window_transform(src_win, transform)
+
                 if is_complex:
                     # If the source is complex, we must use a complex buffer during reproject
                     # to avoid losing the imaginary component before calculating intensity.
                     complex_buffer = np.empty((win.height, win.width), dtype=np.complex64)
                     reproject(
-                        source=source_dataset,
+                        source=source_chunk,
                         destination=complex_buffer,
-                        src_transform=transform,
+                        src_transform=src_chunk_transform,
                         src_crs=crs,
                         dst_transform=dst.window_transform(win), # Map to the output 10m window
                         dst_crs=crs,
@@ -431,9 +508,9 @@ def export_layer(
                 else:
                     # If the data is already real, reproject directly into the float32 buffer
                     reproject(
-                        source=source_dataset,
+                        source=source_chunk,
                         destination=tile_buffer,
-                        src_transform=transform,
+                        src_transform=src_chunk_transform,
                         src_crs=crs,
                         dst_transform=dst.window_transform(win), # Map to the output 10m window
                         dst_crs=crs,
@@ -447,9 +524,8 @@ def export_layer(
                 # --- STEP C: RADIOMETRIC TERRAIN CORRECTION (RTC) ---
                 if dem_dataset:
                     try:
-                        # Calculate the geographic bounds of the current output window
-                        win_bounds = window_bounds(win, dst_transform)
-                        
+                        # (win_bounds was already computed above, before the source read)
+
                         # Create a temporary transform for the DEM window to match the output tile
                         win_transform = rasterio.transform.from_bounds(*win_bounds, win.width, win.height)
                         
