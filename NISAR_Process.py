@@ -91,8 +91,8 @@ GSLC_GRIDS_PATH = "science/LSAR/GSLC/grids"
 # Tuple specifying which frequency band to process (e.g., L-Band frequencyA)
 FREQUENCIES = ("frequencyA",)
 
-# Tuple specifying which polarization channels to extract (e.g., HH polarization)
-POLARIZATIONS = ("HH",)
+# Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
+POLARIZATIONS = ("HH", "HV")
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
