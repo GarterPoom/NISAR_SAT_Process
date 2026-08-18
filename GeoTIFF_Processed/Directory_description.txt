@@ -1,0 +1,1 @@
+Directory for contain Raster that been processed.
