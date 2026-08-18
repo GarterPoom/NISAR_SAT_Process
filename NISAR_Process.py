@@ -303,156 +303,206 @@ def export_layer(
     source_file: Path, frequency: str, polarization: str, grid: h5py.Group, run_timestamp: str, logger: logging.Logger
 ) -> Path:
     """
-    The main orchestration function for a single layer. Handles reading, 
-    resampling, processing (Multilook/RTC), and saving to GeoTIFF.
+    Orchestrates the memory-efficient processing of a single SAR data layer.
     
+    This function uses 'Windowed Reprojection' to avoid MemoryErrors. It calculates 
+    the target 10m grid geometry first, then loops through the destination 
+    image in small tiles. For each tile, it pulls only the necessary pixels 
+    from the source HDF5, performs resampling, intensity calculation, 
+    multi-looking, terrain correction, and decibel conversion.
+
     Args:
-        source_file (Path): Path to the input HDF5/NetCDF file.
-        frequency (str): The frequency band being processed.
-        polarization (str): The polarization being processed.
-        grid (h5py.Group): The specific HDF5 group containing the grid data.
-        run_timestamp (str): Timestamp used for consistent naming in a single run.
+        source_file (Path): The path to the input HDF5/NetCDF file.
+        frequency (str): The frequency band being processed (e.g., 'frequencyA').
+        polarization (str): The polarization (e.g., 'HH').
+        grid (h5py.Group): The HDF5 group containing the raw dataset.
+        run_timestamp (str): Timestamp string to keep filenames consistent.
         logger (logging.Logger): The active logger instance.
         
     Returns:
-        Path: The path to the newly created processed GeoTIFF.
+        Path: The file path to the successfully created GeoTIFF.
     """
-    # 1. ACCESS DATA
+    # --- 1. DATA AND GEOMETRY SETUP ---
+
+    # Access the specific polarization dataset (e.g., HH) inside the HDF5 group
     source_dataset = grid[polarization]
+    
+    # Extract the Affine transform (pixel-to-coordinate mapping) and EPSG code from the HDF5 metadata
     transform, crs = coordinate_transform(grid)
+    
+    # Determine the dimensions (rows and columns) of the original source dataset
     height, width = source_dataset.shape
-    is_complex = source_dataset.dtype.kind == "c"  # Check if data is complex-valued
+    
+    # Check if the data is complex-valued (has Real and Imaginary parts)
+    is_complex = source_dataset.dtype.kind == "c"
 
-    # Calculate pixel resolution from the transform to check if resampling is needed
-    pixel_x, pixel_y = abs(transform.a), abs(transform.e)
-    # If pixels are not square or don't match TARGET_PIXEL_SIZE, we must resample
-    needs_resample = not math.isclose(pixel_x, pixel_y, rel_tol=1e-9, abs_tol=1e-6)
+    # Calculate the bounding box (left, bottom, right, top) of the original data in geographic coordinates
+    left, bottom, right, top = array_bounds(height, width, transform)
+    
+    # Calculate the new target grid (10m resolution) based on the bounding box and target pixel size
+    # dst_transform: The new pixel-to-coordinate matrix for the 10m grid
+    # dst_width/height: The total number of pixels in the final 10m output image
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        crs, crs, width, height, left, bottom, right, top, resolution=(TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE)
+    )
 
-    # 2. PRE-PROCESSING (RESAMPLING)
-    if needs_resample:
-        logger.info("Resampling to %.0f x %.0f m.", TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE)
-        full_array = source_dataset[:, :]
-        
-        # If complex, convert to intensity before resampling to reduce computation/complexity
-        if is_complex:
-            full_array = calculate_intensity(full_array)
-            is_complex = False
-            
-        # Calculate new bounding box and transform for the target resolution
-        left, bottom, right, top = array_bounds(height, width, transform)
-        dst_transform, dst_width, dst_height = calculate_default_transform(
-            crs, crs, width, height, left, bottom, right, top, resolution=(TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE)
-        )
-        
-        # Prepare destination array for resampling
-        resampled_array = np.empty((dst_height, dst_width), dtype=np.float32)
-        # Perform the reprojection/resampling using nearest neighbor to maintain signal integrity
-        reproject(
-            source=full_array, destination=resampled_array,
-            src_transform=transform, src_crs=crs,
-            dst_transform=dst_transform, dst_crs=crs,
-            resampling=Resampling.nearest,
-        )
-        # Update variables to use the resampled state for the rest of the function
-        source_dataset = resampled_array
-        transform = dst_transform
-        height, width = dst_height, dst_width
+    # --- 2. OUTPUT FILE PREPARATION ---
 
-    # 3. FILE SETUP
-    # Construct filename: [original]_frequency_polarization_Processed_dB_timestamp.tif
+    # Construct the final filename using the source name and processing parameters
     out_filename = f"{source_file.stem}_{frequency}_{polarization}_Processed_dB_{run_timestamp}.tif"
+    
+    # Define the path where the final GeoTIFF will be stored
     out_path = PROCESSED_DIRECTORY / out_filename
-    # Use a temporary file name to ensure that if the script crashes, we don't leave a broken .tif
+    
+    # Create a temporary filename to prevent file corruption if the script crashes mid-process
     temp_path = out_path.with_suffix(".part.tif")
     
+    # Delete the temporary file if it already exists from a previous failed attempt
     if temp_path.exists():
         temp_path.unlink()
 
-    # Define GeoTIFF profile (metadata, compression, tiling)
+    # Define the GeoTIFF writing profile (metadata and compression settings)
     profile = {
-        "driver": "GTiff", "width": width, "height": height, "count": 1,
-        "dtype": "float32", "crs": crs, "transform": transform, "nodata": -9999.0,
-        "tiled": True, "blockxsize": TILE_SIZE, "blockysize": TILE_SIZE,
-        "compress": "deflate", "predictor": 3, "BIGTIFF": "IF_SAFER",
+        "driver": "GTiff",                # Use the GeoTIFF file format
+        "width": dst_width,               # Width of the final output image
+        "height": dst_height,             # Height of the final output image
+        "count": 1,                       # Number of bands (we are only producing 1 band: dB)
+        "dtype": "float32",               # Use 32-bit floating point numbers for precision
+        "crs": crs,                       # The coordinate reference system of the output
+        "transform": dst_transform,        # The 10m resolution transform matrix
+        "nodata": -9999.0,                # Set the value used to represent "no data" or nulls
+        "tiled": True,                    # Enable internal tiling for faster GIS loading
+        "blockxsize": TILE_SIZE,          # Size of internal tiles (512 pixels)
+        "blockysize": TILE_SIZE,          # Size of internal tiles (512 pixels)
+        "compress": "deflate",            # Use DEFLATE compression to save disk space
+        "predictor": 3,                   # Use horizontal differencing (improves compression for floats)
+        "BIGTIFF": "IF_SAFER",            # Support files larger than 4GB
     }
 
-    # Open DEM if it exists for the RTC step
+    # Attempt to open the Digital Elevation Model (DEM) if the file path exists
     dem_dataset = None
     if LOCAL_DEM_PATH.exists():
         dem_dataset = rasterio.open(LOCAL_DEM_PATH)
     else:
         logger.warning(f"DEM not found at {LOCAL_DEM_PATH}. RTC step will be skipped.")
 
-    # Calculate total number of tiles for progress tracking
-    total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
+    # --- 3. THE WINDOWED PROCESSING LOOP (The Memory-Saving Part) ---
 
-    # 4. TILE-BASED PROCESSING LOOP
+    # Open the temporary destination file for writing
     with rasterio.open(temp_path, "w", **profile) as dst:
+        
+        # Set a description for the first band in the GeoTIFF metadata
         dst.set_band_description(1, f"{frequency} {polarization} Intensity Multilook RTC dB")
 
-        for tile_num, window in enumerate(source_windows(height, width), start=1):
-            # Read a small chunk (window) of the data from the source
-            tile_data = source_dataset[window.row_off:window.row_off+window.height, 
-                                       window.col_off:window.col_off+window.width]
-            
-            # Step A: Intensity calculation (if data is still complex)
-            if is_complex:
-                intensity_tile = calculate_intensity(tile_data)
-            else:
-                intensity_tile = tile_data
+        # We iterate through the DESTINATION (output) grid in chunks (Tiles)
+        # This ensures we only ever have ONE tile in memory at a time
+        for row_off in range(0, dst_height, TILE_SIZE):
+            for col_off in range(0, dst_width, TILE_SIZE):
+                
+                # Determine the window size for the current tile (handling the edges of the image)
+                win_h = min(TILE_SIZE, dst_height - row_off)
+                win_w = min(TILE_SIZE, dst_width - col_off)
+                
+                # Create a 'Window' object defining the current rectangular sub-region of the output
+                win = Window(col_off, row_off, win_w, win_h)
+                
+                # Create a buffer to hold the resampled/reprojected data for this specific tile
+                # We use float32 as a general-purpose buffer
+                tile_buffer = np.empty((win.height, win.width), dtype=np.float32)
 
-            # Step B: Multi-looking (Speckle Filtering)
-            ml_tile = apply_multilook(intensity_tile, looks=5)
-
-            # Step C: Radiometric Terrain Correction (RTC)
-            if dem_dataset:
-                try:
-                    # Calculate geographic bounds for the current tile
-                    win_bounds = window_bounds(window, transform)
-                    # Create a local transform for the DEM window
-                    win_transform = rasterio.transform.from_bounds(*win_bounds, window.width, window.height)
-                    dem_tile = np.empty((window.height, window.width), dtype=np.float32)
-
-                    # Reproject/Sample only the piece of the DEM required for this tile
+                # --- STEP A: WINDOWED REPROJECTION (Resampling) ---
+                # This is the most important step. It pulls only the data needed for this 
+                # specific 10m window from the source HDF5 and resamples it into the buffer.
+                if is_complex:
+                    # If the source is complex, we must use a complex buffer during reproject
+                    # to avoid losing the imaginary component before calculating intensity.
+                    complex_buffer = np.empty((win.height, win.width), dtype=np.complex64)
                     reproject(
-                        source=rasterio.band(dem_dataset, 1),
-                        destination=dem_tile,
-                        dst_transform=win_transform,
+                        source=source_dataset,
+                        destination=complex_buffer,
+                        src_transform=transform,
+                        src_crs=crs,
+                        dst_transform=dst.window_transform(win), # Map to the output 10m window
                         dst_crs=crs,
-                        resampling=Resampling.bilinear
+                        resampling=Resampling.nearest,         # Use nearest neighbor for raw data
                     )
-                    # Apply the terrain correction formula
-                    rtc_tile = apply_rtc(ml_tile, dem_tile, abs(transform.a), abs(transform.e))
-                except Exception as e:
-                    # If RTC fails (e.g. coordinate mismatch), fall back to uncorrected intensity
-                    logger.debug(f"RTC failed on tile {tile_num}: {e}. Using uncorrected intensity.")
+                    # Convert the complex buffer into intensity (Real^2 + Imag^2)
+                    tile_buffer = calculate_intensity(complex_buffer)
+                else:
+                    # If the data is already real, reproject directly into the float32 buffer
+                    reproject(
+                        source=source_dataset,
+                        destination=tile_buffer,
+                        src_transform=transform,
+                        src_crs=crs,
+                        dst_transform=dst.window_transform(win), # Map to the output 10m window
+                        dst_crs=crs,
+                        resampling=Resampling.nearest,
+                    )
+
+                # --- STEP B: MULTI-LOOKING (Speckle Reduction) ---
+                # Apply the spatial averaging filter to reduce SAR salt-and-pepper noise
+                ml_tile = apply_multilook(tile_buffer, looks=5)
+
+                # --- STEP C: RADIOMETRIC TERRAIN CORRECTION (RTC) ---
+                if dem_dataset:
+                    try:
+                        # Calculate the geographic bounds of the current output window
+                        win_bounds = window_bounds(win, dst_transform)
+                        
+                        # Create a temporary transform for the DEM window to match the output tile
+                        win_transform = rasterio.transform.from_bounds(*win_bounds, win.width, win.height)
+                        
+                        # Create an empty buffer for the DEM data required for this tile
+                        dem_tile = np.empty((win.height, win.width), dtype=np.float32)
+
+                        # Pull only the necessary chunk of the DEM for this tile
+                        reproject(
+                            source=rasterio.band(dem_dataset, 1),
+                            destination=dem_tile,
+                            dst_transform=win_transform,
+                            dst_crs=crs,
+                            resampling=Resampling.bilinear
+                        )
+                        
+                        # Adjust intensity based on the local terrain slope to correct for shadows
+                        rtc_tile = apply_rtc(ml_tile, dem_tile, abs(dst_transform.a), abs(dst_transform.e))
+                    except Exception as e:
+                        # If math or coordinate errors occur during RTC, use the unfiltered tile
+                        logger.debug(f"RTC failed on tile at {row_off},{col_off}: {e}. Using uncorrected intensity.")
+                        rtc_tile = ml_tile
+                else:
+                    # If no DEM is available, skip RTC and use the multi-looked tile
                     rtc_tile = ml_tile
-            else:
-                rtc_tile = ml_tile
 
-            # Step D: Convert to Decibels
-            db_tile = convert_to_decibels(rtc_tile)
-            # Handle non-finite numbers (inf/nan) by setting them to the designated nodata value
-            db_tile = np.where(np.isfinite(db_tile), db_tile, -9999.0)
-            
-            # Write the processed tile to the destination file
-            dst.write(db_tile.astype(np.float32), 1, window=window)
+                # --- STEP D: DECIBEL CONVERSION ---
+                # Convert the linear intensity values to the logarithmic Decibel (dB) scale
+                db_tile = convert_to_decibels(rtc_tile)
+                
+                # Replace any non-finite numbers (like Infinity or NaN) with the designated 'nodata' value
+                db_tile = np.where(np.isfinite(db_tile), db_tile, -9999.0)
+                
+                # --- STEP E: WRITE TO DISK ---
+                # Write the finished, processed 10m tile into the destination GeoTIFF file
+                dst.write(db_tile.astype(np.float32), 1, window=win)
 
-            # Progress reporting
-            if tile_num == total_tiles or tile_num % max(1, total_tiles // 10) == 0:
-                logger.info("%s/%s progress: %.0f%% (%d/%d tiles)", frequency, polarization, 100 * tile_num / total_tiles, tile_num, total_tiles)
-
-        # Build pyramid overviews (the low-resolution versions used for fast zooming)
+        # Build overview/pyramid levels (low-res versions) for fast zooming in GIS software
         dst.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+        
+        # Add metadata tags to the file so GIS software knows how the overviews were built
         dst.update_tags(ns="rio_overview", resampling="average")
 
-    # Close the DEM file if it was opened
+    # Close the DEM file connection to free up system resources
     if dem_dataset:
         dem_dataset.close()
 
-    # Move the temp file to the final destination name
+    # Rename the temporary '.part.tif' file to the final intended filename
     os.replace(temp_path, out_path)
+    
+    # Log the completion of this specific layer
     logger.info("Created Processed dB GeoTIFF: %s", out_path)
+    
+    # Return the path to the finished file
     return out_path
 
 
