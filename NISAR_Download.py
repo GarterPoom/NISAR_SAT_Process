@@ -41,8 +41,8 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g. for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = "armless"  # NASA Earthdata login usernamelm
-    EARTHDATA_PASSWORD = "&EVoNknIDc0!n4nd*!rQV@Xyr5r8PX550cFzVKi&"  # NASA Earthdata login password
+    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"  # NASA Earthdata login usernamelm
+    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"  # NASA Earthdata login password
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved
