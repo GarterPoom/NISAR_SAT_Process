@@ -112,17 +112,21 @@ All settings live in the `Config` class at the top of the file:
 
 ```python
 class Config:
-    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"
-    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"
+    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"  # NASA Earthdata login username.                                   
+    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"  # NASA Earthdata login password.
 
-    LOG_DIRECTORY = "NISAR_Download_logs"
-    OUTPUT_DIRECTORY = "NISAR_Product"
+    LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
+    OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
 
-    AOI_SHAPEFILE = r"Thailand_Admin\L05_Province_ESRI_2559.shp"
+    # Build the full path relative to that directory
+    AOI_SHAPEFILE = os.path.join(script_dir,
+                             "administrative_boundary_shapefile_dir",
+                             "administrative.shp")
 
-    START_DATE = datetime.strptime("2026-08-01", "%Y-%m-%d")
-    END_DATE = datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")
-    PRODUCT_LEVEL = "GSLC"
+    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
+    END_DATE = datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+
+    PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by. GSLC, GCOV, GUNW, RSLC, SME2, e.g.
 
     MAX_RESULTS = 100
     DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
