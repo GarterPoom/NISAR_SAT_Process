@@ -7,7 +7,9 @@ Description: A professional-grade geospatial processing pipeline for NASA-ISRO S
 data. This script reads complex GSLC (Ground Range Localized) HDF5/NetCDF4 data, 
 calculates intensity, applies multi-looking (speckle reduction), performs 
 Radiometric Terrain Correction (RTC) using a Digital Elevation Model (DEM), 
-converts data to Decibels (dB), and exports the results as georeferenced GeoTIFFs.
+converts data to Decibels (dB), and exports the results as georeferenced 
+GeoTIFFs, along with a QGIS style file (.qml) that pre-sets display Gamma
+so the output looks right in QGIS without manual adjustment.
 """
 
 # --- IMPORT SECTION ---
@@ -110,6 +112,13 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 
 # The desired spatial resolution in meters for the final output (target: 10m x 10m)
 TARGET_PIXEL_SIZE = 10.0
+
+# QGIS "Gamma" display value to pre-set in the output .qml style file (Layer Properties ->
+# Symbology -> Gamma). This matches the value you found looks good when set manually in QGIS
+# (0.1-10 range in QGIS; values < 1 darken the display, values > 1 brighten it). This only
+# affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
+# untouched, so the data stays scientifically valid.
+QGIS_DISPLAY_GAMMA = 0.30
 
 
 # --- FUNCTION DEFINITIONS ---
@@ -352,6 +361,62 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     return 10.0 * np.log10(safe_intensity)
 
 
+def write_qgis_style_file(tif_path: Path, gamma: float, vmin: float, vmax: float) -> Path:
+    """
+    Writes a QGIS raster layer style file (.qml) next to the exported GeoTIFF, with the
+    same base filename (e.g. scene.tif -> scene.qml).
+
+    QGIS automatically applies a same-named .qml sitting next to a raster as its default
+    style the first time that raster is added to a project, so opening the .tif in QGIS
+    will already show the Gamma-adjusted rendering -- no manual slider adjustment needed.
+
+    IMPORTANT: this only affects how QGIS DISPLAYS the file. The actual dB pixel values
+    written into the .tif are completely untouched, so the data stays scientifically valid
+    for analysis.
+
+    Args:
+        tif_path (Path): Path to the exported GeoTIFF (used to derive the .qml path).
+        gamma (float): QGIS "Gamma" display value (valid range 0.1-10). Values below 1.0
+            darken the display; values above 1.0 brighten it.
+        vmin (float): Minimum data value QGIS should map to black for the gray stretch.
+        vmax (float): Maximum data value QGIS should map to white for the gray stretch.
+
+    Returns:
+        Path: The path to the written .qml file.
+    """
+    qml_path = tif_path.with_suffix(".qml")
+
+    qml_content = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.34" styleCategories="AllStyleCategories">
+  <pipe>
+    <rasterrenderer type="singlebandgray" opacity="1" alphaBand="-1" grayBand="1">
+      <rasterTransparency/>
+      <minMaxOrigin>
+        <limits>MinMax</limits>
+        <extent>WholeRaster</extent>
+        <statAccuracy>Exact</statAccuracy>
+        <cumulativeCutLower>0.02</cumulativeCutLower>
+        <cumulativeCutUpper>0.98</cumulativeCutUpper>
+        <stdDevFactor>2</stdDevFactor>
+      </minMaxOrigin>
+      <contrastEnhancement>
+        <minValue>{vmin:.6f}</minValue>
+        <maxValue>{vmax:.6f}</maxValue>
+        <algorithm>StretchToMinimumMaximum</algorithm>
+      </contrastEnhancement>
+    </rasterrenderer>
+    <brightnesscontrast brightness="0" contrast="0" gamma="{gamma:.3f}"/>
+    <huesaturation colorizeOn="0" colorizeRed="255" colorizeGreen="128" colorizeBlue="128" colorizeStrength="100" grayscaleMode="0" saturation="0"/>
+    <rasterresampler/>
+  </pipe>
+  <blendMode>0</blendMode>
+</qgis>
+"""
+
+    qml_path.write_text(qml_content, encoding="utf-8")
+    return qml_path
+
+
 def export_layer(
     source_file: Path, frequency: str, polarization: str, grid: h5py.Group, run_timestamp: str, logger: logging.Logger
 ) -> Path:
@@ -562,6 +627,10 @@ def export_layer(
                 # Write the finished, processed 10m tile into the destination GeoTIFF file
                 dst.write(db_tile.astype(np.float32), 1, window=win)
 
+        # Compute real min/max statistics of the written dB data (nodata pixels are excluded
+        # automatically). These drive the min/max contrast stretch in the QGIS style file below.
+        band_stats = dst.statistics(1, approx=False)
+
         # Build overview/pyramid levels (low-res versions) for fast zooming in GIS software
         dst.build_overviews(OVERVIEW_FACTORS, Resampling.average)
         
@@ -577,6 +646,12 @@ def export_layer(
     
     # Log the completion of this specific layer
     logger.info("Created Processed dB GeoTIFF: %s", out_path)
+
+    # Write a matching QGIS style file (.qml) so the GeoTIFF opens in QGIS already
+    # rendered with the QGIS_DISPLAY_GAMMA setting -- no manual Gamma slider adjustment
+    # needed. This is display-only and does not modify the dB pixel values above.
+    qml_path = write_qgis_style_file(out_path, QGIS_DISPLAY_GAMMA, band_stats.min, band_stats.max)
+    logger.info("Created QGIS style file: %s", qml_path)
     
     # Return the path to the finished file
     return out_path
