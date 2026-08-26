@@ -3,22 +3,34 @@
 
 """
 NISAR_Process.py
-Description: A professional-grade geospatial processing pipeline for NASA-ISRO SAR (NISAR) 
-data. This script reads complex GSLC (Ground Range Localized) HDF5/NetCDF4 data, 
-calculates intensity, applies multi-looking (speckle reduction), performs 
-Radiometric Terrain Correction (RTC) using a Digital Elevation Model (DEM), 
-converts data to Decibels (dB), and exports the results as georeferenced 
-GeoTIFFs, along with a QGIS style file (.qml) that pre-sets display Gamma
-so the output looks right in QGIS without manual adjustment.
+
+Purpose
+-------
+Convert supported NISAR HDF5/NetCDF4 products into tiled, georeferenced GeoTIFF
+layers expressed in decibels (dB). The processor preserves each input product's
+native spatial grid; it does not resample NISAR backscatter onto a new resolution.
+
+Supported products
+------------------
+GSLC (Geocoded Single Look Complex): complex-valued polarization layers such as
+HH and HV. Each tile is converted to intensity, multilooked, and optionally
+corrected with a local DEM before dB conversion.
+
+GCOV (Geocoded Polarimetric Covariance): real diagonal covariance layers such as
+HHHH and HVHV. These source layers have already been multilooked and radiometrically
+terrain corrected, so they are converted directly to dB without applying those
+steps again.
+
+Outputs
+-------
+For every available configured frequency/polarization layer, the script creates a
+compressed GeoTIFF and a matching QGIS .qml display style in GeoTIFF_Processed.
 """
 
 # --- IMPORT SECTION ---
 
 # Import future behavior to ensure type hinting works correctly in older Python 3 versions
 from __future__ import annotations
-
-# Import math for floating-point operations (used for checking pixel size equality)
-import math
 
 # Import logging to track script execution and errors in real-time and to files
 import logging
@@ -50,14 +62,11 @@ from scipy.ndimage import uniform_filter
 # Import rasterio for handling geospatial raster data (reading DEMs and writing GeoTIFFs)
 import rasterio
 
-# Import Resampling from rasterio to define how pixels are interpolated during resampling
+# Import Resampling for DEM alignment and GeoTIFF overview construction
 from rasterio.enums import Resampling
 
-# Import reproject and calculate_default_transform to handle coordinate/grid remapping
-from rasterio.warp import calculate_default_transform, reproject
-
-# Import array_bounds to calculate the spatial extent (left, bottom, right, top) of a raster
-from rasterio.transform import array_bounds
+# Import reproject to align DEM tiles with the NISAR product grid for RTC
+from rasterio.warp import reproject
 
 # Import Affine to create the transformation matrix used for georeferencing pixels
 from affine import Affine
@@ -67,11 +76,6 @@ from rasterio.windows import Window
 
 # Import window_bounds to convert pixel-based window coordinates to geographic bounds
 from rasterio.windows import bounds as window_bounds
-
-# Import from_bounds / transform to map a destination window back to a SOURCE pixel window
-# so we can slice the HDF5 dataset instead of loading it in full for every tile
-from rasterio.windows import from_bounds as window_from_bounds
-from rasterio.windows import transform as window_transform
 
 
 # --- CONFIGURATION & CONSTANTS ---
@@ -92,8 +96,11 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 # This must match the CRS and spatial resolution of your target area
 LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "NASA_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif"
 
-# The internal HDF5 path structure where the GSLC spatial grids are stored
-GSLC_GRIDS_PATH = "science/LSAR/GSLC/grids"
+# Internal HDF5 paths for the supported NISAR products.
+PRODUCT_GRIDS_PATHS = {
+    "GSLC": "science/LSAR/GSLC/grids",
+    "GCOV": "science/LSAR/GCOV/grids",
+}
 
 # Tuple specifying which frequency band to process (e.g., L-Band frequencyA)
 FREQUENCIES = ("frequencyA",)
@@ -109,9 +116,6 @@ TILE_SIZE = 512
 
 # List of overview/pyramid levels to build for the output GeoTIFFs (for fast zooming)
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
-
-# The desired spatial resolution in meters for the final output (target: 10m x 10m)
-TARGET_PIXEL_SIZE = 10.0
 
 # QGIS "Gamma" display value to pre-set in the output .qml style file (Layer Properties ->
 # Symbology -> Gamma). This matches the value you found looks good when set manually in QGIS
@@ -228,53 +232,26 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
             yield Window(column_offset, row_offset, tile_width, tile_height)
 
 
-def compute_source_window(
-    dst_win_bounds: tuple[float, float, float, float],
-    src_transform: Affine,
-    src_height: int,
-    src_width: int,
-    pad: int = 2,
-) -> Window:
-    """
-    Maps a destination tile's geographic bounds back onto the SOURCE dataset's
-    pixel grid, so we can read only the small chunk of the HDF5 array that a
-    given output tile actually needs (instead of loading the whole scene).
+def find_product_grids(product: h5py.File) -> tuple[str, h5py.Group]:
+    """Return the supported product type and its spatial-grid group."""
+    matches = [
+        (product_type, path)
+        for product_type, path in PRODUCT_GRIDS_PATHS.items()
+        if path in product
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one supported product; found {matches}")
+    product_type, path = matches[0]
+    return product_type, product[path]
 
-    A small pixel margin ('pad') is added on every side and the result is
-    clipped to the valid extent of the source array, so resampling near tile
-    edges still has the neighboring pixels it needs.
 
-    Args:
-        dst_win_bounds: (left, bottom, right, top) bounds of the destination tile.
-        src_transform: Affine transform of the SOURCE dataset.
-        src_height: Total height (rows) of the source dataset.
-        src_width: Total width (columns) of the source dataset.
-        pad: Extra pixels of margin to include on each side.
-
-    Returns:
-        Window: A pixel window into the source dataset (already clipped to
-        valid bounds; may have zero width/height if the tile falls entirely
-        outside the source data extent).
-    """
-    left, bottom, right, top = dst_win_bounds
-
-    # Convert the destination tile's geographic bounds into source pixel coordinates
-    raw_window = window_from_bounds(left, bottom, right, top, transform=src_transform)
-
-    # Round outward (floor/ceil) and pad, so we never end up short a pixel due to rounding
-    row_start = math.floor(raw_window.row_off) - pad
-    col_start = math.floor(raw_window.col_off) - pad
-    row_stop = math.ceil(raw_window.row_off + raw_window.height) + pad
-    col_stop = math.ceil(raw_window.col_off + raw_window.width) + pad
-
-    # Clip to the valid extent of the source array so we never index out of bounds
-    row_start = max(0, row_start)
-    col_start = max(0, col_start)
-    row_stop = min(src_height, row_stop)
-    col_stop = min(src_width, col_stop)
-
-    return Window(col_start, row_start, max(0, col_stop - col_start), max(0, row_stop - row_start))
-
+def dataset_name_for_polarization(product_type: str, polarization: str) -> str:
+    """Map a requested channel to its product-specific HDF5 dataset name."""
+    if product_type == "GSLC":
+        return polarization
+    if product_type == "GCOV":
+        return polarization * 2
+    raise ValueError(f"Unsupported NISAR product type: {product_type}")
 
 def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     """
@@ -407,7 +384,6 @@ def write_qgis_style_file(tif_path: Path, gamma: float, vmin: float, vmax: float
     </rasterrenderer>
     <brightnesscontrast brightness="0" contrast="0" gamma="{gamma:.3f}"/>
     <huesaturation colorizeOn="0" colorizeRed="255" colorizeGreen="128" colorizeBlue="128" colorizeStrength="100" grayscaleMode="0" saturation="0"/>
-    <rasterresampler/>
   </pipe>
   <blendMode>0</blendMode>
 </qgis>
@@ -418,299 +394,282 @@ def write_qgis_style_file(tif_path: Path, gamma: float, vmin: float, vmax: float
 
 
 def export_layer(
-    source_file: Path, frequency: str, polarization: str, grid: h5py.Group, run_timestamp: str, logger: logging.Logger
+    source_file: Path,
+    product_type: str,
+    frequency: str,
+    polarization: str,
+    grid: h5py.Group,
+    run_timestamp: str,
+    logger: logging.Logger,
 ) -> Path:
     """
-    Orchestrates the memory-efficient processing of a single SAR data layer.
-    
-    This function uses 'Windowed Reprojection' to avoid MemoryErrors. It calculates 
-    the target 10m grid geometry first, then loops through the destination 
-    image in small tiles. For each tile, it pulls only the necessary pixels 
-    from the source HDF5, performs resampling, intensity calculation, 
-    multi-looking, terrain correction, and decibel conversion.
+    Export one configured GSLC or GCOV polarization layer as a native-grid dB GeoTIFF.
+
+    The function reads the source HDF5 dataset tile by tile so a full NISAR scene is
+    never loaded into memory. GSLC tiles are complex samples and require intensity,
+    multilook, and optional DEM-based RTC processing. GCOV diagonal covariance tiles
+    are already intensity-like gamma0 measurements that include multilooking and RTC,
+    so they only require dB conversion.
 
     Args:
-        source_file (Path): The path to the input HDF5/NetCDF file.
-        frequency (str): The frequency band being processed (e.g., 'frequencyA').
-        polarization (str): The polarization (e.g., 'HH').
-        grid (h5py.Group): The HDF5 group containing the raw dataset.
-        run_timestamp (str): Timestamp string to keep filenames consistent.
-        logger (logging.Logger): The active logger instance.
-        
+        source_file: Input NISAR HDF5/NetCDF4 file used to derive the output name.
+        product_type: Detected product identifier, either "GSLC" or "GCOV".
+        frequency: Grid frequency group to process, for example "frequencyA".
+        polarization: Requested physical channel, for example "HH" or "HV".
+        grid: HDF5 group containing coordinate metadata and layer datasets.
+        run_timestamp: Shared timestamp included in output filenames for this run.
+        logger: Configured logger used for progress, warnings, and diagnostics.
+
     Returns:
-        Path: The file path to the successfully created GeoTIFF.
+        Path to the completed GeoTIFF. A same-named .qml QGIS style is also written.
+
+    Raises:
+        ValueError: The selected product layer is absent or is not a two-dimensional raster.
+        OSError: A source, DEM, temporary GeoTIFF, or output GeoTIFF operation fails.
     """
-    # --- 1. DATA AND GEOMETRY SETUP ---
+    # Convert the requested channel name to the dataset name used by this product type.
+    dataset_name = dataset_name_for_polarization(product_type, polarization)
+    # Keep the HDF5 dataset lazy; tile slices below read only the needed source pixels.
+    source_dataset = grid[dataset_name]
+    # Reject metadata or unsupported multidimensional datasets before creating an output file.
+    if not isinstance(source_dataset, h5py.Dataset) or source_dataset.ndim != 2:
+        raise ValueError(f"{dataset_name} is not a two-dimensional raster dataset")
 
-    # Access the specific polarization dataset (e.g., HH) inside the HDF5 group
-    source_dataset = grid[polarization]
-    
-    # Extract the Affine transform (pixel-to-coordinate mapping) and EPSG code from the HDF5 metadata
+    # Derive the source-native affine transform and CRS from grid coordinate metadata.
     transform, crs = coordinate_transform(grid)
-    
-    # Determine the dimensions (rows and columns) of the original source dataset
+    # Use the HDF5 raster dimensions unchanged so the output retains native resolution.
     height, width = source_dataset.shape
-    
-    # Check if the data is complex-valued (has Real and Imaginary parts)
-    is_complex = source_dataset.dtype.kind == "c"
+    # Record native pixel spacing for DEM slope calculation during GSLC RTC.
+    pixel_x = abs(transform.a)
+    pixel_y = abs(transform.e)
+    # Only GSLC requires intensity, multilook, and optional DEM correction in this script.
+    process_gslc = product_type == "GSLC"
 
-    # Calculate the bounding box (left, bottom, right, top) of the original data in geographic coordinates
-    left, bottom, right, top = array_bounds(height, width, transform)
-    
-    # Calculate the new target grid (10m resolution) based on the bounding box and target pixel size
-    # dst_transform: The new pixel-to-coordinate matrix for the 10m grid
-    # dst_width/height: The total number of pixels in the final 10m output image
-    dst_transform, dst_width, dst_height = calculate_default_transform(
-        crs, crs, width, height, left, bottom, right, top, resolution=(TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE)
+    # Build a distinct filename that records the source, product type, frequency, and channel.
+    out_path = PROCESSED_DIRECTORY / (
+        f"{source_file.stem}_{product_type}_{frequency}_{polarization}_Processed_dB_{run_timestamp}.tif"
     )
-
-    # --- 2. OUTPUT FILE PREPARATION ---
-
-    # Construct the final filename using the source name and processing parameters
-    out_filename = f"{source_file.stem}_{frequency}_{polarization}_Processed_dB_{run_timestamp}.tif"
-    
-    # Define the path where the final GeoTIFF will be stored
-    out_path = PROCESSED_DIRECTORY / out_filename
-    
-    # Create a temporary filename to prevent file corruption if the script crashes mid-process
+    # Write to a temporary file first so an interrupted run cannot leave a partial output.
     temp_path = out_path.with_suffix(".part.tif")
-    
-    # Delete the temporary file if it already exists from a previous failed attempt
+    # Remove a temporary file left by a previous interrupted attempt for the same output.
     if temp_path.exists():
         temp_path.unlink()
 
-    # Define the GeoTIFF writing profile (metadata and compression settings)
+    # Define the output GeoTIFF without changing the input dimensions, transform, or CRS.
     profile = {
-        "driver": "GTiff",                # Use the GeoTIFF file format
-        "width": dst_width,               # Width of the final output image
-        "height": dst_height,             # Height of the final output image
-        "count": 1,                       # Number of bands (we are only producing 1 band: dB)
-        "dtype": "float32",               # Use 32-bit floating point numbers for precision
-        "crs": crs,                       # The coordinate reference system of the output
-        "transform": dst_transform,        # The 10m resolution transform matrix
-        "nodata": -9999.0,                # Set the value used to represent "no data" or nulls
-        "tiled": True,                    # Enable internal tiling for faster GIS loading
-        "blockxsize": TILE_SIZE,          # Size of internal tiles (512 pixels)
-        "blockysize": TILE_SIZE,          # Size of internal tiles (512 pixels)
-        "compress": "deflate",            # Use DEFLATE compression to save disk space
-        "predictor": 3,                   # Use horizontal differencing (improves compression for floats)
-        "BIGTIFF": "IF_SAFER",            # Support files larger than 4GB
+        "driver": "GTiff",          # Store the result in GeoTIFF format.
+        "width": width,              # Preserve the source raster column count.
+        "height": height,            # Preserve the source raster row count.
+        "count": 1,                  # Write one dB band per requested channel.
+        "dtype": "float32",         # Store dB values as 32-bit floating point values.
+        "crs": crs,                  # Retain the grid's coordinate reference system.
+        "transform": transform,      # Retain the grid's native affine transform.
+        "nodata": -9999.0,           # Mark invalid output pixels with a consistent sentinel.
+        "tiled": True,               # Enable internal tiles for efficient GIS reading.
+        "blockxsize": TILE_SIZE,     # Use the configured tile width for GeoTIFF blocks.
+        "blockysize": TILE_SIZE,     # Use the configured tile height for GeoTIFF blocks.
+        "compress": "deflate",      # Apply lossless DEFLATE compression.
+        "predictor": 3,              # Improve compression efficiency for floating-point data.
+        "BIGTIFF": "IF_SAFER",      # Permit BigTIFF output when the file would exceed 4 GB.
     }
 
-    # Attempt to open the Digital Elevation Model (DEM) if the file path exists
+    # Start with no DEM handle because GCOV never needs an additional RTC step.
     dem_dataset = None
-    if LOCAL_DEM_PATH.exists():
+    # Open the local DEM only for a GSLC run and only when the configured file exists.
+    if process_gslc and LOCAL_DEM_PATH.exists():
         dem_dataset = rasterio.open(LOCAL_DEM_PATH)
-    else:
-        logger.warning(f"DEM not found at {LOCAL_DEM_PATH}. RTC step will be skipped.")
+    # Report that GSLC will continue without RTC when its DEM is unavailable.
+    elif process_gslc:
+        logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
-    # --- 3. THE WINDOWED PROCESSING LOOP (The Memory-Saving Part) ---
+    # Count source windows so progress messages can report a meaningful completion percentage.
+    total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
+    # Describe the actual processing performed in the output raster's band metadata.
+    description = "Intensity Multilook RTC" if process_gslc else "RTC Gamma0 Covariance"
+    # Reserve a holder for output statistics needed by the QGIS display style.
+    band_stats = None
 
-    # Open the temporary destination file for writing
-    with rasterio.open(temp_path, "w", **profile) as dst:
-        
-        # Set a description for the first band in the GeoTIFF metadata
-        dst.set_band_description(1, f"{frequency} {polarization} Intensity Multilook RTC dB")
+    try:
+        # Create the temporary GeoTIFF using the native-grid output profile.
+        with rasterio.open(temp_path, "w", **profile) as dst:
+            # Attach a human-readable label to the sole output band.
+            dst.set_band_description(1, f"{product_type} {frequency} {polarization} {description} dB")
+            # Iterate over fixed-size source windows to keep memory usage bounded.
+            for tile_num, window in enumerate(source_windows(height, width), start=1):
+                # Convert Rasterio window offsets to integers accepted by HDF5 slicing.
+                row_start = int(window.row_off)
+                row_stop = row_start + int(window.height)
+                col_start = int(window.col_off)
+                col_stop = col_start + int(window.width)
+                # Read only this native-grid source tile from the HDF5 dataset.
+                tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
 
-        # We iterate through the DESTINATION (output) grid in chunks (Tiles)
-        # This ensures we only ever have ONE tile in memory at a time
-        for row_off in range(0, dst_height, TILE_SIZE):
-            for col_off in range(0, dst_width, TILE_SIZE):
-                
-                # Determine the window size for the current tile (handling the edges of the image)
-                win_h = min(TILE_SIZE, dst_height - row_off)
-                win_w = min(TILE_SIZE, dst_width - col_off)
-                
-                # Create a 'Window' object defining the current rectangular sub-region of the output
-                win = Window(col_off, row_off, win_w, win_h)
-
-                # Geographic bounds of this destination tile - used both to find the matching
-                # chunk of the SOURCE dataset below and later for the DEM/RTC step.
-                win_bounds = window_bounds(win, dst_transform)
-
-                # Create a buffer to hold the resampled/reprojected data for this specific tile
-                # We use float32 as a general-purpose buffer
-                tile_buffer = np.empty((win.height, win.width), dtype=np.float32)
-
-                # --- STEP A: WINDOWED REPROJECTION (Resampling) ---
-                # This is the most important step. It pulls only the data needed for this 
-                # specific 10m window from the source HDF5 and resamples it into the buffer.
-                #
-                # NOTE: source_dataset is a plain h5py.Dataset, not a rasterio/GDAL dataset,
-                # so rasterio.warp.reproject() cannot do a lazy/windowed read on it the way it
-                # does for the DEM (rasterio.band(dem_dataset, 1)). Passing source_dataset
-                # directly forces the ENTIRE scene into memory on every tile. Instead, we work
-                # out which small slice of the source array this tile needs and read only that.
-                src_win = compute_source_window(win_bounds, transform, height, width)
-
-                if src_win.width <= 0 or src_win.height <= 0:
-                    # This destination tile falls completely outside the source data extent.
-                    # Fill with nodata and skip straight to writing this tile.
-                    db_tile = np.full((win.height, win.width), -9999.0, dtype=np.float32)
-                    dst.write(db_tile, 1, window=win)
-                    continue
-
-                # Read only the required chunk from the HDF5 dataset (cheap: a few MB, not GB)
-                source_chunk = source_dataset[src_win.toslices()]
-                # Affine transform describing just this small chunk, for src_transform below
-                src_chunk_transform = window_transform(src_win, transform)
-
-                if is_complex:
-                    # If the source is complex, we must use a complex buffer during reproject
-                    # to avoid losing the imaginary component before calculating intensity.
-                    complex_buffer = np.empty((win.height, win.width), dtype=np.complex64)
-                    reproject(
-                        source=source_chunk,
-                        destination=complex_buffer,
-                        src_transform=src_chunk_transform,
-                        src_crs=crs,
-                        dst_transform=dst.window_transform(win), # Map to the output 10m window
-                        dst_crs=crs,
-                        resampling=Resampling.nearest,         # Use nearest neighbor for raw data
-                    )
-                    # Convert the complex buffer into intensity (Real^2 + Imag^2)
-                    tile_buffer = calculate_intensity(complex_buffer)
+                # GSLC source samples are complex-valued and need the GSLC-specific workflow.
+                if process_gslc:
+                    # Convert complex samples to intensity, then suppress speckle with multilooking.
+                    processed_tile = apply_multilook(calculate_intensity(tile_data), looks=5)
+                    # Apply DEM-based RTC only when a DEM was opened successfully.
+                    if dem_dataset is not None:
+                        try:
+                            # Build the current tile's affine transform for DEM alignment.
+                            win_transform = rasterio.transform.from_bounds(
+                                *window_bounds(window, transform), window.width, window.height
+                            )
+                            # Allocate a DEM array matching the current output tile shape.
+                            dem_tile = np.empty((window.height, window.width), dtype=np.float32)
+                            # Align the DEM to this tile; this affects only the DEM used by RTC.
+                            reproject(
+                                source=rasterio.band(dem_dataset, 1),
+                                destination=dem_tile,
+                                dst_transform=win_transform,
+                                dst_crs=crs,
+                                resampling=Resampling.bilinear,
+                            )
+                            # Correct the multilooked GSLC intensity using local terrain slope.
+                            processed_tile = apply_rtc(processed_tile, dem_tile, pixel_x, pixel_y)
+                        except Exception as exc:
+                            # Keep the uncorrected multilooked tile when RTC fails for this window.
+                            logger.debug(
+                                "RTC failed on tile %d: %s. Using uncorrected intensity.", tile_num, exc
+                            )
+                # GCOV diagonal covariance values are already multilooked and RTC corrected.
                 else:
-                    # If the data is already real, reproject directly into the float32 buffer
-                    reproject(
-                        source=source_chunk,
-                        destination=tile_buffer,
-                        src_transform=src_chunk_transform,
-                        src_crs=crs,
-                        dst_transform=dst.window_transform(win), # Map to the output 10m window
-                        dst_crs=crs,
-                        resampling=Resampling.nearest,
-                    )
+                    # Convert the native real covariance values to the GeoTIFF float type.
+                    processed_tile = np.asarray(tile_data, dtype=np.float32)
 
-                # --- STEP B: MULTI-LOOKING (Speckle Reduction) ---
-                # Apply the spatial averaging filter to reduce SAR salt-and-pepper noise
-                ml_tile = apply_multilook(tile_buffer, looks=5)
-
-                # --- STEP C: RADIOMETRIC TERRAIN CORRECTION (RTC) ---
-                if dem_dataset:
-                    try:
-                        # (win_bounds was already computed above, before the source read)
-
-                        # Create a temporary transform for the DEM window to match the output tile
-                        win_transform = rasterio.transform.from_bounds(*win_bounds, win.width, win.height)
-                        
-                        # Create an empty buffer for the DEM data required for this tile
-                        dem_tile = np.empty((win.height, win.width), dtype=np.float32)
-
-                        # Pull only the necessary chunk of the DEM for this tile
-                        reproject(
-                            source=rasterio.band(dem_dataset, 1),
-                            destination=dem_tile,
-                            dst_transform=win_transform,
-                            dst_crs=crs,
-                            resampling=Resampling.bilinear
-                        )
-                        
-                        # Adjust intensity based on the local terrain slope to correct for shadows
-                        rtc_tile = apply_rtc(ml_tile, dem_tile, abs(dst_transform.a), abs(dst_transform.e))
-                    except Exception as e:
-                        # If math or coordinate errors occur during RTC, use the unfiltered tile
-                        logger.debug(f"RTC failed on tile at {row_off},{col_off}: {e}. Using uncorrected intensity.")
-                        rtc_tile = ml_tile
-                else:
-                    # If no DEM is available, skip RTC and use the multi-looked tile
-                    rtc_tile = ml_tile
-
-                # --- STEP D: DECIBEL CONVERSION ---
-                # Convert the linear intensity values to the logarithmic Decibel (dB) scale
-                db_tile = convert_to_decibels(rtc_tile)
-                
-                # Replace any non-finite numbers (like Infinity or NaN) with the designated 'nodata' value
+                # Convert valid linear intensity or covariance values to the logarithmic dB scale.
+                db_tile = convert_to_decibels(processed_tile)
+                # Replace NaN and infinity values with the declared GeoTIFF nodata value.
                 db_tile = np.where(np.isfinite(db_tile), db_tile, -9999.0)
-                
-                # --- STEP E: WRITE TO DISK ---
-                # Write the finished, processed 10m tile into the destination GeoTIFF file
-                dst.write(db_tile.astype(np.float32), 1, window=win)
+                # Write this completed native-grid tile into the temporary GeoTIFF.
+                dst.write(db_tile.astype(np.float32), 1, window=window)
 
-        # Compute real min/max statistics of the written dB data (nodata pixels are excluded
-        # automatically). These drive the min/max contrast stretch in the QGIS style file below.
-        band_stats = dst.statistics(1, approx=False)
+                # Log progress approximately ten times per layer and always after the final tile.
+                if tile_num == total_tiles or tile_num % max(1, total_tiles // 10) == 0:
+                    logger.info(
+                        "%s/%s progress: %.0f%% (%d/%d tiles)",
+                        frequency,
+                        polarization,
+                        100 * tile_num / total_tiles,
+                        tile_num,
+                        total_tiles,
+                    )
 
-        # Build overview/pyramid levels (low-res versions) for fast zooming in GIS software
-        dst.build_overviews(OVERVIEW_FACTORS, Resampling.average)
-        
-        # Add metadata tags to the file so GIS software knows how the overviews were built
-        dst.update_tags(ns="rio_overview", resampling="average")
+            # Build lower-resolution overview levels for responsive display in GIS applications.
+            dst.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+            # Record the overview resampling method as GeoTIFF metadata.
+            dst.update_tags(ns="rio_overview", resampling="average")
+            # Calculate final raster statistics for the QGIS contrast stretch.
+            band_stats = dst.statistics(1, approx=False)
+    finally:
+        # Close the DEM even if processing fails while writing a tile.
+        if dem_dataset is not None:
+            dem_dataset.close()
 
-    # Close the DEM file connection to free up system resources
-    if dem_dataset:
-        dem_dataset.close()
-
-    # Rename the temporary '.part.tif' file to the final intended filename
+    # Atomically replace the final output path only after the temporary GeoTIFF is complete.
     os.replace(temp_path, out_path)
-    
-    # Log the completion of this specific layer
-    logger.info("Created Processed dB GeoTIFF: %s", out_path)
-
-    # Write a matching QGIS style file (.qml) so the GeoTIFF opens in QGIS already
-    # rendered with the QGIS_DISPLAY_GAMMA setting -- no manual Gamma slider adjustment
-    # needed. This is display-only and does not modify the dB pixel values above.
-    qml_path = write_qgis_style_file(out_path, QGIS_DISPLAY_GAMMA, band_stats.min, band_stats.max)
-    logger.info("Created QGIS style file: %s", qml_path)
-    
-    # Return the path to the finished file
+    # Create the optional QGIS style when valid output statistics were calculated.
+    if band_stats is not None:
+        write_qgis_style_file(out_path, QGIS_DISPLAY_GAMMA, band_stats.min, band_stats.max)
+    # Record the final product path for operational logs and troubleshooting.
+    logger.info("Created processed %s GeoTIFF: %s", product_type, out_path)
+    # Return the final GeoTIFF path to the caller.
     return out_path
-
 
 def main() -> None:
     """
-    The main entry point. Discovers all supported products in the input directory 
-    and triggers the processing pipeline for each file found.
+    Discover and process every supported NISAR product below ROOT_DIRECTORY.
+
+    The batch entry point initializes logging, validates input/output directories,
+    detects whether each HDF5 file is GSLC or GCOV, and invokes export_layer for
+    every configured frequency and polarization that exists in that product. A
+    failure for one file is logged and does not stop subsequent files from running.
+
+    Returns:
+        None. Outputs and diagnostics are written to configured directories.
     """
-    # Initialize logging
+    # Configure console and file logging before performing any filesystem work.
     logger = setup_logger(LOG_DIRECTORY)
-    
-    # Ensure the input directory exists before proceeding
+
+    # Fail early when the configured input-product directory does not exist.
     if not ROOT_DIRECTORY.is_dir():
         logger.error("Input directory does not exist: %s", ROOT_DIRECTORY)
         raise SystemExit(1)
-        
-    # Ensure output directory exists
+
+    # Create the output directory now so every successful layer has a destination.
     PROCESSED_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    
-    # Find all files matching the supported extensions in the input tree
-    source_files = [p for p in ROOT_DIRECTORY.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
-    
+    # Recursively select supported HDF5 or NetCDF files from the product directory.
+    source_files = [
+        path
+        for path in ROOT_DIRECTORY.rglob("*")
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+
+    # End successfully when there are no products to process in the input directory.
     if not source_files:
         logger.warning("No supported products found.")
         return
-        
-    # Create a single timestamp to use across all files in this specific execution run
+
+    # Use one timestamp for every output generated during this batch execution.
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # State the amount of batch work before opening the first product.
     logger.info("Found %d product(s). Starting processing...", len(source_files))
 
-    # Process each file one by one
+    # Process every input file independently so one damaged file cannot stop the batch.
     for source_file in source_files:
         try:
-            # Open the HDF5 file in read mode
+            # Open the HDF5/NetCDF product in read-only mode for metadata and tile access.
             with h5py.File(source_file, "r") as product:
-                # Navigate to the GSLC grid section
-                grids = product[GSLC_GRIDS_PATH]
-                # Iterate through each requested frequency (e.g., frequencyA)
+                # Detect the product type and retrieve its product-specific grids group.
+                product_type, grids = find_product_grids(product)
+                # Record which product type is being processed for operational traceability.
+                logger.info("Processing %s product: %s", product_type, source_file.name)
+
+                # Consider each frequency configured at the top of this module.
                 for frequency in FREQUENCIES:
+                    # Skip a requested frequency that is absent from this product.
+                    if frequency not in grids:
+                        logger.warning("%s does not contain requested frequency %s.", source_file.name, frequency)
+                        continue
+
+                    # Select the grid group holding this frequency's metadata and layers.
                     grid = grids[frequency]
-                    # Iterate through each requested polarization (eg., HH)
+                    # Consider each physical polarization configured at the top of this module.
                     for polarization in POLARIZATIONS:
-                        # Execute the full processing and export pipeline
-                        export_layer(source_file, frequency, polarization, grid, run_timestamp, logger)
-        
-        # Catch errors related to reading files that were interrupted during download
-        except OSError as e:
+                        # Convert the requested physical channel to its GSLC or GCOV dataset name.
+                        dataset_name = dataset_name_for_polarization(product_type, polarization)
+                        # Skip a requested layer that is unavailable in this product acquisition mode.
+                        if dataset_name not in grid:
+                            logger.warning(
+                                "%s %s does not contain requested polarization %s (%s).",
+                                source_file.name,
+                                frequency,
+                                polarization,
+                                dataset_name,
+                            )
+                            continue
+
+                        # Process and export the available native-grid layer.
+                        export_layer(
+                            source_file,
+                            product_type,
+                            frequency,
+                            polarization,
+                            grid,
+                            run_timestamp,
+                            logger,
+                        )
+        # Handle unreadable or incomplete HDF5 files without stopping the remaining batch.
+        except OSError as exc:
             logger.error("File appears incomplete or corrupted. Please re-download: %s", source_file.name)
-            logger.debug("Truncated file details: %s", e)
-            
-        # Catch and log any other unexpected errors to prevent the script from crashing mid-batch
-        except Exception as e:
-            logger.error("Failed to process product %s: %s", source_file.name, e)
+            logger.debug("Truncated file details: %s", exc)
+        # Log all other per-product failures with a traceback for later diagnosis.
+        except Exception as exc:
+            logger.error("Failed to process product %s: %s", source_file.name, exc)
             logger.debug("Detailed traceback:", exc_info=True)
 
+    # Record successful completion after every discoverable input product has been attempted.
     logger.info("Export complete.")
-
 
 # --- EXECUTION START ---
 if __name__ == "__main__":
