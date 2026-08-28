@@ -94,7 +94,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 
 # Path to the Digital Elevation Model (DEM) used for Terrain Correction (RTC)
 # This must match the CRS and spatial resolution of your target area
-LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "NASA_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif"
+LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "DEM_Directory" / "your_local_dem.tif"
 
 # Internal HDF5 paths for the supported NISAR products.
 PRODUCT_GRIDS_PATHS = {
@@ -106,13 +106,18 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HH", "HV")
+POLARIZATIONS = ("HV",)
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
 
 # The dimensions (height/width) of the tiles used during processing to prevent memory overflow
 TILE_SIZE = 512
+
+# GeoTIFF value used for pixels outside the valid NISAR swath.  This is deliberately
+# outside the expected backscatter dB range, so invalid edge pixels are transparent
+# in GIS software instead of appearing as a black -100 dB border.
+OUTPUT_NODATA = -9999.0
 
 # List of overview/pyramid levels to build for the output GeoTIFFs (for fast zooming)
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
@@ -284,8 +289,18 @@ def apply_multilook(intensity: np.ndarray, looks: int = 5) -> np.ndarray:
     Returns:
         np.ndarray: The spatially filtered intensity array.
     """
-    # Use a uniform filter to perform a simple spatial average across the 'looks' window
-    return uniform_filter(intensity, size=looks, mode="reflect")
+    # Mark zero, negative, NaN, and infinity values as invalid.  NISAR swath edges
+    # commonly contain zero-filled samples, which must not contribute to an average.
+    valid = np.isfinite(intensity) & (intensity > 0)
+    # Filter data and valid-sample weights separately so NoData never darkens the
+    # neighboring valid edge pixels.
+    summed = uniform_filter(np.where(valid, intensity, 0.0), size=looks, mode="reflect")
+    weights = uniform_filter(valid.astype(np.float32), size=looks, mode="reflect")
+    # Preserve invalid source pixels as NaN; they become GeoTIFF NoData on export.
+    multilooked = np.full(intensity.shape, np.nan, dtype=np.float32)
+    output_valid = valid & (weights > 0)
+    multilooked[output_valid] = summed[output_valid] / weights[output_valid]
+    return multilooked
 
 
 def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y: float) -> np.ndarray:
@@ -331,67 +346,13 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     Returns:
         np.ndarray: Decibel-scale array.
     """
-    # Replace any non-positive values with a tiny epsilon (1e-10) to avoid log10(0) errors
-    safe_intensity = np.where(intensity > 0, intensity, 1e-10)
-    
-    # Standard log conversion to dB
-    return 10.0 * np.log10(safe_intensity)
-
-
-def write_qgis_style_file(tif_path: Path, gamma: float, vmin: float, vmax: float) -> Path:
-    """
-    Writes a QGIS raster layer style file (.qml) next to the exported GeoTIFF, with the
-    same base filename (e.g. scene.tif -> scene.qml).
-
-    QGIS automatically applies a same-named .qml sitting next to a raster as its default
-    style the first time that raster is added to a project, so opening the .tif in QGIS
-    will already show the Gamma-adjusted rendering -- no manual slider adjustment needed.
-
-    IMPORTANT: this only affects how QGIS DISPLAYS the file. The actual dB pixel values
-    written into the .tif are completely untouched, so the data stays scientifically valid
-    for analysis.
-
-    Args:
-        tif_path (Path): Path to the exported GeoTIFF (used to derive the .qml path).
-        gamma (float): QGIS "Gamma" display value (valid range 0.1-10). Values below 1.0
-            darken the display; values above 1.0 brighten it.
-        vmin (float): Minimum data value QGIS should map to black for the gray stretch.
-        vmax (float): Maximum data value QGIS should map to white for the gray stretch.
-
-    Returns:
-        Path: The path to the written .qml file.
-    """
-    qml_path = tif_path.with_suffix(".qml")
-
-    qml_content = f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
-<qgis version="3.34" styleCategories="AllStyleCategories">
-  <pipe>
-    <rasterrenderer type="singlebandgray" opacity="1" alphaBand="-1" grayBand="1">
-      <rasterTransparency/>
-      <minMaxOrigin>
-        <limits>MinMax</limits>
-        <extent>WholeRaster</extent>
-        <statAccuracy>Exact</statAccuracy>
-        <cumulativeCutLower>0.02</cumulativeCutLower>
-        <cumulativeCutUpper>0.98</cumulativeCutUpper>
-        <stdDevFactor>2</stdDevFactor>
-      </minMaxOrigin>
-      <contrastEnhancement>
-        <minValue>{vmin:.6f}</minValue>
-        <maxValue>{vmax:.6f}</maxValue>
-        <algorithm>StretchToMinimumMaximum</algorithm>
-      </contrastEnhancement>
-    </rasterrenderer>
-    <brightnesscontrast brightness="0" contrast="0" gamma="{gamma:.3f}"/>
-    <huesaturation colorizeOn="0" colorizeRed="255" colorizeGreen="128" colorizeBlue="128" colorizeStrength="100" grayscaleMode="0" saturation="0"/>
-  </pipe>
-  <blendMode>0</blendMode>
-</qgis>
-"""
-
-    qml_path.write_text(qml_content, encoding="utf-8")
-    return qml_path
-
+    # Only positive, finite linear values have a valid dB representation.  Invalid
+    # values remain NaN and are written as OUTPUT_NODATA by export_layer, rather than
+    # being converted to the artificial -100 dB value produced by log10(1e-10).
+    decibels = np.full(intensity.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(intensity) & (intensity > 0)
+    decibels[valid] = 10.0 * np.log10(intensity[valid])
+    return decibels
 
 def export_layer(
     source_file: Path,
@@ -464,7 +425,7 @@ def export_layer(
         "dtype": "float32",         # Store dB values as 32-bit floating point values.
         "crs": crs,                  # Retain the grid's coordinate reference system.
         "transform": transform,      # Retain the grid's native affine transform.
-        "nodata": -9999.0,           # Mark invalid output pixels with a consistent sentinel.
+        "nodata": OUTPUT_NODATA,     # Mark invalid output pixels with a consistent sentinel.
         "tiled": True,               # Enable internal tiles for efficient GIS reading.
         "blockxsize": TILE_SIZE,     # Use the configured tile width for GeoTIFF blocks.
         "blockysize": TILE_SIZE,     # Use the configured tile height for GeoTIFF blocks.
@@ -539,10 +500,15 @@ def export_layer(
 
                 # Convert valid linear intensity or covariance values to the logarithmic dB scale.
                 db_tile = convert_to_decibels(processed_tile)
-                # Replace NaN and infinity values with the declared GeoTIFF nodata value.
-                db_tile = np.where(np.isfinite(db_tile), db_tile, -9999.0)
+                # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
+                # dB value.  GIS renderers therefore leave the outside-swath edge blank.
+                valid_db = np.isfinite(db_tile)
+                db_tile = np.where(valid_db, db_tile, OUTPUT_NODATA)
                 # Write this completed native-grid tile into the temporary GeoTIFF.
                 dst.write(db_tile.astype(np.float32), 1, window=window)
+                # Write an explicit validity mask as well as the NoData value so software
+                # that prioritizes raster masks renders the swath edge transparently.
+                dst.write_mask(np.where(valid_db, 255, 0).astype(np.uint8), window=window)
 
                 # Log progress approximately ten times per layer and always after the final tile.
                 if tile_num == total_tiles or tile_num % max(1, total_tiles // 10) == 0:
@@ -568,9 +534,6 @@ def export_layer(
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
     os.replace(temp_path, out_path)
-    # Create the optional QGIS style when valid output statistics were calculated.
-    if band_stats is not None:
-        write_qgis_style_file(out_path, QGIS_DISPLAY_GAMMA, band_stats.min, band_stats.max)
     # Record the final product path for operational logs and troubleshooting.
     logger.info("Created processed %s GeoTIFF: %s", product_type, out_path)
     # Return the final GeoTIFF path to the caller.
