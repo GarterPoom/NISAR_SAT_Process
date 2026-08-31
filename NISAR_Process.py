@@ -7,8 +7,8 @@ NISAR_Process.py
 Purpose
 -------
 Convert supported NISAR HDF5/NetCDF4 products into tiled, georeferenced GeoTIFF
-layers expressed in decibels (dB). The processor preserves each input product's
-native spatial grid; it does not resample NISAR backscatter onto a new resolution.
+layers expressed in decibels (dB). Products with square pixels retain their native
+grid; products with rectangular pixels are resampled to 10 m x 10 m before export.
 
 Supported products
 ------------------
@@ -34,6 +34,9 @@ from __future__ import annotations
 
 # Import logging to track script execution and errors in real-time and to files
 import logging
+
+# Import math for rounding rectangular-grid output dimensions up to whole 10 m pixels.
+import math
 
 # Import os for operating system tasks like replacing files (os.replace)
 import os
@@ -94,7 +97,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 
 # Path to the Digital Elevation Model (DEM) used for Terrain Correction (RTC)
 # This must match the CRS and spatial resolution of your target area
-LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "DEM_Directory" / "your_local_dem.tif"
+LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "Directory_DEM" / "your_local_DEM.tif"
 
 # Internal HDF5 paths for the supported NISAR products.
 PRODUCT_GRIDS_PATHS = {
@@ -106,7 +109,7 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HV",)
+POLARIZATIONS = ("HH", "HV")
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
@@ -128,6 +131,9 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
 # untouched, so the data stays scientifically valid.
 QGIS_DISPLAY_GAMMA = 0.30
+
+# Resolution used when a source grid has rectangular (non-square) pixels.
+RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
 
 
 # --- FUNCTION DEFINITIONS ---
@@ -210,6 +216,30 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
                        0.0, y_resolution, float(y_coordinates[0]) - y_resolution / 2)
     
     return transform, f"EPSG:{epsg_code}"
+
+
+def grid_has_square_pixels(transform: Affine) -> bool:
+    """Return whether the grid's horizontal and vertical pixel sizes are equal."""
+    return bool(np.isclose(abs(transform.a), abs(transform.e), rtol=1e-9, atol=1e-9))
+
+
+def rectangular_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
+    """Create an exact 10 m square-pixel GeoTIFF profile covering a rectangular source grid."""
+    source_pixel_x = abs(transform.a)
+    source_pixel_y = abs(transform.e)
+    target_resolution = RECTANGULAR_PIXEL_OUTPUT_RESOLUTION
+
+    # Preserve the source's upper-left pixel boundary and axis directions.  Rounding up
+    # covers the full source footprint, even when it is not an exact multiple of 10 m.
+    target_width = math.ceil(width * source_pixel_x / target_resolution)
+    target_height = math.ceil(height * source_pixel_y / target_resolution)
+    target_transform = Affine(
+        math.copysign(target_resolution, transform.a), 0.0, transform.c,
+        0.0, math.copysign(target_resolution, transform.e), transform.f,
+    )
+    target_profile = profile.copy()
+    target_profile.update({"width": target_width, "height": target_height, "transform": target_transform})
+    return target_profile
 
 
 def source_windows(height: int, width: int) -> Iterator[Window]:
@@ -364,7 +394,7 @@ def export_layer(
     logger: logging.Logger,
 ) -> Path:
     """
-    Export one configured GSLC or GCOV polarization layer as a native-grid dB GeoTIFF.
+    Export one configured GSLC or GCOV polarization layer as a dB GeoTIFF.
 
     The function reads the source HDF5 dataset tile by tile so a full NISAR scene is
     never loaded into memory. GSLC tiles are complex samples and require intensity,
@@ -398,8 +428,11 @@ def export_layer(
 
     # Derive the source-native affine transform and CRS from grid coordinate metadata.
     transform, crs = coordinate_transform(grid)
-    # Use the HDF5 raster dimensions unchanged so the output retains native resolution.
+    # Read and process the HDF5 raster at its native dimensions before any output resampling.
     height, width = source_dataset.shape
+    # Square source pixels (for example 5 m x 5 m or 10 m x 10 m) are exported unchanged.
+    # Rectangular source pixels are converted to a 10 m x 10 m GeoTIFF after processing.
+    source_has_square_pixels = grid_has_square_pixels(transform)
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
     pixel_y = abs(transform.e)
@@ -412,19 +445,22 @@ def export_layer(
     )
     # Write to a temporary file first so an interrupted run cannot leave a partial output.
     temp_path = out_path.with_suffix(".part.tif")
-    # Remove a temporary file left by a previous interrupted attempt for the same output.
+    native_temp_path = out_path.with_suffix(".native.part.tif")
+    # Remove temporary files left by a previous interrupted attempt for the same output.
     if temp_path.exists():
         temp_path.unlink()
+    if native_temp_path.exists():
+        native_temp_path.unlink()
 
-    # Define the output GeoTIFF without changing the input dimensions, transform, or CRS.
+    # Define the native-grid staging GeoTIFF used by both square and rectangular grids.
     profile = {
         "driver": "GTiff",          # Store the result in GeoTIFF format.
-        "width": width,              # Preserve the source raster column count.
-        "height": height,            # Preserve the source raster row count.
+        "width": width,              # Preserve the source raster column count in the staging file.
+        "height": height,            # Preserve the source raster row count in the staging file.
         "count": 1,                  # Write one dB band per requested channel.
         "dtype": "float32",         # Store dB values as 32-bit floating point values.
         "crs": crs,                  # Retain the grid's coordinate reference system.
-        "transform": transform,      # Retain the grid's native affine transform.
+        "transform": transform,      # Retain the grid's native affine transform in the staging file.
         "nodata": OUTPUT_NODATA,     # Mark invalid output pixels with a consistent sentinel.
         "tiled": True,               # Enable internal tiles for efficient GIS reading.
         "blockxsize": TILE_SIZE,     # Use the configured tile width for GeoTIFF blocks.
@@ -443,6 +479,18 @@ def export_layer(
     elif process_gslc:
         logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
+    if source_has_square_pixels:
+        logger.info(
+            "%s/%s has square pixels (%.6g m x %.6g m); retaining native resolution.",
+            frequency, polarization, pixel_x, pixel_y,
+        )
+    else:
+        logger.info(
+            "%s/%s has rectangular pixels (%.6g m x %.6g m); resampling to %.0f m x %.0f m with nearest neighbor.",
+            frequency, polarization, pixel_x, pixel_y,
+            RECTANGULAR_PIXEL_OUTPUT_RESOLUTION, RECTANGULAR_PIXEL_OUTPUT_RESOLUTION,
+        )
+
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
@@ -451,8 +499,8 @@ def export_layer(
     band_stats = None
 
     try:
-        # Create the temporary GeoTIFF using the native-grid output profile.
-        with rasterio.open(temp_path, "w", **profile) as dst:
+        # Create the native-grid staging GeoTIFF.
+        with rasterio.open(native_temp_path, "w", **profile) as dst:
             # Attach a human-readable label to the sole output band.
             dst.set_band_description(1, f"{product_type} {frequency} {polarization} {description} dB")
             # Iterate over fixed-size source windows to keep memory usage bounded.
@@ -521,16 +569,42 @@ def export_layer(
                         total_tiles,
                     )
 
-            # Build lower-resolution overview levels for responsive display in GIS applications.
-            dst.build_overviews(OVERVIEW_FACTORS, Resampling.average)
-            # Record the overview resampling method as GeoTIFF metadata.
-            dst.update_tags(ns="rio_overview", resampling="average")
-            # Calculate final raster statistics for the QGIS contrast stretch.
-            band_stats = dst.statistics(1, approx=False)
     finally:
         # Close the DEM even if processing fails while writing a tile.
         if dem_dataset is not None:
             dem_dataset.close()
+
+    if source_has_square_pixels:
+        # Square-pixel grids need no resampling, so promote the staging GeoTIFF directly.
+        os.replace(native_temp_path, temp_path)
+    else:
+        # Resample only rectangular grids after the scientific processing steps and before
+        # publishing the final GeoTIFF.  Nearest neighbour preserves source dB samples.
+        target_profile = rectangular_grid_profile(profile, transform, width, height)
+        with rasterio.open(native_temp_path) as source_raster:
+            with rasterio.open(temp_path, "w", **target_profile) as destination_raster:
+                destination_raster.set_band_description(
+                    1, f"{product_type} {frequency} {polarization} {description} dB"
+                )
+                reproject(
+                    source=rasterio.band(source_raster, 1),
+                    destination=rasterio.band(destination_raster, 1),
+                    src_transform=source_raster.transform,
+                    src_crs=source_raster.crs,
+                    src_nodata=OUTPUT_NODATA,
+                    dst_transform=destination_raster.transform,
+                    dst_crs=destination_raster.crs,
+                    dst_nodata=OUTPUT_NODATA,
+                    resampling=Resampling.nearest,
+                    init_dest_nodata=True,
+                )
+        native_temp_path.unlink()
+
+    # Build overviews on the actual exported grid and calculate its final statistics.
+    with rasterio.open(temp_path, "r+") as output_raster:
+        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+        output_raster.update_tags(ns="rio_overview", resampling="average")
+        band_stats = output_raster.statistics(1, approx=False)
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
     os.replace(temp_path, out_path)
@@ -612,7 +686,7 @@ def main() -> None:
                             )
                             continue
 
-                        # Process and export the available native-grid layer.
+                        # Process and export the available layer, resampling only if its pixels are rectangular.
                         export_layer(
                             source_file,
                             product_type,
