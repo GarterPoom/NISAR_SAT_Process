@@ -1,30 +1,16 @@
-"""
-nisar_search_download.py
-
-Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules
-within a given area of interest and date range, filter results down to
-HDF5 product files, and download them sequentially to a local directory.
-
-Each file download shows its own byte-level progress bar (current bytes / total bytes), 
-rather than a single progress bar tracking file count.
-
-Requirements:
-    pip install asf_search tqdm requests geopandas shapely
-
-Credentials:
-    Set your NASA Earthdata username/password directly below in Config.
-    (Hardcoded here since this script is only run locally on one machine.)
-
-Usage:
-    python nisar_search_download.py
-"""  # End of module‑level docstring – describes the whole script.
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
 import os  # Module for interacting with the operating system (e.g., creating directories).    
 import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).  
 import logging  # Standard logging module for recording execution steps, warnings, and errors.   
+import copy  # Copy authenticated cookies into a separate session per worker thread.
+import re  # Regular expressions used to validate HTTP range responses.
+import threading  # Thread-local state and a lock for concurrent progress bars.
+import time  # Retry backoff delays after transient download failures.
+from concurrent.futures import ThreadPoolExecutor, as_completed  # Bounded concurrent downloads.
 from datetime import datetime  # Module for handling date objects and generating dynamic timestamps. 
+from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
 
 import requests  # HTTP library; used here for its exceptions and streamed GET requests.
 from tqdm import tqdm  # Library for rendering dynamic progress bars in the terminal console.
@@ -66,6 +52,11 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
     DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
+    DOWNLOAD_WORKERS = 4  # Safe upper limit for simultaneous file downloads.
+    DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
+    DOWNLOAD_READ_TIMEOUT = 120  # Seconds allowed without receiving download data.
+    DOWNLOAD_MAX_ATTEMPTS = 5  # Initial attempt plus retries for interrupted downloads.
+    DOWNLOAD_RETRY_BACKOFF = 5  # Base seconds between retries; doubles after each failure.
 
 # --------------------------------------------------------------------------- #
 # Logging setup – configures logging to write to both a timestamped log file and stdout.  
@@ -263,53 +254,147 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
     return download_urls  # Return the list of filtered HDF5 download URLs.
 
 # --------------------------------------------------------------------------- #
-# Download – downloads a single file, showing a byte‑level tqdm progress bar.               
-# --------------------------------------------------------------------------- #
-def download_single_file(url: str, output_directory: str, session: asf.ASFSession) -> None:  # Download one file, showing a byte-level tqdm progress bar for it.
-    """Download one file, showing a byte-level tqdm progress bar for it.
+# Download – bounded concurrent downloads with resumable partial files.
+"""Search ASF for NISAR GSLC products and download them safely in parallel.
 
-    Streams the response in chunks rather than loading it all into memory,
-    and updates the progress bar as each chunk arrives so the bar reflects
-    real download progress (not just file count).
+The workflow reads an AOI from a shapefile, searches the ASF catalogue for
+matching NISAR HDF5 products, and downloads those products to the configured
+directory.  Downloads are streamed to ``.part`` files, resumed after an
+interruption, retried with exponential backoff, and atomically renamed only
+after their expected byte count has been received.
 
-    Args:
-        url: Direct download URL for the file.
-        output_directory: Local directory to save the file into.
-        session: Authenticated ASFSession (subclasses requests.Session, so it can be used directly for streamed HTTP GETs).
+``ThreadPoolExecutor`` limits concurrent transfers to ``DOWNLOAD_WORKERS``.
+Each worker owns an authenticated HTTP session, so cookie/session state is not
+shared between threads.  This preserves download throughput without creating
+unbounded connections, memory use, or console output contention.
 
-    Raises:
-        requests.HTTPError: If the server returns a non-success status code.
-    """
-    filename = url.split("/")[-1]  # Extract the target filename from the URL string.
-    destination_path = os.path.join(output_directory, filename)  # Build the full local save path for this file.
+Requirements:
+    pip install asf_search tqdm requests geopandas shapely
 
-    with session.get(url, stream=True) as response:  # Open a streamed GET request so the body isn't loaded all at once.
-        response.raise_for_status()  # Raise an exception if the server returned an error status code.
-        total_bytes = int(response.headers.get("Content-Length", 0))  # Read expected file size for the progress bar.
-
-        with open(destination_path, "wb") as output_file, tqdm(  # Open the local file and a progress bar together.
-            total=total_bytes,  # Progress bar's total is the file's expected size in bytes.
-            unit="B",  # Display units as bytes.
-            unit_scale=True,  # Auto-scale bytes to KB/MB/GB for readability.
-            unit_divisor=1024,  # Use 1024 as the scaling divisor (binary units).
-            desc=filename,  # Show the filename as the progress bar's label.
-            file=sys.stdout,  # Render the progress bar to standard output.
-            leave=True,  # Keep the completed bar visible after the file finishes.
-        ) as progress_bar:  # Progress bar context manager.
-            for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):  # Stream the file in fixed-size chunks.
-                if chunk:  # Skip any empty keep-alive chunks.
-                    output_file.write(chunk)  # Write this chunk to disk.
-                    progress_bar.update(len(chunk))  # Advance the progress bar by the chunk's byte size.
+Configure the Earthdata credentials, AOI shapefile, date range, output path,
+and worker limit in :class:`Config`, then run ``python NISAR_Download.py``.
+"""
 
 # --------------------------------------------------------------------------- #
-# Download – sequential download of many files, each with its own progress bar.               
-# --------------------------------------------------------------------------- #
-def download_files_sequentially(  # Download a list of files one at a time, each with its own progress bar.
+def filename_from_url(url: str) -> str:
+    """Extract a decoded filename without URL query parameters."""
+    return unquote(os.path.basename(urlparse(url).path))
+
+
+def content_range_total(content_range: str | None) -> int | None:
+    """Extract the complete object size from an HTTP Content-Range header."""
+    total_text = (content_range or "").rpartition("/")[-1]
+    return int(total_text) if total_text.isdigit() else None
+
+
+def response_total_bytes(response: requests.Response) -> int | None:
+    """Return the complete object size when the server provides it."""
+    if response.status_code == requests.codes.partial_content:
+        return content_range_total(response.headers.get("Content-Range"))
+    content_length = response.headers.get("Content-Length")
+    return int(content_length) if content_length and content_length.isdigit() else None
+
+
+def make_worker_session_factory(authenticated_session: asf.ASFSession):
+    """Return a factory that gives each worker an independent authenticated session."""
+    headers = dict(authenticated_session.headers)
+    cookies = copy.deepcopy(authenticated_session.cookies)
+    thread_local = threading.local()
+
+    def get_worker_session() -> requests.Session:
+        worker_session = getattr(thread_local, "session", None)
+        if worker_session is None:
+            worker_session = requests.Session()
+            worker_session.headers.update(headers)
+            worker_session.cookies = copy.deepcopy(cookies)
+            worker_session.auth = authenticated_session.auth
+            thread_local.session = worker_session
+        return worker_session
+
+    return get_worker_session
+
+
+def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
+    """Download or resume one file, then atomically rename its .part file."""
+    filename = filename_from_url(url)
+    destination_path = os.path.join(output_directory, filename)
+    partial_path = f"{destination_path}.part"
+    starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
+    headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}
+
+    with get_worker_session().get(
+        url,
+        headers=headers,
+        stream=True,
+        timeout=(Config.DOWNLOAD_CONNECT_TIMEOUT, Config.DOWNLOAD_READ_TIMEOUT),
+    ) as response:
+        if response.status_code == requests.codes.requested_range_not_satisfiable:
+            total_bytes = content_range_total(response.headers.get("Content-Range"))
+            if total_bytes is not None and starting_bytes == total_bytes:
+                os.replace(partial_path, destination_path)
+                return
+        response.raise_for_status()
+
+        append = starting_bytes > 0 and response.status_code == requests.codes.partial_content
+        if append:
+            content_range = response.headers.get("Content-Range", "")
+            match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)
+            if not match or int(match.group(1)) != starting_bytes:
+                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")
+        elif starting_bytes:
+            logging.warning("%s ignored its range request; restarting its partial download.", filename)
+            starting_bytes = 0
+
+        total_bytes = response_total_bytes(response)
+        if total_bytes is not None and starting_bytes > total_bytes:
+            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")
+
+        with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
+            total=total_bytes,
+            initial=starting_bytes,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc=filename[:50],
+            file=sys.stdout,
+            leave=True,
+            position=progress_position,
+        ) as progress_bar:
+            for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
+                if chunk:
+                    output_file.write(chunk)
+                    progress_bar.update(len(chunk))
+
+    downloaded_bytes = os.path.getsize(partial_path)
+    if total_bytes is not None and downloaded_bytes != total_bytes:
+        raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")
+    os.replace(partial_path, destination_path)
+
+
+def download_with_retries(url: str, output_directory: str, get_worker_session, progress_position: int) -> str:
+    """Retry interrupted transfers without discarding their partial file."""
+    filename = filename_from_url(url)
+    for attempt in range(1, Config.DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            download_single_file(url, output_directory, get_worker_session, progress_position)
+            return filename
+        except (requests.RequestException, OSError, ValueError) as error:
+            if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
+                raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error
+            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))
+            logging.warning(
+                "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
+                filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+
+def download_files_with_thread_pool(  # Download a list of files with bounded concurrency.
     download_urls: list[str],  # URLs of the files to download.
     output_directory: str,  # Local directory to save files into (created if it doesn't already exist).
     session: asf.ASFSession,  # Authenticated ASFSession used for the HTTP requests.
 ) -> None:
-    """Download a list of files one at a time, each with its own progress bar.
+    """Download files concurrently with a safe worker cap and isolated sessions.
 
     Args:
         download_urls: URLs of the files to download.
@@ -318,30 +403,37 @@ def download_files_sequentially(  # Download a list of files one at a time, each
     """
     os.makedirs(output_directory, exist_ok=True)  # Create the output data directory safely if it doesn't exist.
     logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Log its absolute path.
-    logging.info(f"Starting sequential download of {len(download_urls)} file(s)...")  # Log start of the batch.
+    logging.info("Starting download of %d file(s) with at most %d worker threads.", len(download_urls), Config.DOWNLOAD_WORKERS)
 
-    successful_downloads = 0  # Initialize a counter for successful downloads.
-    failed_downloads = 0  # Initialize a counter for failed downloads.
+    get_worker_session = make_worker_session_factory(session)
+    pending_urls = []
+    successful_downloads = 0
+    for url in dict.fromkeys(download_urls):  # Remove duplicate URLs before scheduling work.
+        filename = filename_from_url(url)
+        if os.path.isfile(os.path.join(output_directory, filename)):
+            logging.info("File already exists, skipping: %s", filename)
+            successful_downloads += 1
+        else:
+            pending_urls.append(url)
 
-    for url in download_urls:  # Iterate through the URLs one at a time (sequential, not parallel).
-        filename = url.split("/")[-1]  # Extract the filename for logging purposes.
-        destination_path = os.path.join(output_directory, filename)  # Full local path where this file would be saved.
-
-        logging.info(f"Starting download for file: {filename}")  # Log the start of this file's download.
-
-        # Skip the file if it already exists locally – avoids re‑downloading.
-        if os.path.isfile(destination_path):
-            logging.info(f"File already exists, skipping: {filename}")
-            successful_downloads += 1  # Count it as a successful (already‑present) download.
-            continue  # Move on to the next URL.
-
-        try:  # Begin try block for a single file download.
-            download_single_file(url, output_directory, session)  # Download the file with its own progress bar.
-            successful_downloads += 1  # Increment the success counter on completion.
-            logging.info(f"Successfully finished downloading file: {filename}")  # Log successful completion.
-        except Exception as file_error:  # Intercept any error for this specific file.
-            failed_downloads += 1  # Increment the failure counter.
-            logging.error(f"Failed to download {filename}: {file_error}")  # Log the detailed error message.
+    failed_downloads = 0
+    tqdm.set_lock(threading.RLock())  # Prevent simultaneous progress-bar writes from corrupting the console.
+    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))
+    if worker_count:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
+            futures = {
+                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url
+                for index, url in enumerate(pending_urls)
+            }
+            for future in as_completed(futures):
+                filename = filename_from_url(futures[future])
+                try:
+                    future.result()
+                    successful_downloads += 1
+                    logging.info("Successfully finished downloading file: %s", filename)
+                except Exception as file_error:
+                    failed_downloads += 1
+                    logging.error("Failed to download %s: %s", filename, file_error)
 
     logging.info(  # Log the overall download summary.
         f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"
@@ -368,7 +460,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
 
     download_urls = filter_hdf5_urls(results)  # Narrow results down to HDF5 file URLs only (excluding _QA_STATS.h5).
 
-    download_files_sequentially(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download each file in turn.
+    download_files_with_thread_pool(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download files with bounded concurrency.
 
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 

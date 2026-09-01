@@ -1,23 +1,24 @@
-"""
-nisar_search_download.py
+"""Search ASF for NISAR SME2 products and download them safely in parallel.
 
-Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules
-within a given area of interest and date range, filter results down to
-HDF5 product files, and download them sequentially to a local directory.
+The script sends the configured WGS84 AOI to the ASF catalogue, filters the
+resulting links to product HDF5 files, and stores the selected SME2 products
+locally.  Each transfer streams directly to a ``.part`` file, resumes from a
+previously received byte range when possible, retries transient failures with
+exponential backoff, and atomically renames the file after completion.
 
-Each file download shows its own byte-level progress bar (current bytes / total bytes), 
-rather than a single progress bar tracking file count.
+The thread pool is deliberately bounded by ``Config.DOWNLOAD_WORKERS``.  Each
+worker receives its own copy of the authenticated session headers and cookies,
+which avoids sharing mutable HTTP session state while keeping connection and
+memory pressure predictable.  Thread-safe tqdm progress bars show the active
+transfers without corrupting terminal output.
 
 Requirements:
     pip install asf_search tqdm requests
 
-Credentials:
-    Set your NASA Earthdata username/password directly below in Config.
-    (Hardcoded here since this script is only run locally on one machine.)
+Set the Earthdata credentials, WKT AOI, date range, output directory, and
+worker limit in :class:`Config`, then run ``python NISAR_SME2_Download.py``.
+"""
 
-Usage:
-    python nisar_search_download.py
-"""  # End of module‑level docstring – describes the whole script.
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
@@ -212,118 +213,117 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
 # --------------------------------------------------------------------------- #
 # Download – downloads a single file, showing a byte‑level tqdm progress bar.               
 # --------------------------------------------------------------------------- #
-def filename_from_url(url: str) -> str:
-    return unquote(os.path.basename(urlparse(url).path))
+def filename_from_url(url: str) -> str:  # Derive a safe local name from the product URL.
+    """Return the decoded URL basename, excluding query parameters."""
+    return unquote(os.path.basename(urlparse(url).path))  # Parse the URL path, isolate its basename, and decode escaped characters.
 
 
-def content_range_total(content_range):
-    '''Extract the complete object size from an HTTP Content-Range header.'''
-    if not content_range:
-        return None
-    total_text = content_range.rpartition('/')[-1]
-    return int(total_text) if total_text.isdigit() else None
+def content_range_total(content_range: str | None) -> int | None:  # Extract a full object size from a range header.
+    """Return the total byte count stated after ``/`` in ``Content-Range``."""
+    total_text = (content_range or "").rpartition("/")[-1]  # Retain the final header component, such as ``12345``.
+    return int(total_text) if total_text.isdigit() else None  # Convert a valid numeric total or report an unknown size.
 
 
-def response_total_bytes(response: requests.Response) -> int | None:
+def response_total_bytes(response: requests.Response) -> int | None:  # Determine the complete byte count advertised by the response.
     """Return the complete object size when the server provides it."""
-    if response.status_code == requests.codes.partial_content:
-        return content_range_total(response.headers.get("Content-Range"))
-    content_length = response.headers.get("Content-Length")
-    return int(content_length) if content_length and content_length.isdigit() else None
+    if response.status_code == requests.codes.partial_content:  # A range response reports its complete size in Content-Range.
+        return content_range_total(response.headers.get("Content-Range"))  # Read that total rather than the partial payload length.
+    content_length = response.headers.get("Content-Length")  # Get the full-response size if the server sends it.
+    return int(content_length) if content_length and content_length.isdigit() else None  # Return a numeric size only when valid.
 
 
-def make_worker_session_factory(authenticated_session: asf.ASFSession):
+def make_worker_session_factory(authenticated_session: asf.ASFSession):  # Build independent authenticated sessions per thread.
     """Create an independent authenticated requests session in each worker thread."""
-    headers = dict(authenticated_session.headers)
-    cookies = copy.deepcopy(authenticated_session.cookies)
-    thread_local = threading.local()
+    headers = dict(authenticated_session.headers)  # Snapshot default/authentication headers before worker threads begin.
+    cookies = copy.deepcopy(authenticated_session.cookies)  # Snapshot cookies so threads do not share a mutable cookie jar.
+    thread_local = threading.local()  # Hold one private session for each executor thread.
 
-    def get_worker_session() -> requests.Session:
-        worker_session = getattr(thread_local, "session", None)
-        if worker_session is None:
-            worker_session = requests.Session()
-            worker_session.headers.update(headers)
-            worker_session.cookies = copy.deepcopy(cookies)
-            worker_session.auth = authenticated_session.auth
-            thread_local.session = worker_session
-        return worker_session
+    def get_worker_session() -> requests.Session:  # Return a cached session for the calling thread.
+        worker_session = getattr(thread_local, "session", None)  # Look up only this thread's prior session.
+        if worker_session is None:  # Create a session lazily the first time this thread needs one.
+            worker_session = requests.Session()  # Give the thread its own connection pool and mutable state.
+            worker_session.headers.update(headers)  # Apply the saved request headers.
+            worker_session.cookies = copy.deepcopy(cookies)  # Copy authentication cookies into this isolated session.
+            worker_session.auth = authenticated_session.auth  # Preserve any ASF authentication handler.
+            thread_local.session = worker_session  # Cache the configured session for later calls in this thread.
+        return worker_session  # Return the safe, authenticated thread-local session.
 
-    return get_worker_session
+    return get_worker_session  # Give download tasks access to lazy per-thread session creation.
 
 
-def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
+def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:  # Stream or resume one product.
     """Download or resume one file, atomically renaming its completed .part file."""
-    filename = filename_from_url(url)
-    destination_path = os.path.join(output_directory, filename)
-    partial_path = f"{destination_path}.part"
-    starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
-    headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}
+    filename = filename_from_url(url)  # Calculate the product name once for local paths and messages.
+    destination_path = os.path.join(output_directory, filename)  # Build the path exposed after a verified download.
+    partial_path = f"{destination_path}.part"  # Keep incomplete data separate from usable products.
+    starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0  # Resume at the retained byte offset.
+    headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}  # Request only missing bytes when resuming.
 
-    with get_worker_session().get(
-        url,
-        headers=headers,
-        stream=True,
-        timeout=(Config.DOWNLOAD_CONNECT_TIMEOUT, Config.DOWNLOAD_READ_TIMEOUT),
-    ) as response:
-        if response.status_code == requests.codes.requested_range_not_satisfiable:
-            total_bytes = content_range_total(response.headers.get("Content-Range"))
-            if total_bytes is not None and starting_bytes == total_bytes:
-                os.replace(partial_path, destination_path)
-                return
-        response.raise_for_status()
+    with get_worker_session().get(  # Open a streamed request through the thread-local authenticated session.
+        url,  # Download the selected product URL.
+        headers=headers,  # Send a Range header only when a partial file exists.
+        stream=True,  # Receive response bytes incrementally instead of holding the product in RAM.
+        timeout=(Config.DOWNLOAD_CONNECT_TIMEOUT, Config.DOWNLOAD_READ_TIMEOUT),  # Bound connection setup and stalled reads.
+    ) as response:  # Always close the response socket as this block exits.
+        if response.status_code == requests.codes.requested_range_not_satisfiable:  # A 416 can mean the partial file already contains all bytes.
+            total_bytes = content_range_total(response.headers.get("Content-Range"))  # Obtain the server's complete file size.
+            if total_bytes is not None and starting_bytes == total_bytes:  # Confirm that the local partial file is exactly complete.
+                os.replace(partial_path, destination_path)  # Atomically promote the verified partial file.
+                return  # Finish this file without another download.
+        response.raise_for_status()  # Fail this attempt for all other non-success HTTP responses.
 
-        append = starting_bytes > 0 and response.status_code == requests.codes.partial_content
-        if append:
-            content_range = response.headers.get("Content-Range", "")
-            match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)
-            if not match or int(match.group(1)) != starting_bytes:
-                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")
-        elif starting_bytes:
-            logging.warning("%s ignored its range request; restarting its partial download.", filename)
-            starting_bytes = 0
+        append = starting_bytes > 0 and response.status_code == requests.codes.partial_content  # Append only to a valid 206 range response.
+        if append:  # Verify that the server started at exactly the retained byte offset.
+            content_range = response.headers.get("Content-Range", "")  # Read the range the server claims to return.
+            match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)  # Extract its first byte position.
+            if not match or int(match.group(1)) != starting_bytes:  # Prevent corrupting a file with a mismatched range.
+                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")  # Let retry logic retain and handle it.
+        elif starting_bytes:  # The server ignored a Range request and sent the entire object.
+            logging.warning("%s ignored its range request; restarting its partial download.", filename)  # Explain why existing partial data is overwritten.
+            starting_bytes = 0  # Reset progress to match the complete-response transfer.
 
-        total_bytes = response_total_bytes(response)
-        if total_bytes is not None and starting_bytes > total_bytes:
-            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")
+        total_bytes = response_total_bytes(response)  # Read the complete expected size if the server supplies it.
+        if total_bytes is not None and starting_bytes > total_bytes:  # Detect a corrupt or stale partial file before writes begin.
+            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")  # Preserve the partial file for recovery.
 
-        with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
-            total=total_bytes,
-            initial=starting_bytes,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            desc=filename[:50],
-            file=sys.stdout,
-            leave=True,
-            position=progress_position,
-        ) as progress_bar:
-            for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
-                if chunk:
-                    output_file.write(chunk)
-                    progress_bar.update(len(chunk))
+        with open(partial_path, "ab" if append else "wb") as output_file, tqdm(  # Open the appropriate partial-file mode and its progress bar.
+            total=total_bytes,  # Show the full byte target when known; tqdm supports unknown totals.
+            initial=starting_bytes,  # Begin resumed bars at the bytes already stored.
+            unit="B",  # Measure transfer progress in bytes.
+            unit_scale=True,  # Present bytes as readable KiB, MiB, or GiB values.
+            unit_divisor=1024,  # Use binary byte scaling.
+            desc=filename[:50],  # Keep each concurrent bar's label short enough for the terminal.
+            file=sys.stdout,  # Render progress to standard output.
+            leave=True,  # Keep completed bar lines for an execution record.
+            position=progress_position,  # Reserve a stable terminal row for this worker.
+        ) as progress_bar:  # Close both resources safely at the end of the transfer.
+            for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):  # Receive the response in bounded-memory chunks.
+                if chunk:  # Skip empty keep-alive chunks.
+                    output_file.write(chunk)  # Persist the received bytes to the partial file.
+                    progress_bar.update(len(chunk))  # Advance the visual byte counter by the written size.
 
-    downloaded_bytes = os.path.getsize(partial_path)
-    if total_bytes is not None and downloaded_bytes != total_bytes:
-        raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")
-    os.replace(partial_path, destination_path)
+    downloaded_bytes = os.path.getsize(partial_path)  # Measure data safely written after the response has closed.
+    if total_bytes is not None and downloaded_bytes != total_bytes:  # Reject a short or oversized transfer when its expected total is known.
+        raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")  # Leave .part intact for retry/resume.
+    os.replace(partial_path, destination_path)  # Atomically expose the completed product only after validation.
 
 
-def download_with_retries(url: str, output_directory: str, get_worker_session, progress_position: int) -> str:
+def download_with_retries(url: str, output_directory: str, get_worker_session, progress_position: int) -> str:  # Retry one transfer without discarding progress.
     """Retry transient failures without losing already downloaded bytes."""
-    filename = filename_from_url(url)
-    for attempt in range(1, Config.DOWNLOAD_MAX_ATTEMPTS + 1):
-        try:
-            download_single_file(url, output_directory, get_worker_session, progress_position)
-            return filename
-        except (requests.RequestException, OSError, ValueError) as error:
-            if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
-                raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error
-            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))
-            logging.warning(
-                "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
-                filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
+    filename = filename_from_url(url)  # Reuse a readable name in all retry messages.
+    for attempt in range(1, Config.DOWNLOAD_MAX_ATTEMPTS + 1):  # Make one initial attempt plus the configured retries.
+        try:  # Handle expected transfer failures at the per-file level.
+            download_single_file(url, output_directory, get_worker_session, progress_position)  # Stream or resume this product.
+            return filename  # Return success to the future collector.
+        except (requests.RequestException, OSError, ValueError) as error:  # Preserve partial data after recoverable failures.
+            if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:  # Stop after the final permitted attempt.
+                raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error  # Retain the original failure cause.
+            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))  # Double the wait time after each failure.
+            logging.warning(  # Record the error and planned retry delay.
+                "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",  # Use structured formatting for concurrent logs.
+                filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,  # Fill the warning with file and retry details.
             )
-            time.sleep(wait_seconds)
+            time.sleep(wait_seconds)  # Pause only this worker before resuming its retained partial download.
 
 # --------------------------------------------------------------------------- #
 # Download – sequential download of many files, each with its own progress bar.               
@@ -342,37 +342,37 @@ def download_files_with_thread_pool(  # Download files concurrently with one ses
     """
     os.makedirs(output_directory, exist_ok=True)  # Create the output data directory safely if it doesn't exist.
     logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Log its absolute path.
-    logging.info("Starting download of %d file(s) with %d worker threads...", len(download_urls), Config.DOWNLOAD_WORKERS)
+    logging.info("Starting download of %d file(s) with %d worker threads...", len(download_urls), Config.DOWNLOAD_WORKERS)  # Record the bounded concurrency setting.
 
-    get_worker_session = make_worker_session_factory(session)
-    pending_urls = []
-    successful_downloads = 0
-    for url in dict.fromkeys(download_urls):
-        filename = filename_from_url(url)
-        if os.path.isfile(os.path.join(output_directory, filename)):
-            logging.info("File already exists, skipping: %s", filename)
-            successful_downloads += 1
-        else:
-            pending_urls.append(url)
+    get_worker_session = make_worker_session_factory(session)  # Create lazy, isolated authentication sessions for executor threads.
+    pending_urls = []  # Collect unique files that still require a transfer.
+    successful_downloads = 0  # Count completed and already-present products.
+    for url in dict.fromkeys(download_urls):  # De-duplicate URLs while preserving the catalogue order.
+        filename = filename_from_url(url)  # Derive the local filename used for existence checks and logging.
+        if os.path.isfile(os.path.join(output_directory, filename)):  # Avoid downloading a product that is already complete.
+            logging.info("File already exists, skipping: %s", filename)  # Record the intentional skip.
+            successful_downloads += 1  # Treat an existing completed product as successful.
+        else:  # Queue only missing products for a worker.
+            pending_urls.append(url)  # Retain the URL for concurrent scheduling.
 
-    failed_downloads = 0
-    tqdm.set_lock(threading.RLock())
-    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))
-    if worker_count:
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
-            futures = {
-                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url
-                for index, url in enumerate(pending_urls)
+    failed_downloads = 0  # Count files that exhaust their retries without success.
+    tqdm.set_lock(threading.RLock())  # Serialize terminal writes so progress bars do not overwrite one another.
+    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))  # Never create more threads than queued files.
+    if worker_count:  # Skip executor setup when all requested products already exist.
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:  # Cap active network and disk transfers.
+            futures = {  # Associate each submitted task with its URL for completion reporting.
+                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url  # Assign a stable progress-bar row.
+                for index, url in enumerate(pending_urls)  # Submit every missing product; the executor runs only worker_count at once.
             }
-            for future in as_completed(futures):
-                filename = filename_from_url(futures[future])
-                try:
-                    future.result()
-                    successful_downloads += 1
-                    logging.info("Successfully finished downloading file: %s", filename)
-                except Exception as file_error:
-                    failed_downloads += 1
-                    logging.error("Failed to download %s: %s", filename, file_error)
+            for future in as_completed(futures):  # Process each file as soon as its worker finishes.
+                filename = filename_from_url(futures[future])  # Recover the product name associated with this future.
+                try:  # Convert a successful or failed worker outcome into batch-level accounting.
+                    future.result()  # Re-raise the worker exception here when all retries failed.
+                    successful_downloads += 1  # Count a completed transfer.
+                    logging.info("Successfully finished downloading file: %s", filename)  # Record the successful filename.
+                except Exception as file_error:  # Keep other futures running when one product fails.
+                    failed_downloads += 1  # Count the failed product.
+                    logging.error("Failed to download %s: %s", filename, file_error)  # Preserve the failure reason in the log.
 
     logging.info(  # Log the overall download summary.
         f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"
