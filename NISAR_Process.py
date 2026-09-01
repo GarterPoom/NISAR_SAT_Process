@@ -21,10 +21,6 @@ HHHH and HVHV. These source layers have already been multilooked and radiometric
 terrain corrected, so they are converted directly to dB without applying those
 steps again.
 
-Outputs
--------
-For every available configured frequency/polarization layer, the script creates a
-compressed GeoTIFF and a matching QGIS .qml display style in GeoTIFF_Processed.
 """
 
 # --- IMPORT SECTION ---
@@ -124,13 +120,6 @@ OUTPUT_NODATA = -9999.0
 
 # List of overview/pyramid levels to build for the output GeoTIFFs (for fast zooming)
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
-
-# QGIS "Gamma" display value to pre-set in the output .qml style file (Layer Properties ->
-# Symbology -> Gamma). This matches the value you found looks good when set manually in QGIS
-# (0.1-10 range in QGIS; values < 1 darken the display, values > 1 brighten it). This only
-# affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
-# untouched, so the data stays scientifically valid.
-QGIS_DISPLAY_GAMMA = 0.30
 
 # Resolution used when a source grid has rectangular (non-square) pixels.
 RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
@@ -410,9 +399,6 @@ def export_layer(
         grid: HDF5 group containing coordinate metadata and layer datasets.
         run_timestamp: Shared timestamp included in output filenames for this run.
         logger: Configured logger used for progress, warnings, and diagnostics.
-
-    Returns:
-        Path to the completed GeoTIFF. A same-named .qml QGIS style is also written.
 
     Raises:
         ValueError: The selected product layer is absent or is not a two-dimensional raster.
