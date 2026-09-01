@@ -277,50 +277,105 @@ and worker limit in :class:`Config`, then run ``python NISAR_Download.py``.
 
 # --------------------------------------------------------------------------- #
 def filename_from_url(url: str) -> str:
-    """Extract a decoded filename without URL query parameters."""
-    return unquote(os.path.basename(urlparse(url).path))
+    """Return a filesystem-safe product name derived from a download URL.
+
+    The URL path is separated from any query string, reduced to its final path
+    component, and URL-decoded so encoded product names are saved correctly.
+
+    Args:
+        url: Source URL for an ASF/NISAR product.
+
+    Returns:
+        Decoded filename component of ``url``.
+    """
+    return unquote(os.path.basename(urlparse(url).path))  # Strip URL metadata and decode escaped filename characters.
 
 
 def content_range_total(content_range: str | None) -> int | None:
-    """Extract the complete object size from an HTTP Content-Range header."""
-    total_text = (content_range or "").rpartition("/")[-1]
-    return int(total_text) if total_text.isdigit() else None
+    """Extract the total object size from an HTTP ``Content-Range`` header.
+
+    Args:
+        content_range: Header value such as ``bytes 0-1023/2048``; may be absent.
+
+    Returns:
+        Complete object size in bytes, or ``None`` when no numeric size is supplied.
+    """
+    total_text = (content_range or "").rpartition("/")[-1]  # Take text after the final slash, which is the full size.
+    return int(total_text) if total_text.isdigit() else None  # Convert only a valid numeric size to avoid malformed-header failures.
 
 
 def response_total_bytes(response: requests.Response) -> int | None:
-    """Return the complete object size when the server provides it."""
+    """Return the remote object's full byte count when the server exposes it.
+
+    Partial responses use ``Content-Range`` because ``Content-Length`` only
+    describes the remaining segment; full responses use ``Content-Length``.
+
+    Args:
+        response: Streaming HTTP response received from the product server.
+
+    Returns:
+        Full remote object size in bytes, or ``None`` when it is unavailable.
+    """
     if response.status_code == requests.codes.partial_content:
-        return content_range_total(response.headers.get("Content-Range"))
-    content_length = response.headers.get("Content-Length")
-    return int(content_length) if content_length and content_length.isdigit() else None
+        return content_range_total(response.headers.get("Content-Range"))  # A 206 response needs its complete size from Content-Range.
+    content_length = response.headers.get("Content-Length")  # Read the full-response payload size provided by the server.
+    return int(content_length) if content_length and content_length.isdigit() else None  # Accept only a numeric length.
 
 
 def make_worker_session_factory(authenticated_session: asf.ASFSession):
-    """Return a factory that gives each worker an independent authenticated session."""
-    headers = dict(authenticated_session.headers)
-    cookies = copy.deepcopy(authenticated_session.cookies)
-    thread_local = threading.local()
+    """Build a getter that lazily creates one authenticated session per thread.
+
+    A ``requests.Session`` is not shared by workers.  Each thread instead gets
+    a private copy of the authenticated headers, cookies, and authentication
+    settings, avoiding concurrent mutation of HTTP session state.
+
+    Args:
+        authenticated_session: ASF session that has already authenticated with Earthdata.
+
+    Returns:
+        Zero-argument callable returning the current worker's HTTP session.
+    """
+    headers = dict(authenticated_session.headers)  # Snapshot common request headers for later per-thread copies.
+    cookies = copy.deepcopy(authenticated_session.cookies)  # Preserve authentication cookies without sharing a mutable cookie jar.
+    thread_local = threading.local()  # Store a distinct session attribute for each download thread.
 
     def get_worker_session() -> requests.Session:
+        """Return the calling thread's session, creating it on first use."""
         worker_session = getattr(thread_local, "session", None)
         if worker_session is None:
-            worker_session = requests.Session()
-            worker_session.headers.update(headers)
-            worker_session.cookies = copy.deepcopy(cookies)
-            worker_session.auth = authenticated_session.auth
-            thread_local.session = worker_session
-        return worker_session
+            worker_session = requests.Session()  # Start an isolated connection pool for this worker.
+            worker_session.headers.update(headers)  # Apply the authenticated session's request headers.
+            worker_session.cookies = copy.deepcopy(cookies)  # Give this worker its own copy of login cookies.
+            worker_session.auth = authenticated_session.auth  # Retain any configured authentication handler.
+            thread_local.session = worker_session  # Cache the initialized session in this thread only.
+        return worker_session  # Reuse the thread's private session for subsequent downloads.
 
-    return get_worker_session
+    return get_worker_session  # Provide the lazy getter to the thread-pool coordinator.
 
 
 def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
-    """Download or resume one file, then atomically rename its .part file."""
-    filename = filename_from_url(url)
-    destination_path = os.path.join(output_directory, filename)
-    partial_path = f"{destination_path}.part"
-    starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0
-    headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}
+    """Download one file, resume a valid partial transfer, and finalize safely.
+
+    Data is streamed to a ``.part`` file.  If that file exists, the function
+    asks the server for only the missing byte range.  A completed file is made
+    visible only after its byte count is checked and ``os.replace`` atomically
+    moves the partial file into its final name.
+
+    Args:
+        url: Product URL to retrieve.
+        output_directory: Directory where the final product and temporary file live.
+        get_worker_session: Callable returning the current worker's HTTP session.
+        progress_position: Console row reserved for this file's progress bar.
+
+    Raises:
+        IOError: If server range metadata is invalid or the byte count is wrong.
+        requests.RequestException: If the HTTP request cannot complete successfully.
+    """
+    filename = filename_from_url(url)  # Derive the local NISAR product filename from the source URL.
+    destination_path = os.path.join(output_directory, filename)  # Choose the final destination path.
+    partial_path = f"{destination_path}.part"  # Keep incomplete output separate from completed products.
+    starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0  # Detect resumable data already written.
+    headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}  # Request only missing bytes when a partial file exists.
 
     with get_worker_session().get(
         url,
@@ -329,25 +384,25 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
         timeout=(Config.DOWNLOAD_CONNECT_TIMEOUT, Config.DOWNLOAD_READ_TIMEOUT),
     ) as response:
         if response.status_code == requests.codes.requested_range_not_satisfiable:
-            total_bytes = content_range_total(response.headers.get("Content-Range"))
+            total_bytes = content_range_total(response.headers.get("Content-Range"))  # Determine whether the local partial already has all bytes.
             if total_bytes is not None and starting_bytes == total_bytes:
-                os.replace(partial_path, destination_path)
-                return
-        response.raise_for_status()
+                os.replace(partial_path, destination_path)  # Atomically finalize the already-complete partial file.
+                return  # No additional network transfer is required.
+        response.raise_for_status()  # Propagate non-success responses to the retry wrapper.
 
-        append = starting_bytes > 0 and response.status_code == requests.codes.partial_content
+        append = starting_bytes > 0 and response.status_code == requests.codes.partial_content  # Append only when the server honored the range request.
         if append:
-            content_range = response.headers.get("Content-Range", "")
-            match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)
+            content_range = response.headers.get("Content-Range", "")  # Read the range actually returned by the server.
+            match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)  # Parse the returned segment's first byte.
             if not match or int(match.group(1)) != starting_bytes:
-                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")
+                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")  # Reject data that cannot safely continue the local file.
         elif starting_bytes:
-            logging.warning("%s ignored its range request; restarting its partial download.", filename)
-            starting_bytes = 0
+            logging.warning("%s ignored its range request; restarting its partial download.", filename)  # Record that the server sent the entire object instead.
+            starting_bytes = 0  # Reset progress because the partial file will be overwritten.
 
-        total_bytes = response_total_bytes(response)
+        total_bytes = response_total_bytes(response)  # Obtain the complete expected object size when the server sends it.
         if total_bytes is not None and starting_bytes > total_bytes:
-            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")
+            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")  # Reject a corrupt or mismatched partial file.
 
         with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
             total=total_bytes,
@@ -362,81 +417,102 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
         ) as progress_bar:
             for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
                 if chunk:
-                    output_file.write(chunk)
-                    progress_bar.update(len(chunk))
+                    output_file.write(chunk)  # Persist this non-empty streamed block to disk.
+                    progress_bar.update(len(chunk))  # Advance the visual progress indicator by the written byte count.
 
-    downloaded_bytes = os.path.getsize(partial_path)
+    downloaded_bytes = os.path.getsize(partial_path)  # Inspect the complete temporary file after the response closes.
     if total_bytes is not None and downloaded_bytes != total_bytes:
-        raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")
-    os.replace(partial_path, destination_path)
+        raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")  # Keep the partial file available for a later resume.
+    os.replace(partial_path, destination_path)  # Atomically expose a verified file at its final path.
 
 
 def download_with_retries(url: str, output_directory: str, get_worker_session, progress_position: int) -> str:
-    """Retry interrupted transfers without discarding their partial file."""
-    filename = filename_from_url(url)
+    """Retry one resumable download with exponential backoff between attempts.
+
+    The ``.part`` file remains in place after a failed request, allowing the
+    next call to ``download_single_file`` to continue from the saved byte count.
+
+    Args:
+        url: Product URL to download.
+        output_directory: Directory containing final and partial downloads.
+        get_worker_session: Callable returning the current worker's HTTP session.
+        progress_position: Console row used by the progress bar.
+
+    Returns:
+        Filename of the successfully downloaded product.
+
+    Raises:
+        RuntimeError: If every configured transfer attempt fails.
+    """
+    filename = filename_from_url(url)  # Retain a readable product name for return values and log messages.
     for attempt in range(1, Config.DOWNLOAD_MAX_ATTEMPTS + 1):
         try:
-            download_single_file(url, output_directory, get_worker_session, progress_position)
-            return filename
+            download_single_file(url, output_directory, get_worker_session, progress_position)  # Perform or resume the transfer.
+            return filename  # Report success to the future monitored by the coordinator.
         except (requests.RequestException, OSError, ValueError) as error:
             if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
-                raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error
-            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))
+                raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error  # Surface the final failure with its original cause.
+            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))  # Double the delay after each failed attempt.
             logging.warning(
                 "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
                 filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
             )
-            time.sleep(wait_seconds)
+            time.sleep(wait_seconds)  # Pause before retrying to reduce pressure on a transiently failing service.
 
 
-def download_files_with_thread_pool(  # Download a list of files with bounded concurrency.
-    download_urls: list[str],  # URLs of the files to download.
-    output_directory: str,  # Local directory to save files into (created if it doesn't already exist).
-    session: asf.ASFSession,  # Authenticated ASFSession used for the HTTP requests.
+def download_files_with_thread_pool(  # Coordinate bounded, concurrent product downloads.
+    download_urls: list[str],  # Candidate product URLs, including any duplicates.
+    output_directory: str,  # Local destination directory, created when absent.
+    session: asf.ASFSession,  # Earthdata-authenticated ASF session used to seed workers.
 ) -> None:
-    """Download files concurrently with a safe worker cap and isolated sessions.
+    """Download product URLs concurrently with a safe worker cap.
+
+    Existing files and duplicate URLs are skipped.  Each remaining URL runs in
+    a worker with its own authenticated HTTP session.  Completion is collected
+    as each future finishes, so a single failed transfer is logged without
+    preventing unrelated products from completing.
 
     Args:
-        download_urls: URLs of the files to download.
-        output_directory: Local directory to save files into (created if it doesn't already exist).
-        session: Authenticated ASFSession used for the HTTP requests.
+        download_urls: Candidate product URLs to process.
+        output_directory: Local directory used for downloaded products.
+        session: Authenticated ASF session whose credentials are copied per worker.
     """
-    os.makedirs(output_directory, exist_ok=True)  # Create the output data directory safely if it doesn't exist.
-    logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Log its absolute path.
-    logging.info("Starting download of %d file(s) with at most %d worker threads.", len(download_urls), Config.DOWNLOAD_WORKERS)
+    os.makedirs(output_directory, exist_ok=True)  # Ensure the requested local destination is ready for file output.
+    logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Record the fully resolved output location.
+    logging.info("Starting download of %d file(s) with at most %d worker threads.", len(download_urls), Config.DOWNLOAD_WORKERS)  # Announce the workload and concurrency ceiling.
 
-    get_worker_session = make_worker_session_factory(session)
-    pending_urls = []
-    successful_downloads = 0
-    for url in dict.fromkeys(download_urls):  # Remove duplicate URLs before scheduling work.
-        filename = filename_from_url(url)
+    get_worker_session = make_worker_session_factory(session)  # Create a thread-local authenticated-session provider.
+    pending_urls = []  # Accumulate URLs that still need a network transfer.
+    successful_downloads = 0  # Count existing and newly completed products as successes.
+    for url in dict.fromkeys(download_urls):  # Preserve order while removing duplicate URLs before scheduling work.
+        filename = filename_from_url(url)  # Determine the destination filename for this candidate URL.
         if os.path.isfile(os.path.join(output_directory, filename)):
-            logging.info("File already exists, skipping: %s", filename)
-            successful_downloads += 1
+            logging.info("File already exists, skipping: %s", filename)  # Avoid replacing an already completed product.
+            successful_downloads += 1  # Treat a reusable existing product as a successful result.
         else:
-            pending_urls.append(url)
+            pending_urls.append(url)  # Queue the missing product for a worker thread.
 
-    failed_downloads = 0
-    tqdm.set_lock(threading.RLock())  # Prevent simultaneous progress-bar writes from corrupting the console.
-    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))
+    failed_downloads = 0  # Count files that exhaust their retry attempts.
+    tqdm.set_lock(threading.RLock())  # Serialize progress-bar output from simultaneous worker threads.
+    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))  # Do not create more workers than pending files.
     if worker_count:
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
             futures = {
-                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url
-                for index, url in enumerate(pending_urls)
+                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url  # Assign each URL a retrying task and stable progress-bar row.
+                for index, url in enumerate(pending_urls)  # Submit every missing URL to the bounded executor.
             }
-            for future in as_completed(futures):
-                filename = filename_from_url(futures[future])
+            for future in as_completed(futures):  # Process tasks in completion order rather than submission order.
+                filename = filename_from_url(futures[future])  # Recover the product name associated with this future.
                 try:
-                    future.result()
-                    successful_downloads += 1
-                    logging.info("Successfully finished downloading file: %s", filename)
+                    future.result()  # Re-raise any worker exception in the coordinating thread.
+                    successful_downloads += 1  # Include this newly completed file in the final summary.
+                    logging.info("Successfully finished downloading file: %s", filename)  # Record individual transfer success.
                 except Exception as file_error:
-                    failed_downloads += 1
-                    logging.error("Failed to download %s: %s", filename, file_error)
+                    failed_downloads += 1  # Record the failure while allowing other futures to finish.
+                    logging.error("Failed to download %s: %s", filename, file_error)  # Preserve the filename and root error in the log.
 
-    logging.info(  # Log the overall download summary.
-        f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"
+    logging.info(  # Emit a final operational summary after all scheduled work completes.
+        f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"  # Include skipped existing files as successes.
     )
 
 # --------------------------------------------------------------------------- #
