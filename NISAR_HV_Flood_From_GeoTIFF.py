@@ -9,7 +9,7 @@ It does not open a NISAR HDF5/NetCDF product or repeat the SAR processing.
 With no command-line arguments, every GeoTIFF below ``GeoTIFF_Processed`` is
 used as input and the masks are written to ``Flood_Raster``. A pixel is flood
 (``1``) when its valid input value is strictly below the selected threshold
-(default: -15 dB); all other pixels,
+(default: -20 dB); all other pixels,
 including input NoData, are non-flood (``0``).
 """
 
@@ -53,7 +53,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 # Accept both common GeoTIFF filename extensions.
 SUPPORTED_EXTENSIONS = (".tif", ".tiff")
 # Classify valid dB pixels below this value as flooded unless the user overrides it.
-DEFAULT_FLOOD_THRESHOLD_DB = -15.0
+DEFAULT_FLOOD_THRESHOLD_DB = -20.0
 # Process rasters in 512-by-512-pixel tiles to limit memory use.
 TILE_SIZE = 512
 # Candidate pyramid scales for faster display of large output rasters.

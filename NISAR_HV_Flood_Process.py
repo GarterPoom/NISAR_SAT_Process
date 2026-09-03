@@ -122,8 +122,8 @@ TILE_SIZE = 512
 OUTPUT_NODATA = -9999.0
 
 # Fixed dB threshold for the flood mask. Pixels strictly below this value are
-# flood (1); pixels equal to or above -13 dB and source NoData are non-flood (0).
-FLOOD_THRESHOLD_DB = -15.0
+# flood (1); pixels equal to or above -20 dB and source NoData are non-flood (0).
+FLOOD_THRESHOLD_DB = -20.0
 
 # List of overview/pyramid levels to build for the output GeoTIFFs (for fast zooming)
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
