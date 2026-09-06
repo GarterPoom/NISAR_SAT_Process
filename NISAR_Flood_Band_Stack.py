@@ -141,7 +141,7 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
     incomplete = 0  # Count groups lacking a required channel.
     for identity, channels in sorted(groups.items()):  # Examine each source/run group independently.
         scene, product, frequency, export_date, stamp = identity  # Unpack the shared identifiers.
-        name = f"{scene}_{product}_{frequency}_RGB_HH_HV_HHminusHV_dB_{stamp}"  # Name the output.
+        name = f"{scene}_{product}_{frequency}_Flood_Bandstack_{stamp}"  # Name the output.
         missing = {"HH", "HV"} - channels.keys()  # Determine whether either required channel is absent.
         if missing:  # Prevent combining incomplete groups with another date or run.
             incomplete += 1  # Count this unprocessed group.
