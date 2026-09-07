@@ -93,7 +93,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 
 # Path to the Digital Elevation Model (DEM) used for Terrain Correction (RTC)
 # This must match the CRS and spatial resolution of your target area
-LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "Directory_DEM" / "your_local_DEM.tif"
+LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "NASA_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif"
 
 # Internal HDF5 paths for the supported NISAR products.
 PRODUCT_GRIDS_PATHS = {
@@ -105,7 +105,7 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HH", "HV")
+POLARIZATIONS = ("HV", "HH")
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
@@ -121,8 +121,14 @@ OUTPUT_NODATA = -9999.0
 # List of overview/pyramid levels to build for the output GeoTIFFs (for fast zooming)
 OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 
+# QGIS "Gamma" display value to pre-set in the output .qml style file (Layer Properties ->
+# Symbology -> Gamma). This matches the value you found looks good when set manually in QGIS
+# (0.1-10 range in QGIS; values < 1 darken the display, values > 1 brighten it). This only
+# affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
+# untouched, so the data stays scientifically valid.
+
 # Resolution used when a source grid has rectangular (non-square) pixels.
-RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
+RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 5.0
 
 
 # --- FUNCTION DEFINITIONS ---
