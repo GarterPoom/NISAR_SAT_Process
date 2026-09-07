@@ -27,9 +27,8 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    # Set these in the environment; never store Earthdata credentials in source control.
-    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "")
-    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "")
+    EARTHDATA_USERNAME = "Your_NASA_Earthdata_Username_Account"  # NASA Earthdata login username.
+    EARTHDATA_PASSWORD = "Your_NASA_Earthdata_Password"  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -43,11 +42,11 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                             "Thailand_Admin",
-                             "L05_Province_ESRI_2559.shp")
+                             "administrative_divisions_directory",
+                             "admin_shapefile.shp")
 
-    START_DATE = datetime.strptime("2026-07-01", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
-    END_DATE = datetime.strptime("2026-07-31", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
+    END_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
 

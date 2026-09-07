@@ -93,7 +93,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 
 # Path to the Digital Elevation Model (DEM) used for Terrain Correction (RTC)
 # This must match the CRS and spatial resolution of your target area
-LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "NASA_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif"
+LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "LOCAL_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif (e.g.)"
 
 # Internal HDF5 paths for the supported NISAR products.
 PRODUCT_GRIDS_PATHS = {
@@ -105,7 +105,7 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HH",)
+POLARIZATIONS = ("HH", "HV")
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
@@ -128,7 +128,7 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # untouched, so the data stays scientifically valid.
 
 # Resolution used when a source grid has rectangular (non-square) pixels.
-RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 5.0
+RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
 
 
 # --- FUNCTION DEFINITIONS ---

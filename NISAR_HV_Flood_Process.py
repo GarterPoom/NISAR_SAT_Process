@@ -83,7 +83,7 @@ from rasterio.windows import bounds as window_bounds
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 
 # Root directory where the raw NISAR HDF5/NetCDF files are located
-ROOT_DIRECTORY = Path(r"N:\\Flood\\y2026\\00_Download\\NISAR\\GSLC\\06\\Descending") #SCRIPT_DIRECTORY / "NISAR_Product"
+ROOT_DIRECTORY = Path(r"NISAR_Product") #SCRIPT_DIRECTORY / "NISAR_Product"
 
 # Directory where the processed, georeferenced GeoTIFF files will be saved
 PROCESSED_DIRECTORY = SCRIPT_DIRECTORY / "GeoTIFF_Processed"
