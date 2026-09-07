@@ -128,7 +128,7 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # untouched, so the data stays scientifically valid.
 
 # Resolution used when a source grid has rectangular (non-square) pixels.
-RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 5.0
+RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
 
 
 # --- FUNCTION DEFINITIONS ---
