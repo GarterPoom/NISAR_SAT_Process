@@ -105,7 +105,7 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HH",)
+POLARIZATIONS = ("HH", "HV")
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
