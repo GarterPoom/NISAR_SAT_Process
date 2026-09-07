@@ -83,7 +83,7 @@ from rasterio.windows import bounds as window_bounds
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 
 # Root directory where the raw NISAR HDF5/NetCDF files are located
-ROOT_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_Product"
+ROOT_DIRECTORY = Path(r"NISAR_Product") #SCRIPT_DIRECTORY / "NISAR_Product"
 
 # Directory where the processed, georeferenced GeoTIFF files will be saved
 PROCESSED_DIRECTORY = SCRIPT_DIRECTORY / "GeoTIFF_Processed"
@@ -105,7 +105,7 @@ PRODUCT_GRIDS_PATHS = {
 FREQUENCIES = ("frequencyA",)
 
 # Tuple specifying which polarization channels to extract (e.g., HH, HV polarization)
-POLARIZATIONS = ("HV", "HH")
+POLARIZATIONS = ("HH",)
 
 # A list of file extensions that the script will recognize as valid input files
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
@@ -379,6 +379,51 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     decibels[valid] = 10.0 * np.log10(intensity[valid])
     return decibels
 
+
+def completed_output_path(
+    source_file: Path,
+    product_type: str,
+    frequency: str,
+    polarization: str,
+    logger: logging.Logger,
+) -> Path | None:
+    """Return an existing final GeoTIFF for a layer, ignoring partial outputs.
+
+    Output filenames include the batch timestamp, so search for any prior final
+    export of this source/product/frequency/polarization combination.  The final
+    GeoTIFF is only published with ``os.replace`` after writing, overviews, and
+    statistics all succeed; ``*.part.tif`` files are therefore never treated as
+    completed results.
+    """
+    output_prefix = (
+        f"{source_file.stem}_{product_type}_{frequency}_{polarization}_Processed_dB_"
+    )
+    candidates = sorted(
+        PROCESSED_DIRECTORY.glob(f"{output_prefix}*.tif"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for candidate in candidates:
+        # Interrupted exports retain a .part.tif suffix and must be retried.
+        if candidate.name.endswith(".part.tif"):
+            continue
+        try:
+            # Confirm the final-named file can still be opened as a nonempty GeoTIFF.
+            with rasterio.open(candidate) as existing_raster:
+                if (
+                    existing_raster.driver == "GTiff"
+                    and existing_raster.count == 1
+                    and existing_raster.width > 0
+                    and existing_raster.height > 0
+                ):
+                    return candidate
+        except (OSError, rasterio.errors.RasterioError) as exc:
+            # A damaged result is not complete and should be regenerated.
+            logger.warning("Existing GeoTIFF is unreadable and will be regenerated: %s (%s)", candidate, exc)
+
+    return None
+
 def export_layer(
     source_file: Path,
     product_type: str,
@@ -410,6 +455,19 @@ def export_layer(
         ValueError: The selected product layer is absent or is not a two-dimensional raster.
         OSError: A source, DEM, temporary GeoTIFF, or output GeoTIFF operation fails.
     """
+    # Avoid repeating expensive tile processing when a previous run published this layer.
+    existing_output = completed_output_path(
+        source_file, product_type, frequency, polarization, logger
+    )
+    if existing_output is not None:
+        logger.info(
+            "Skipping %s/%s; completed GeoTIFF already exists: %s",
+            frequency,
+            polarization,
+            existing_output,
+        )
+        return existing_output
+
     # Convert the requested channel name to the dataset name used by this product type.
     dataset_name = dataset_name_for_polarization(product_type, polarization)
     # Keep the HDF5 dataset lazy; tile slices below read only the needed source pixels.

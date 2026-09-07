@@ -27,8 +27,9 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"  # NASA Earthdata login username.                                   
-    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"  # NASA Earthdata login password.
+    # Set these in the environment; never store Earthdata credentials in source control.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "")
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "")
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -42,17 +43,17 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                             "administrative_boundary_shapefile_dir",
-                             "administrative.shp")
+                             "Thailand_Admin",
+                             "L05_Province_ESRI_2559.shp")
 
-    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
-    END_DATE = datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    START_DATE = datetime.strptime("2026-07-01", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
+    END_DATE = datetime.strptime("2026-07-31", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
     DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
-    DOWNLOAD_WORKERS = 4  # Safe upper limit for simultaneous file downloads.
+    DOWNLOAD_WORKERS = 2  # Safe upper limit for simultaneous file downloads.
     DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
     DOWNLOAD_READ_TIMEOUT = 120  # Seconds allowed without receiving download data.
     DOWNLOAD_MAX_ATTEMPTS = 5  # Initial attempt plus retries for interrupted downloads.

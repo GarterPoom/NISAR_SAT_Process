@@ -209,20 +209,21 @@ def flood_raster_path(
 
 
 def valid_existing_output(output_path: Path) -> bool:
-    """Return True only for a readable, nonempty, one-band uint8 GeoTIFF."""
+    """Return True only for a readable, nonempty, binary GeoTIFF without NoData."""
     # A missing path cannot be reused as an existing output.
     if not output_path.is_file():
         return False
     try:
         # Open the candidate output only long enough to inspect its metadata.
         with rasterio.open(output_path) as raster:
-            # Verify the expected format, shape, band count, and categorical data type.
+            # Recreate legacy outputs that declare NoData; flood masks must be all-valid 0/1.
             return (
                 raster.driver == "GTiff"
                 and raster.count == 1
                 and raster.width > 0
                 and raster.height > 0
                 and raster.dtypes[0] == "uint8"
+                and raster.nodata is None
             )
     # Treat unreadable or malformed rasters as invalid rather than aborting the run.
     except (OSError, rasterio.errors.RasterioError):
