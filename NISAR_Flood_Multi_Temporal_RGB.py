@@ -27,9 +27,11 @@ Input filename convention
 -------------------------
 ``<NISAR_SOURCE>_<GSLC|GCOV>_<FREQUENCY>_HH_Processed_dB_<EXPORT>.tif``
 
-The NISAR source name must contain Track, Frame, direction, acquisition start,
-and acquisition end fields, for example:
-``NISAR_L2_UR_GSLC_030_004_D_..._20260906T114638_20260906T114713_...``
+The NISAR source name must contain a leading numeric identifier, Track,
+direction, Frame, acquisition start, and acquisition end fields, for example:
+``NISAR_L2_UR_GSLC_030_004_D_080_..._20260906T114638_20260906T114713_...``
+In that example, Track is ``004``, direction is ``D``, and Frame is ``080``;
+the preceding ``030`` field is not Track.
 HV files, existing band stacks, and temporary ``.part.tif`` files are ignored.
 When the same acquisition was exported more than once, the most recent export
 timestamp is used so an older processing result is not selected accidentally.
@@ -97,7 +99,7 @@ PROCESSED_PATTERN = re.compile(  # Describe the final processed GeoTIFF filename
 )  # Finish compiling the processed-filename pattern once at import time.
 SOURCE_PATTERN = re.compile(  # Describe identifiers embedded in a standard NISAR source-product name.
     r"^NISAR_(?P<level>L\d+)_(?P<mode>[A-Z0-9]+)_(?P<source_product>GSLC|GCOV)_"  # Capture product family fields.
-    r"(?P<track>\d+)_(?P<frame>\d+)_(?P<direction>[AD])_.*?"  # Capture Track, Frame, and orbit direction.
+    r"\d+_(?P<track>\d+)_(?P<direction>[AD])_(?P<frame>\d+)_.*?"  # Skip leading ID, then capture Track/direction/Frame.
     r"(?P<acquisition_start>\d{8}T\d{6})_(?P<acquisition_end>\d{8}T\d{6})_.+$",  # Capture acquisition interval.
     re.IGNORECASE,  # Accept case variations found in otherwise valid product names.
 )  # Finish compiling the source-product pattern once at import time.
@@ -187,22 +189,31 @@ def filename_info(path: Path) -> SceneInfo | None:  # Define parsing for one can
             tokens between its source name and processed suffix.
     """
     processed_match = PROCESSED_PATTERN.fullmatch(path.name)  # Match the entire final processed filename.
+
     if processed_match is None:  # Detect unrelated rasters, folders, and temporary products.
         return None  # Tell discovery to ignore unsupported entries safely.
+
     processed = processed_match.groupdict()  # Extract the outer processed-product fields by name.
     source_match = SOURCE_PATTERN.fullmatch(processed["scene"])  # Parse the embedded NISAR source filename.
+
     if source_match is None:  # Require standard source fields so Track and Frame are trustworthy.
         return None  # Ignore non-NISAR or shortened names instead of guessing field positions.
+
     source = source_match.groupdict()  # Extract source-product fields into an accessible mapping.
+
     acquisition_start = datetime.strptime(source["acquisition_start"], "%Y%m%dT%H%M%S")  # Validate acquisition start.
     acquisition_end = datetime.strptime(source["acquisition_end"], "%Y%m%dT%H%M%S")  # Validate acquisition end.
     export_time = datetime.strptime(processed["export_stamp"], "%Y%m%d_%H%M%S")  # Validate processing export time.
+
     if acquisition_end < acquisition_start:  # Reject a malformed interval before using its date.
         raise ValueError(f"Acquisition end precedes start in {path.name}")  # Identify the invalid input precisely.
+
     source_product = source["source_product"].upper()  # Normalize the embedded product token for comparison.
     product = processed["product"].upper()  # Normalize the processed suffix product token for comparison.
+
     if source_product != product:  # Detect inconsistent GSLC/GCOV identity within one filename.
         raise ValueError(f"Source and processed product types differ in {path.name}")  # Refuse uncertain grouping.
+
     return SceneInfo(  # Assemble one immutable, fully validated scene record.
         path=path,  # Store the file to open when writing a selected composite.
         scene=processed["scene"],  # Preserve the complete source product name.
@@ -255,10 +266,13 @@ def choose_scene(candidates: list[SceneInfo], acquisition_date: date) -> SceneIn
             because a calendar-date option cannot select between them safely.
     """
     acquisition_times = {item.acquisition_start for item in candidates}  # Find distinct passes on this date.
+
     if len(acquisition_times) != 1:  # Detect an ambiguity that export timestamps cannot resolve.
         names = ", ".join(item.path.name for item in sorted(candidates, key=lambda item: item.path.name))  # List evidence.
         raise ValueError(f"Multiple HH acquisitions exist on {acquisition_date:%Y%m%d}: {names}")  # Refuse to guess.
+
     selected = max(candidates, key=lambda item: (item.export_time, item.path.name))  # Prefer the newest processing result.
+
     if len(candidates) > 1:  # Make automatic duplicate resolution visible to the operator.
         LOG.warning(  # Report the chosen file and number of older alternatives.
             "Using newest export for %s Track %s Frame %s: %s (%d older export(s) ignored)",  # Define message fields.
@@ -268,6 +282,7 @@ def choose_scene(candidates: list[SceneInfo], acquisition_date: date) -> SceneIn
             selected.path.name,  # Identify the actual input selected.
             len(candidates) - 1,  # Count the ignored older exports.
         )  # Finish the duplicate-resolution warning.
+
     return selected  # Supply the unique newest export to composite discovery.
 
 
@@ -294,22 +309,31 @@ def discover_composites(  # Define directory scanning and temporal pairing.
     """
     if (low_date is None) != (high_date is None):  # Require date overrides as one meaningful pair.
         raise ValueError("--low-date and --high-date must be supplied together")  # Prevent a half-defined event.
+
     if low_date is not None and high_date is not None and low_date >= high_date:  # Require different chronological dates.
         raise ValueError("--low-date must be earlier than --high-date")  # Keep channel roles temporally consistent.
+
     groups: dict[tuple[str, ...], dict[date, list[SceneInfo]]] = {}  # Index matching groups, then acquisition dates.
+
     for path in sorted(input_dir.iterdir()):  # Inspect entries in deterministic filename order.
         if not path.is_file():  # Exclude output folders and any other directories.
             continue  # Advance to the next entry without attempting filename parsing.
+
         info = filename_info(path)  # Parse and validate any supported processed raster filename.
+
         if info is None or info.polarization != "HH":  # Use only HH, ignoring HV and unrelated products.
             continue  # Advance without treating intentionally ignored inputs as errors.
+
         by_date = groups.setdefault(group_key(info), {})  # Retrieve this Track/Frame-compatible group.
         by_date.setdefault(info.acquisition_start.date(), []).append(info)  # Register the scene under its source date.
+
     composites: list[Composite] = []  # Collect valid output plans in deterministic group order.
     incomplete = 0  # Count groups that cannot satisfy the requested temporal pairing.
+
     for key, by_date in sorted(groups.items()):  # Resolve every compatible Track/Frame group independently.
         level, mode, source_product, product, frequency_key, track, frame, direction = key  # Unpack name fields.
         available_dates = sorted(by_date)  # Order acquisitions using filename timestamps, never file dates.
+
         if low_date is None or high_date is None:  # Apply automatic earliest/latest selection.
             if len(available_dates) < 2:  # Require two distinct acquisition calendar dates.
                 incomplete += 1  # Record that this Track/Frame group cannot be processed yet.
@@ -321,12 +345,14 @@ def discover_composites(  # Define directory scanning and temporal pairing.
                     ", ".join(item.strftime("%Y%m%d") for item in available_dates) or "none",  # List source dates.
                 )  # Finish the missing-date warning.
                 continue  # Advance to another group without creating an invalid composite.
+
             selected_low_date = available_dates[0]  # Treat the earliest date as low flood by documented default.
             selected_high_date = available_dates[-1]  # Treat the latest date as high flood by documented default.
         else:  # Apply the operator's known flood-event date choices.
             selected_low_date = low_date  # Use the explicit red/blue acquisition date.
             selected_high_date = high_date  # Use the explicit green acquisition date.
             missing_dates = [item for item in (selected_low_date, selected_high_date) if item not in by_date]  # Check both.
+
             if missing_dates:  # Skip a group that does not contain the complete requested pair.
                 incomplete += 1  # Include the group in the partial-failure exit status.
                 LOG.warning(  # Report requested, missing, and available dates for correction.
@@ -338,14 +364,18 @@ def discover_composites(  # Define directory scanning and temporal pairing.
                     ", ".join(item.strftime("%Y%m%d") for item in available_dates),  # List usable source dates.
                 )  # Finish the requested-date warning.
                 continue  # Advance without silently substituting a different date.
+
         low = choose_scene(by_date[selected_low_date], selected_low_date)  # Resolve the newest low-date export.
         high = choose_scene(by_date[selected_high_date], selected_high_date)  # Resolve the newest high-date export.
         frequency = low.frequency  # Preserve original frequency capitalization in the output filename.
+
         name = (  # Build a readable, collision-resistant output filename stem.
             f"NISAR_Track{track}_Frame{frame}_{direction}_{level}_{mode}_{source_product}_"  # Record matching geometry.
             f"{product}_{frequency}_MultiTemporal_RGB_{selected_low_date:%Y%m%d}_{selected_high_date:%Y%m%d}"  # Record dates.
         )  # Finish the output name.
+
         composites.append(Composite(name=name, low=low, high=high))  # Store the validated pair for processing.
+
     return composites, incomplete  # Return all complete plans and skipped-group count.
 
 
@@ -364,14 +394,19 @@ def validate_temporal_pair(low_path: Path, high_path: Path) -> tuple[SceneInfo, 
     """
     low = filename_info(low_path)  # Parse and validate the proposed red/blue source.
     high = filename_info(high_path)  # Parse and validate the proposed green source.
+
     if low is None or high is None:  # Require filenames with reliable NISAR identity fields.
         raise ValueError("Both inputs must follow the final NISAR processed GeoTIFF naming convention")  # Reject guesses.
+
     if low.polarization != "HH" or high.polarization != "HH":  # Enforce the requested HH-only band mapping.
         raise ValueError("Both temporal inputs must be HH rasters")  # Reject HV or swapped product inputs.
+
     if group_key(low) != group_key(high):  # Compare Track, Frame, direction, product, mode, and frequency.
         raise ValueError("Temporal inputs must share Track, Frame, direction, level, mode, product, and frequency")  # Explain.
+
     if low.acquisition_start.date() >= high.acquisition_start.date():  # Require low scene to precede high scene by date.
         raise ValueError("Low-flood acquisition date must be earlier than high-flood acquisition date")  # Enforce roles.
+
     return low, high  # Supply validated source metadata to the raster writer.
 
 
@@ -395,17 +430,23 @@ def stack_temporal_pair(low_path: Path, high_path: Path, output_path: Path) -> N
     """
     low_info, high_info = validate_temporal_pair(low_path, high_path)  # Recheck identity for direct function calls.
     resolved_output = output_path.resolve()  # Normalize the destination before comparing it with sources.
+
     if resolved_output in {low_path.resolve(), high_path.resolve()}:  # Protect both input datasets from replacement.
         raise ValueError("Output must not replace either input raster")  # Stop before a writer can truncate a source.
+
     temporary = output_path.with_name(f".{uuid.uuid4().hex}.part.tif")  # Allocate a unique staging raster nearby.
+
     try:  # Guarantee cleanup of this call's incomplete staging file.
         with rasterio.open(low_path) as low, rasterio.open(high_path) as high:  # Open and later close both source rasters.
             if low.count != 1 or high.count != 1:  # Require original single-band processed products.
                 raise ValueError("Expected single-band HH inputs")  # Reject a prior stack or unexpected dataset.
+
             if low.crs is None or high.crs is None:  # Require defined coordinate reference systems.
                 raise ValueError("Both inputs must have a coordinate reference system")  # Prevent ungeoreferenced output.
+
             if low.crs != high.crs or low.shape != high.shape or low.transform != high.transform:  # Compare full grids.
                 raise ValueError("Temporal HH grids differ; align CRS, dimensions, and transform before stacking")  # Reject.
+
             profile = {  # Define storage, band structure, compression, and georeferencing.
                 "driver": "GTiff",  # Write the result using the GeoTIFF driver.
                 "width": low.width,  # Preserve the shared number of pixel columns.
@@ -424,19 +465,24 @@ def stack_temporal_pair(low_path: Path, high_path: Path, output_path: Path) -> N
                 "photometric": "RGB",  # Advertise the bands as a true RGB visualization mapping.
                 "interleave": "pixel",  # Store the three channel values together per pixel.
             }  # Finish the destination profile.
+
             with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):  # Embed validity in the TIFF rather than a sidecar file.
                 with rasterio.open(temporary, "w", **profile) as dst:  # Create and safely close the staging dataset.
                     dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)  # Declare display roles.
+
                     low_date_text = low_info.acquisition_start.strftime("%Y-%m-%d")  # Format the low date once.
                     high_date_text = high_info.acquisition_start.strftime("%Y-%m-%d")  # Format the high date once.
+
                     band_labels = (  # Define self-explanatory descriptions in exact output order.
                         f"HH non-flood/low-flood ({low_date_text})",  # Describe the red-band source and date.
                         f"HH high-flood ({high_date_text})",  # Describe the green-band source and date.
                         f"HH non-flood/low-flood ({low_date_text})",  # Describe the repeated blue-band source.
                     )  # Finish band-label construction.
+
                     for index, label in enumerate(band_labels, 1):  # Number Rasterio bands from one.
                         dst.set_band_description(index, label)  # Embed the human-readable role on each channel.
                         dst.set_band_unit(index, "dB")  # Record the measurement unit for every output channel.
+
                     dst.update_tags(  # Record provenance and matching evidence at dataset level.
                         SOURCE_LOW_HH=low_path.name,  # Identify the red/blue source file exactly.
                         SOURCE_HIGH_HH=high_path.name,  # Identify the green source file exactly.
@@ -455,25 +501,35 @@ def stack_temporal_pair(low_path: Path, high_path: Path, output_path: Path) -> N
                         BAND_MAPPING="R=low/non-flood HH; G=high-flood HH; B=low/non-flood HH",  # Document channels.
                         VALIDITY="All bands valid only where both temporal HH source pixels are valid",  # Explain mask.
                     )  # Finish writing dataset-level metadata.
+
                     tile_rows = (low.height + TILE_SIZE - 1) // TILE_SIZE  # Round up the output tile-row count.
                     tile_columns = (low.width + TILE_SIZE - 1) // TILE_SIZE  # Round up the tile-column count.
                     total = tile_rows * tile_columns  # Count all windows for progress percentages.
+
                     for number, (_, window) in enumerate(dst.block_windows(1), 1):  # Visit every output tile once.
                         low_data = low.read(1, window=window, masked=True, out_dtype="float32")  # Read low HH and mask.
                         high_data = high.read(1, window=window, masked=True, out_dtype="float32")  # Read high HH and mask.
+
                         valid = ~np.ma.getmaskarray(low_data) & ~np.ma.getmaskarray(high_data)  # Require both masks valid.
                         valid &= np.isfinite(low_data.data) & np.isfinite(high_data.data)  # Exclude NaN and infinity.
+
                         data = np.stack((low_data.data, high_data.data, low_data.data)).astype(np.float32, copy=False)  # Map RGB.
                         data[:, ~valid] = OUTPUT_NODATA  # Apply the identical invalid footprint to all three channels.
+
                         dst.write(data, window=window)  # Write this completed three-band tile.
                         dst.write_mask(valid.astype(np.uint8) * 255, window=window)  # Encode valid=255 and invalid=0.
+
                         if number == total or number % max(1, total // 10) == 0:  # Report about every ten percent.
                             LOG.info("Stacking: %.0f%% (%d/%d tiles)", 100 * number / total, number, total)  # Show progress.
+
                     factors = [factor for factor in (2, 4, 8, 16, 32) if min(low.width, low.height) // factor >= 1]  # Fit.
+
                     if factors:  # Avoid invalid overviews for extremely small rasters.
                         dst.build_overviews(factors, Resampling.average)  # Build continuous-data display pyramids.
                         dst.update_tags(ns="rio_overview", resampling="average")  # Record the overview algorithm.
+
         os.replace(temporary, output_path)  # Publish only the fully closed and completed raster.
+
     finally:  # Run after success and every possible read/write exception.
         if temporary.exists():  # Detect whether this call left an incomplete staging file.
             temporary.unlink()  # Remove only the uniquely named temporary output.
@@ -496,55 +552,69 @@ def main() -> int:  # Define the command-line batch workflow.
         description=__doc__,  # Reuse the module documentation as the workflow description.
         formatter_class=argparse.RawDescriptionHelpFormatter,  # Preserve documentation formatting.
     )  # Finish parser construction.
+
     parser.add_argument(  # Define the processed-raster source folder.
         "--input-dir",  # Expose a readable long option name.
         type=Path,  # Convert text to a platform-aware path.
         default=DEFAULT_INPUT_DIRECTORY,  # Use the normal processing output by default.
         help="Folder containing final processed HH GeoTIFFs",  # Explain the accepted folder content.
     )  # Finish the input-folder option.
+
     parser.add_argument(  # Define an optional composite destination override.
         "--output-dir",  # Expose a readable long option name.
         type=Path,  # Convert supplied text to a platform-aware path.
         help="Default: INPUT_DIR/Multi_Temporal_RGB",  # Explain the automatic destination.
     )  # Finish the output-folder option.
+
     parser.add_argument(  # Define selection of a known non-flood/low-flood date.
         "--low-date",  # Use terminology matching the requested channel mapping.
         type=parse_date_argument,  # Validate the compact calendar date immediately.
         help="Non-flood/low-flood acquisition date (YYYYMMDD); requires --high-date",  # Explain pairing.
     )  # Finish the low-date option.
+
     parser.add_argument(  # Define selection of a known high-flood date.
         "--high-date",  # Use terminology matching the requested channel mapping.
         type=parse_date_argument,  # Validate the compact calendar date immediately.
         help="High-flood acquisition date (YYYYMMDD); requires --low-date",  # Explain pairing.
     )  # Finish the high-date option.
+
     parser.add_argument(  # Define explicit replacement of completed composites.
         "--overwrite",  # Expose a readable boolean switch.
         action="store_true",  # Default to false and become true when specified.
         help="Replace existing composites; otherwise skip them",  # Explain the safe default.
     )  # Finish the overwrite option.
+
     args = parser.parse_args()  # Parse and validate all command-line values.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")  # Configure messages.
+
     if not args.input_dir.is_dir():  # Check the source before creating any output folder.
         LOG.error("Input directory does not exist: %s", args.input_dir)  # Identify the missing folder.
         return 1  # Signal failure to the calling shell.
+
     try:  # Convert discovery exceptions into a concise batch failure.
         composites, incomplete = discover_composites(args.input_dir, args.low_date, args.high_date)  # Find pairs.
     except (ValueError, OSError) as exc:  # Catch invalid names, date choices, ambiguity, or unreadable folders.
         LOG.error("Composite discovery failed: %s", exc)  # Explain why processing could not begin.
         return 1  # Stop before creating potentially mismatched products.
+
     if not composites:  # Detect a folder with no usable two-date HH group.
         LOG.error("No same-Track/Frame HH scenes on two different acquisition dates were found")  # Explain.
         return 1  # Signal that no requested output could be produced.
+
     output_dir = args.output_dir or args.input_dir / DEFAULT_OUTPUT_SUBDIRECTORY  # Choose requested or default output.
     output_dir.mkdir(parents=True, exist_ok=True)  # Create the destination and missing parent folders.
     LOG.info("Found %d multi-temporal pair(s)", len(composites))  # Report the batch size before raster I/O.
+
     created = skipped = failed = 0  # Initialize complete, retained, and unsuccessful output counts.
+
     for composite in composites:  # Process each independently matched Track/Frame group.
         output_path = output_dir / f"{composite.name}.tif"  # Add the GeoTIFF extension to the planned stem.
+
         if output_path.exists() and not args.overwrite:  # Preserve prior results unless replacement was requested.
             LOG.info("Already exists, skipping: %s", output_path)  # Identify the retained composite.
             skipped += 1  # Count the existing output.
             continue  # Advance without opening or changing the existing file.
+
         try:  # Isolate raster failures to one Track/Frame pair.
             LOG.info("Low/non-flood HH: %s", composite.low.path.name)  # Show the red/blue source selection.
             LOG.info("High-flood HH: %s", composite.high.path.name)  # Show the green source selection.
@@ -554,7 +624,9 @@ def main() -> int:  # Define the command-line batch workflow.
         except Exception:  # Continue other independent groups after an unexpected raster error.
             failed += 1  # Count the unsuccessful composite.
             LOG.exception("Failed composite: %s", composite.name)  # Include a diagnostic traceback.
+
     LOG.info("Done: %d created, %d existing, %d incomplete, %d failed", created, skipped, incomplete, failed)  # Summarize.
+
     return 1 if failed or incomplete else 0  # Signal partial failure whenever a discovered group was not handled.
 
 
