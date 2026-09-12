@@ -42,8 +42,8 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = "Your_NASA_Earthdata_Username_Account"  # NASA Earthdata login username.
-    EARTHDATA_PASSWORD = "Your_NASA_Earthdata_Password"  # NASA Earthdata login password.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "Your_NASA_Earthdata_Username_Account")  # NASA Earthdata login username.
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "Your_NASA_Earthdata_Password")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
