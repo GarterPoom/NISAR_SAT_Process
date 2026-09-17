@@ -18,8 +18,8 @@ corrected with a local DEM before dB conversion.
 
 GCOV (Geocoded Polarimetric Covariance): real diagonal covariance layers such as
 HHHH and HVHV. These source layers have already been multilooked and radiometrically
-terrain corrected, so they are converted directly to dB without applying those
-steps again.
+terrain corrected, so they bypass those processing steps and are converted directly
+to dB before GeoTIFF export.
 
 """
 
@@ -443,8 +443,8 @@ def export_layer(
     The function reads the source HDF5 dataset tile by tile so a full NISAR scene is
     never loaded into memory. GSLC tiles are complex samples and require intensity,
     multilook, and optional DEM-based RTC processing. GCOV diagonal covariance tiles
-    are already intensity-like gamma0 measurements that include multilooking and RTC,
-    so they only require dB conversion.
+    are already multilooked, intensity-like measurements with radiometric terrain
+    correction, so they proceed directly to dB conversion and GeoTIFF export.
 
     Args:
         source_file: Input NISAR HDF5/NetCDF4 file used to derive the output name.
@@ -490,7 +490,7 @@ def export_layer(
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
     pixel_y = abs(transform.e)
-    # Only GSLC requires intensity, multilook, and optional DEM correction in this script.
+    # Only GSLC requires complex-to-intensity conversion, multilooking, and optional DEM correction.
     process_gslc = product_type == "GSLC"
 
     # Build a distinct filename that records the source, product type, frequency, and channel.
@@ -595,9 +595,9 @@ def export_layer(
                             logger.debug(
                                 "RTC failed on tile %d: %s. Using uncorrected intensity.", tile_num, exc
                             )
-                # GCOV diagonal covariance values are already multilooked and RTC corrected.
+                # GCOV is already multilooked and terrain corrected by the product generator.
                 else:
-                    # Convert the native real covariance values to the GeoTIFF float type.
+                    # Preserve the native covariance samples, changing only their in-memory type.
                     processed_tile = np.asarray(tile_data, dtype=np.float32)
 
                 # Convert valid linear intensity or covariance values to the logarithmic dB scale.
