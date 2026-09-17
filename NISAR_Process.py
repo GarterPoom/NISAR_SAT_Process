@@ -7,8 +7,8 @@ NISAR_Process.py
 Purpose
 -------
 Convert supported NISAR HDF5/NetCDF4 products into tiled, georeferenced GeoTIFF
-layers expressed in decibels (dB). Products with square pixels retain their native
-grid; products with rectangular pixels are resampled to 10 m x 10 m before export.
+layers expressed in decibels (dB). Every output uses a 5 m x 5 m grid; source
+grids at another resolution are resampled before export.
 
 Supported products
 ------------------
@@ -31,7 +31,7 @@ from __future__ import annotations
 # Import logging to track script execution and errors in real-time and to files
 import logging
 
-# Import math for rounding rectangular-grid output dimensions up to whole 10 m pixels.
+# Import math for rounding output dimensions up to whole target-resolution pixels.
 import math
 
 # Import os for operating system tasks like replacing files (os.replace)
@@ -127,8 +127,8 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
 # untouched, so the data stays scientifically valid.
 
-# Resolution used when a source grid has rectangular (non-square) pixels.
-RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
+# Required horizontal and vertical output pixel size, in metres.
+TARGET_PIXEL_SIZE = 5.0
 
 
 # --- FUNCTION DEFINITIONS ---
@@ -213,19 +213,22 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     return transform, f"EPSG:{epsg_code}"
 
 
-def grid_has_square_pixels(transform: Affine) -> bool:
-    """Return whether the grid's horizontal and vertical pixel sizes are equal."""
-    return bool(np.isclose(abs(transform.a), abs(transform.e), rtol=1e-9, atol=1e-9))
+def grid_has_target_pixel_size(transform: Affine) -> bool:
+    """Return whether both source pixel dimensions already equal the target size."""
+    return bool(
+        np.isclose(abs(transform.a), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
+        and np.isclose(abs(transform.e), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
+    )
 
 
-def rectangular_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
-    """Create an exact 10 m square-pixel GeoTIFF profile covering a rectangular source grid."""
+def target_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
+    """Create an exact 5 m square-pixel GeoTIFF profile covering the source grid."""
     source_pixel_x = abs(transform.a)
     source_pixel_y = abs(transform.e)
-    target_resolution = RECTANGULAR_PIXEL_OUTPUT_RESOLUTION
+    target_resolution = TARGET_PIXEL_SIZE
 
     # Preserve the source's upper-left pixel boundary and axis directions.  Rounding up
-    # covers the full source footprint, even when it is not an exact multiple of 10 m.
+    # covers the full source footprint when it is not an exact multiple of 5 m.
     target_width = math.ceil(width * source_pixel_x / target_resolution)
     target_height = math.ceil(height * source_pixel_y / target_resolution)
     target_transform = Affine(
@@ -416,6 +419,7 @@ def completed_output_path(
                     and existing_raster.count == 1
                     and existing_raster.width > 0
                     and existing_raster.height > 0
+                    and grid_has_target_pixel_size(existing_raster.transform)
                 ):
                     return candidate
         except (OSError, rasterio.errors.RasterioError) as exc:
@@ -480,9 +484,9 @@ def export_layer(
     transform, crs = coordinate_transform(grid)
     # Read and process the HDF5 raster at its native dimensions before any output resampling.
     height, width = source_dataset.shape
-    # Square source pixels (for example 5 m x 5 m or 10 m x 10 m) are exported unchanged.
-    # Rectangular source pixels are converted to a 10 m x 10 m GeoTIFF after processing.
-    source_has_square_pixels = grid_has_square_pixels(transform)
+    # A native 5 m x 5 m grid can be exported unchanged; every other grid is
+    # converted to exactly 5 m x 5 m after the scientific processing steps.
+    source_has_target_pixel_size = grid_has_target_pixel_size(transform)
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
     pixel_y = abs(transform.e)
@@ -529,16 +533,16 @@ def export_layer(
     elif process_gslc:
         logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
-    if source_has_square_pixels:
+    if source_has_target_pixel_size:
         logger.info(
-            "%s/%s has square pixels (%.6g m x %.6g m); retaining native resolution.",
+            "%s/%s already has %.6g m x %.6g m pixels; retaining the native grid.",
             frequency, polarization, pixel_x, pixel_y,
         )
     else:
         logger.info(
-            "%s/%s has rectangular pixels (%.6g m x %.6g m); resampling to %.0f m x %.0f m with nearest neighbor.",
+            "%s/%s has %.6g m x %.6g m pixels; resampling to %.0f m x %.0f m with nearest neighbor.",
             frequency, polarization, pixel_x, pixel_y,
-            RECTANGULAR_PIXEL_OUTPUT_RESOLUTION, RECTANGULAR_PIXEL_OUTPUT_RESOLUTION,
+            TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE,
         )
 
     # Count source windows so progress messages can report a meaningful completion percentage.
@@ -624,13 +628,13 @@ def export_layer(
         if dem_dataset is not None:
             dem_dataset.close()
 
-    if source_has_square_pixels:
-        # Square-pixel grids need no resampling, so promote the staging GeoTIFF directly.
+    if source_has_target_pixel_size:
+        # Native 5 m x 5 m grids need no resampling, so promote the staging GeoTIFF directly.
         os.replace(native_temp_path, temp_path)
     else:
-        # Resample only rectangular grids after the scientific processing steps and before
-        # publishing the final GeoTIFF.  Nearest neighbour preserves source dB samples.
-        target_profile = rectangular_grid_profile(profile, transform, width, height)
+        # Resample to the required 5 m grid after the scientific processing steps and
+        # before publishing the final GeoTIFF. Nearest neighbour preserves source dB samples.
+        target_profile = target_grid_profile(profile, transform, width, height)
         with rasterio.open(native_temp_path) as source_raster:
             with rasterio.open(temp_path, "w", **target_profile) as destination_raster:
                 destination_raster.set_band_description(
@@ -736,7 +740,7 @@ def main() -> None:
                             )
                             continue
 
-                        # Process and export the available layer, resampling only if its pixels are rectangular.
+                        # Process and export the layer on the required 5 m x 5 m output grid.
                         export_layer(
                             source_file,
                             product_type,
