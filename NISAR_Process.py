@@ -17,9 +17,9 @@ HH and HV. Each tile is converted to intensity, multilooked, and optionally
 corrected with a local DEM before dB conversion.
 
 GCOV (Geocoded Polarimetric Covariance): real diagonal covariance layers such as
-HHHH and HVHV. These source layers have already been multilooked and radiometrically
-terrain corrected, so they bypass those processing steps and are converted directly
-to dB before GeoTIFF export.
+HHHH and HVHV. Each tile is multilooked before dB conversion. The source covariance
+values are already radiometrically terrain corrected, so no additional DEM-based RTC
+is applied.
 
 """
 
@@ -441,10 +441,10 @@ def export_layer(
     Export one configured GSLC or GCOV polarization layer as a dB GeoTIFF.
 
     The function reads the source HDF5 dataset tile by tile so a full NISAR scene is
-    never loaded into memory. GSLC tiles are complex samples and require intensity,
-    multilook, and optional DEM-based RTC processing. GCOV diagonal covariance tiles
-    are already multilooked, intensity-like measurements with radiometric terrain
-    correction, so they proceed directly to dB conversion and GeoTIFF export.
+    never loaded into memory. GSLC tiles are complex samples and require intensity
+    conversion plus optional DEM-based RTC processing. GCOV diagonal covariance tiles
+    are intensity-like measurements with radiometric terrain correction already
+    applied. Both product types are multilooked before dB conversion and export.
 
     Args:
         source_file: Input NISAR HDF5/NetCDF4 file used to derive the output name.
@@ -490,7 +490,8 @@ def export_layer(
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
     pixel_y = abs(transform.e)
-    # Only GSLC requires complex-to-intensity conversion, multilooking, and optional DEM correction.
+    # Only GSLC requires complex-to-intensity conversion and optional DEM correction.
+    # Both supported product types are multilooked below.
     process_gslc = product_type == "GSLC"
 
     # Build a distinct filename that records the source, product type, frequency, and channel.
@@ -548,7 +549,7 @@ def export_layer(
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
-    description = "Intensity Multilook RTC" if process_gslc else "RTC Gamma0 Covariance"
+    description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
     # Reserve a holder for output statistics needed by the QGIS display style.
     band_stats = None
 
@@ -567,10 +568,20 @@ def export_layer(
                 # Read only this native-grid source tile from the HDF5 dataset.
                 tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
 
-                # GSLC source samples are complex-valued and need the GSLC-specific workflow.
+                # Convert each product's source samples to the linear measurement that
+                # will be multilooked: intensity for GSLC and covariance for GCOV.
                 if process_gslc:
-                    # Convert complex samples to intensity, then suppress speckle with multilooking.
-                    processed_tile = apply_multilook(calculate_intensity(tile_data), looks=5)
+                    # Convert complex GSLC samples to intensity before multilooking.
+                    processed_tile = calculate_intensity(tile_data)
+                else:
+                    # GCOV diagonal covariance samples are already intensity-like.
+                    processed_tile = np.asarray(tile_data, dtype=np.float32)
+
+                # Apply the required multi-looking step to every supported product type.
+                processed_tile = apply_multilook(processed_tile, looks=5)
+
+                # GSLC alone receives the optional additional DEM-based RTC step.
+                if process_gslc:
                     # Apply DEM-based RTC only when a DEM was opened successfully.
                     if dem_dataset is not None:
                         try:
@@ -595,11 +606,6 @@ def export_layer(
                             logger.debug(
                                 "RTC failed on tile %d: %s. Using uncorrected intensity.", tile_num, exc
                             )
-                # GCOV is already multilooked and terrain corrected by the product generator.
-                else:
-                    # Preserve the native covariance samples, changing only their in-memory type.
-                    processed_tile = np.asarray(tile_data, dtype=np.float32)
-
                 # Convert valid linear intensity or covariance values to the logarithmic dB scale.
                 db_tile = convert_to_decibels(processed_tile)
                 # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
