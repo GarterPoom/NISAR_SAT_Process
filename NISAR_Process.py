@@ -40,6 +40,9 @@ import os
 # Import sys to interact with the interpreter (used for sys.stdout and exiting)
 import sys
 
+# Import perf_counter for precise elapsed-time measurements that are unaffected by clock changes
+from time import perf_counter
+
 # Import datetime to create unique, timestamped filenames for logs and outputs
 from datetime import datetime
 
@@ -132,6 +135,24 @@ TARGET_PIXEL_SIZE = 5.0
 
 
 # --- FUNCTION DEFINITIONS ---
+
+def format_elapsed_time(elapsed_seconds: float) -> str:
+    """Convert elapsed seconds to a readable hours, minutes, and seconds value.
+
+    Args:
+        elapsed_seconds: Measured duration in seconds from ``perf_counter``.
+
+    Returns:
+        A duration string formatted as HH:MM:SS.ss.
+    """
+    # Convert the measured duration to a non-negative floating-point value.
+    safe_seconds = max(0.0, float(elapsed_seconds))
+    # Separate complete minutes from the remaining seconds and fractional seconds.
+    total_minutes, seconds = divmod(safe_seconds, 60.0)
+    # Separate complete hours from the remaining complete minutes.
+    hours, minutes = divmod(int(total_minutes), 60)
+    # Return a fixed-width duration that remains readable for batches longer than one hour.
+    return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
 
 def setup_logger(log_directory: Path) -> logging.Logger:
     """
@@ -711,9 +732,15 @@ def main() -> None:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # State the amount of batch work before opening the first product.
     logger.info("Found %d product(s). Starting processing...", len(source_files))
+    # Capture a monotonic start time for the complete multi-file processing batch.
+    batch_start_time = perf_counter()
 
     # Process every input file independently so one damaged file cannot stop the batch.
     for source_file in source_files:
+        # Capture a separate monotonic start time for this individual source product.
+        file_start_time = perf_counter()
+        # Announce the start of the per-file timer in both the terminal and log file.
+        logger.info("Starting timer for file: %s", source_file.name)
         try:
             # Open the HDF5/NetCDF product in read-only mode for metadata and tile access.
             with h5py.File(source_file, "r") as product:
@@ -764,9 +791,26 @@ def main() -> None:
         except Exception as exc:
             logger.error("Failed to process product %s: %s", source_file.name, exc)
             logger.debug("Detailed traceback:", exc_info=True)
+        finally:
+            # Calculate this file's elapsed time even when processing raised an error.
+            file_elapsed_seconds = perf_counter() - file_start_time
+            # Report both a readable duration and exact seconds for monitoring and analysis.
+            logger.info(
+                "Processing time for %s: %s (%.2f seconds)",
+                source_file.name,
+                format_elapsed_time(file_elapsed_seconds),
+                file_elapsed_seconds,
+            )
 
-    # Record successful completion after every discoverable input product has been attempted.
-    logger.info("Export complete.")
+    # Calculate the complete duration after every discoverable input product has been attempted.
+    batch_elapsed_seconds = perf_counter() - batch_start_time
+    # Record completion together with the total time spent processing all source files.
+    logger.info(
+        "Export complete. Total processing time for all %d file(s): %s (%.2f seconds)",
+        len(source_files),
+        format_elapsed_time(batch_elapsed_seconds),
+        batch_elapsed_seconds,
+    )
 
 # --- EXECUTION START ---
 if __name__ == "__main__":
