@@ -96,7 +96,7 @@ LOG_DIRECTORY = SCRIPT_DIRECTORY / "NISAR_logs"
 
 # Path to the Digital Elevation Model (DEM) used for Terrain Correction (RTC)
 # This must match the CRS and spatial resolution of your target area
-LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "LOCAL_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif (e.g.)"
+LOCAL_DEM_PATH = SCRIPT_DIRECTORY / "NASA_DEM" / "NISAR_DEM_1-20260817_064201_Mosaic.tif"
 
 # Internal HDF5 paths for the supported NISAR products.
 PRODUCT_GRIDS_PATHS = {

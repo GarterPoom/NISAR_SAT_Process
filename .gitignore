@@ -35,3 +35,6 @@ Thailand_Admin/L05_Thailand_ESRI_2559.sbx
 Thailand_Admin/L05_Thailand_ESRI_2559.shp
 Thailand_Admin/L05_Thailand_ESRI_2559.zip
 .vscode/settings.json
+
+# Local credentials (never commit)
+.env
