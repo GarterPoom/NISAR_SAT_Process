@@ -9,16 +9,20 @@ import re  # Regular expressions used to validate HTTP range responses.
 import threading  # Thread-local state and a lock for concurrent progress bars.
 import time  # Retry backoff delays after transient download failures.
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Bounded concurrent downloads.
-from datetime import datetime  # Module for handling date objects and generating dynamic timestamps. 
+from datetime import datetime, timedelta  # Module for handling date objects and generating dynamic timestamps. 
 from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
 
 import requests  # HTTP library; used here for its exceptions and streamed GET requests.
 from tqdm import tqdm  # Library for rendering dynamic progress bars in the terminal console.
 import asf_search as asf  # Alaska Satellite Facility Search Python package, imported under alias 'asf'.
 import geopandas as gpd  # Library for reading shapefiles and handling geospatial vector data.
+from dotenv import load_dotenv  # Loads KEY=VALUE pairs from the .env file into environment variables.
+
+# Load credentials from the .env file that sits next to this script.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # --------------------------------------------------------------------------- #
-# Configuration – all tunable settings are gathered in this class.                
+# Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
     """Central configuration for the search-and-download workflow.                        
@@ -27,8 +31,8 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "Your_NASA_Earthdata_Username_Account")  # NASA Earthdata login username.
-    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "Your_NASA_Earthdata_Password")  # NASA Earthdata login password.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "")  # NASA Earthdata login username (from .env).
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "")  # NASA Earthdata login password (from .env).
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -42,21 +46,27 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                             "administrative_divisions_directory",
-                             "admin_shapefile.shp")
+                             "Thailand_Admin",
+                             "province_simplify.shp") # Path to the shapefile defining the area of interest (AOI).
 
-    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
-    END_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    END_DATE = datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    START_DATE = END_DATE - timedelta(days=7)  # Earliest acquisition date to include – 7 days before END_DATE.
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
+    FRAME_COVERAGE = "FULL"  # Download only products covering the full NISAR frame; exclude partial-frame products.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
-    DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
-    DOWNLOAD_WORKERS = 2  # Safe upper limit for simultaneous file downloads.
+    DUAL_POLARIZATION_ONLY = True  # Keep only Dual Polarization NISAR products; exclude Single Polarization acquisitions.
+    MAX_DOWNLOADS = 12  # Maximum number of filtered products to actually download; set to None for no limit.
+    DOWNLOAD_CHUNK_SIZE = 256 * 1024  # 256 KB chunks keep progress and slow-link checks responsive.
+    DOWNLOAD_WORKERS = 1  # Safe upper limit for simultaneous file downloads.
     DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
-    DOWNLOAD_READ_TIMEOUT = 120  # Seconds allowed without receiving download data.
-    DOWNLOAD_MAX_ATTEMPTS = 5  # Initial attempt plus retries for interrupted downloads.
+    DOWNLOAD_READ_TIMEOUT = 180  # Seconds allowed without receiving any download data.
+    DOWNLOAD_MIN_SPEED = 16 * 1024  # Retry when sustained throughput falls below 16 KiB/s; set to 0 to disable.
+    DOWNLOAD_SPEED_WINDOW = 300  # Seconds over which sustained low throughput is measured.
+    DOWNLOAD_MAX_ATTEMPTS = 8  # Initial attempt plus retries for interrupted or persistently slow downloads.
     DOWNLOAD_RETRY_BACKOFF = 5  # Base seconds between retries; doubles after each failure.
+    DOWNLOAD_MAX_BACKOFF = 120  # Cap retry delays so recovery does not pause for an excessive period.
 
 # --------------------------------------------------------------------------- #
 # Logging setup – configures logging to write to both a timestamped log file and stdout.  
@@ -180,6 +190,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     start_date: datetime,  # Earliest acquisition date to include.
     end_date: datetime,  # Latest acquisition date to include.
     product_level: str,  # NISAR processing level to filter on (e.g. "GSLC").
+    frame_coverage: str,  # NISAR frame coverage to include ("FULL" excludes partial scenes).
     max_results: int,  # Maximum number of granules to return.
 
 ) -> asf.ASFSearchResults:  # The raw ASF search results object.
@@ -190,6 +201,8 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         start_date: Earliest acquisition date to include.
         end_date: Latest acquisition date to include.
         product_level: NISAR processing level to filter on (e.g. "GSLC").
+        frame_coverage: NISAR frame coverage to include; use ``"FULL"`` to
+            exclude partial-frame products.
         max_results: Maximum number of granules to return.
 
     Returns:
@@ -201,6 +214,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     logging.info(f"Area of Interest (AOI WKT): {aoi_wkt}")  # Log the specified spatial coverage WKT boundary.
     logging.info(f"Search date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")  # Log the search time range.
     logging.info(f"Target Processing Level: {product_level}")  # Log the selected target product level.
+    logging.info(f"Target NISAR Frame Coverage: {frame_coverage}")  # Confirm that partial-frame products are excluded.
 
     search_options = asf.ASFSearchOptions(  # Initialize the ASF search configuration object.
         dataset=["NISAR"],  # Filter search results to the NISAR dataset platform.
@@ -208,6 +222,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         start=start_date,  # Filter granules acquired on or after the start date.
         end=end_date,  # Filter granules acquired on or before the end date.
         processingLevel=[product_level],  # Filter granules by the specified product level.
+        frameCoverage=frame_coverage,  # Keep only full-frame NISAR scenes, excluding partial-frame products.
         maxResults=max_results,  # Limit the maximum number of search results retrieved.
     )
 
@@ -221,7 +236,36 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.              
+# Polarization – identifies Dual Polarization NISAR products from their filename.
+# --------------------------------------------------------------------------- #
+POLARIZATION_MODE_PATTERN = re.compile(r"_([A-Z]{2})([A-Z]{2})_[A-Z]_\d{8}T\d{6}_")  # Matches the FreqA/FreqB polarization mode field preceding the acquisition timestamps.
+
+def is_dual_polarization(filename: str) -> bool:  # Determine whether a NISAR filename indicates a Dual Polarization acquisition.
+    """Return True only for NISAR filenames whose polarization mode indicates Dual Polarization.
+
+    NISAR filenames encode a 4-character polarization mode field (Frequency-A
+    mode followed by Frequency-B mode) just before the acquisition start/stop
+    timestamps, e.g. ``DHDH`` (Dual Polarization on both bands), ``SHSH``
+    (Single Polarization), or ``NASV`` (Frequency A not present, Single
+    Polarization on Frequency B). The first character of each 2-character
+    group is the mode code: ``D`` (Dual), ``S`` (Single), ``Q`` (Quad), or
+    ``N`` (not applicable).
+
+    Args:
+        filename: NISAR product filename to inspect.
+
+    Returns:
+        True if either frequency band's mode code is ``D``; False otherwise,
+        including when the filename does not match the expected pattern.
+    """
+    match = POLARIZATION_MODE_PATTERN.search(filename)  # Locate the polarization mode field within the filename.
+    if match is None:  # Filenames that don't match the expected NISAR convention cannot be confirmed as Dual Polarization.
+        return False
+    freq_a_mode, freq_b_mode = match.group(1)[0], match.group(2)[0]  # Isolate each band's single-character mode code.
+    return "D" in (freq_a_mode, freq_b_mode)  # Dual Polarization is present if either band was acquired in Dual mode.
+
+# --------------------------------------------------------------------------- #
+# Filter – keeps only HDF5 URLs, excludes QA_STATS/Single Polarization files, and caps the download count.
 # --------------------------------------------------------------------------- #
 def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
     """Filter search results down to direct-download URLs for HDF5 files.
@@ -230,26 +274,43 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
         results: Search results returned by search_nisar_granules().
 
     Returns:
-        A list of download URLs ending in .h5 or .hdf5, **excluding** any file whose name ends with `_QA_STATS.h5`.
+        A list of download URLs ending in .h5 or .hdf5, excluding any file
+        whose name ends with `_QA_STATS.h5` and, when
+        ``Config.DUAL_POLARIZATION_ONLY`` is enabled, excluding Single
+        Polarization products. The list is capped at
+        ``Config.MAX_DOWNLOADS`` entries when that limit is configured.
 
     Exits:
         Gracefully (status 0) if no HDF5 URLs are found.
     """
     all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
 
-    # Build a list of URLs that meet both criteria: file extension is .h5/.hdf5 **and** filename does NOT end with _QA_STATS.h5.
+    # Build a list of URLs that meet all criteria: HDF5 extension, no QA_STATS suffix, and Dual Polarization when required.
     download_urls = []
+    skipped_single_polarization = 0  # Count Single Polarization products excluded by the Dual Polarization filter.
     for url in all_urls:
         filename = url.split("/")[-1]  # Extract the filename from the URL.
-        if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
-            not filename.lower().endswith('_qa_stats.h5')):    # Exclude QA_STATS files.
-            download_urls.append(url)  # Add the URL to the list.
+        if not (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
+                not filename.lower().endswith('_qa_stats.h5')):    # Exclude QA_STATS files.
+            continue
+        if Config.DUAL_POLARIZATION_ONLY and not is_dual_polarization(filename):
+            skipped_single_polarization += 1  # Track how many Single Polarization products were excluded.
+            continue
+        download_urls.append(url)  # Add the URL to the list.
 
     logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
-    
+    if Config.DUAL_POLARIZATION_ONLY:
+        logging.info(f"Excluded {skipped_single_polarization} Single Polarization product(s).")  # Log the polarization filter's impact.
+
     if not download_urls:  # Check if the filtered URL list is empty.
         logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
         sys.exit(0)  # Exit script gracefully with a success status.
+
+    if Config.MAX_DOWNLOADS is not None and len(download_urls) > Config.MAX_DOWNLOADS:
+        logging.info(  # Announce the truncation so log readers understand why fewer files are downloaded than were found.
+            f"Limiting download list from {len(download_urls)} to the configured maximum of {Config.MAX_DOWNLOADS}."
+        )
+        download_urls = download_urls[:Config.MAX_DOWNLOADS]  # Cap the number of products actually downloaded.
 
     return download_urls  # Return the list of filtered HDF5 download URLs.
 
@@ -353,6 +414,10 @@ def make_worker_session_factory(authenticated_session: asf.ASFSession):
     return get_worker_session  # Provide the lazy getter to the thread-pool coordinator.
 
 
+class SlowDownloadError(requests.ConnectionError):
+    """Raised when a transfer remains below the configured useful speed."""
+
+
 def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
     """Download one file, resume a valid partial transfer, and finalize safely.
 
@@ -388,6 +453,11 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             if total_bytes is not None and starting_bytes == total_bytes:
                 os.replace(partial_path, destination_path)  # Atomically finalize the already-complete partial file.
                 return  # No additional network transfer is required.
+            with open(partial_path, "wb"):
+                pass  # Reset an invalid partial so the retry starts cleanly instead of repeating the same rejected range.
+            raise IOError(
+                f"Server rejected resume at byte {starting_bytes}; partial file was reset"
+            )
         response.raise_for_status()  # Propagate non-success responses to the retry wrapper.
 
         append = starting_bytes > 0 and response.status_code == requests.codes.partial_content  # Append only when the server honored the range request.
@@ -395,14 +465,22 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             content_range = response.headers.get("Content-Range", "")  # Read the range actually returned by the server.
             match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)  # Parse the returned segment's first byte.
             if not match or int(match.group(1)) != starting_bytes:
-                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")  # Reject data that cannot safely continue the local file.
+                with open(partial_path, "wb"):
+                    pass  # Discard a partial that cannot be matched safely to the returned remote range.
+                raise IOError(
+                    f"Unexpected Content-Range while resuming: {content_range!r}; partial file was reset"
+                )
         elif starting_bytes:
             logging.warning("%s ignored its range request; restarting its partial download.", filename)  # Record that the server sent the entire object instead.
             starting_bytes = 0  # Reset progress because the partial file will be overwritten.
 
         total_bytes = response_total_bytes(response)  # Obtain the complete expected object size when the server sends it.
         if total_bytes is not None and starting_bytes > total_bytes:
-            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")  # Reject a corrupt or mismatched partial file.
+            with open(partial_path, "wb"):
+                pass  # Clear a corrupt or stale partial so the next attempt can fetch the current remote object.
+            raise IOError(
+                f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes); partial file was reset"
+            )
 
         with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
             total=total_bytes,
@@ -415,10 +493,29 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             leave=True,
             position=progress_position,
         ) as progress_bar:
+            speed_window_started = time.monotonic()  # Start a rolling measurement for detecting a connection that only trickles data.
+            speed_window_bytes = 0  # Count bytes received during the current slow-speed window.
             for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
                 if chunk:
                     output_file.write(chunk)  # Persist this non-empty streamed block to disk.
                     progress_bar.update(len(chunk))  # Advance the visual progress indicator by the written byte count.
+                    speed_window_bytes += len(chunk)
+
+                    elapsed = time.monotonic() - speed_window_started
+                    transfer_complete = total_bytes is not None and progress_bar.n >= total_bytes
+                    if (
+                        Config.DOWNLOAD_MIN_SPEED > 0
+                        and elapsed >= Config.DOWNLOAD_SPEED_WINDOW
+                        and not transfer_complete
+                    ):
+                        average_speed = speed_window_bytes / elapsed
+                        if average_speed < Config.DOWNLOAD_MIN_SPEED:
+                            raise SlowDownloadError(
+                                f"Sustained speed {average_speed / 1024:.1f} KiB/s is below "
+                                f"the {Config.DOWNLOAD_MIN_SPEED / 1024:.1f} KiB/s limit"
+                            )
+                        speed_window_started = time.monotonic()  # Begin a fresh window after acceptable sustained throughput.
+                        speed_window_bytes = 0
 
     downloaded_bytes = os.path.getsize(partial_path)  # Inspect the complete temporary file after the response closes.
     if total_bytes is not None and downloaded_bytes != total_bytes:
@@ -452,7 +549,10 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
         except (requests.RequestException, OSError, ValueError) as error:
             if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
                 raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error  # Surface the final failure with its original cause.
-            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))  # Double the delay after each failed attempt.
+            wait_seconds = min(
+                Config.DOWNLOAD_MAX_BACKOFF,
+                Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1)),
+            )  # Double the delay after each failure, but keep it within the configured cap.
             logging.warning(
                 "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
                 filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
@@ -531,6 +631,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
         start_date=Config.START_DATE,
         end_date=Config.END_DATE,
         product_level=Config.PRODUCT_LEVEL,
+        frame_coverage=Config.FRAME_COVERAGE,
         max_results=Config.MAX_RESULTS,
     )
 

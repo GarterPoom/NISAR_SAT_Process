@@ -38,7 +38,10 @@ CRS, transform, dimensions, and pixel spacing are preserved. Different grids
 are rejected; this script does not resample either input. A pixel is valid in
 all three bands only when both source pixels are valid and finite.
 Tiled reading/writing bounds memory usage for large scenes. Outputs use lossless
-compression, an internal validity mask, and average-resampled display overviews.
+compression, an internal validity mask, and nearest-resampled display overviews.
+Failed source reads are retried once using a newly opened dataset. Persistent
+read failures reject the pair and remove its temporary stack; subsequent pairs
+continue. Unreadable pixels are never silently substituted with valid values.
 
 Default input:  GeoTIFF_Processed
 Default output: GeoTIFF_Processed\\Band_Stacked
@@ -48,10 +51,10 @@ Dependencies and usage
 ----------------------
 Use the Python environment containing numpy and rasterio that runs the original
 NISAR_Process.py. This separate script does not import or modify that script.
-    python NISAR_Band_Stack.py
-    python NISAR_Band_Stack.py --input-dir "GeoTIFF_Processed"
-    python NISAR_Band_Stack.py --output-dir "NISAR\\RGB"
-    python NISAR_Band_Stack.py --overwrite
+    python NISAR_Flood_Band_Stack.py
+    python NISAR_Flood_Band_Stack.py --input-dir "GeoTIFF_Processed"
+    python NISAR_Flood_Band_Stack.py --output-dir "NISAR\\RGB"
+    python NISAR_Flood_Band_Stack.py --overwrite
 In QGIS choose Multiband color, Red=1, Green=2, Blue=3, with a per-band stretch.
 
 Function guide
@@ -76,6 +79,8 @@ import uuid  # Give each temporary raster a unique filename.
 import numpy as np  # Calculate the difference band and pixel validity arrays.
 import rasterio  # Read and write georeferenced raster datasets.
 from rasterio.enums import ColorInterp, Resampling  # Label RGB channels and build overviews.
+from rasterio.errors import RasterioIOError
+from rasterio.windows import Window
 
 DEFAULT_INPUT_DIRECTORY = Path(r"GeoTIFF_Processed")  # Locate final rasters.
 TILE_SIZE = 512  # Process at most 512 by 512 pixels in each tile.
@@ -87,6 +92,44 @@ INPUT_PATTERN = re.compile(  # Describe the complete expected input filename.
 )  # Finish compiling the filename pattern.
 IDENTITY_FIELDS = ("scene", "product", "frequency", "export_date", "stamp")  # Required pair matches.
 LOG = logging.getLogger("NISAR_Band_Stack")  # Use one logger for all script functions.
+
+
+class SourceReadError(RasterioIOError):
+    """A source window remained unreadable after reopening the dataset."""
+
+
+def read_source_window(source: rasterio.io.DatasetReader, window: Window) -> np.ma.MaskedArray:
+    """Read a source tile, retrying once with a fresh handle after an I/O error.
+
+    Reopening permits recovery from a transient read failure without suppressing
+    TIFF decoding errors or accepting a partially decoded array. A persistent
+    failure includes the source path and pixel window in its diagnostic.
+    """
+    location = (
+        f"column={int(window.col_off)}, row={int(window.row_off)}, "
+        f"width={int(window.width)}, height={int(window.height)}"
+    )
+    with rasterio.Env(GTIFF_IGNORE_READ_ERRORS=False):
+        try:
+            return source.read(1, window=window, masked=True, out_dtype="float32")
+        except RasterioIOError as exc:
+            LOG.warning("Source read failed: %s (%s): %s. Reopening and retrying once.",
+                        source.name, location, exc)
+
+        try:
+            with rasterio.open(source.name, sharing=False) as reopened:
+                data = reopened.read(1, window=window, masked=True, out_dtype="float32")
+        except RasterioIOError as exc:
+            raise SourceReadError(
+                f"Source remains unreadable after retry: {source.name} ({location}). "
+                "Check the source file and storage. If the failure persists, regenerate "
+                "HH and HV together from the original product with NISAR_Process.py "
+                "so their export timestamps match. Move the previous HH/HV exports "
+                "out of GeoTIFF_Processed first, because existing exports are skipped."
+            ) from exc
+
+    LOG.warning("Source read recovered after reopening: %s (%s)", source.name, location)
+    return data
 
 
 def filename_info(path: Path) -> dict[str, str] | None:  # Define the filename parser.
@@ -273,8 +316,8 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
                     total = tile_rows * tile_columns  # Count tiles for progress reporting.
 
                     for number, (_, window) in enumerate(dst.block_windows(1), 1):  # Visit each output tile once.
-                        red = hh.read(1, window=window, masked=True, out_dtype="float32")  # Read HH and its validity mask.
-                        green = hv.read(1, window=window, masked=True, out_dtype="float32")  # Read matching HV pixels.
+                        red = read_source_window(hh, window)  # Read HH and retry transient I/O failures.
+                        green = read_source_window(hv, window)  # Read matching HV pixels with the same checks.
 
                         valid = ~np.ma.getmaskarray(red) & ~np.ma.getmaskarray(green)  # Require both source masks to be valid.
                         valid &= np.isfinite(red.data) & np.isfinite(green.data)  # Exclude NaN and infinity in either source.
@@ -372,6 +415,9 @@ def main() -> int:  # Define the command-line batch workflow.
             stack_pair(hh_path, hv_path, output_path)  # Validate and write the RGB raster.
             created += 1  # Count the newly completed stack.
             LOG.info("Created: %s", output_path)  # Report the final output path.
+        except SourceReadError as exc:
+            failed += 1
+            LOG.error("Failed pair: %s. %s", name, exc)
         except Exception:  # Continue the batch when an individual pair cannot be processed.
             failed += 1  # Count the unsuccessful pair.
             LOG.exception("Failed pair: %s", name)  # Include the exception traceback for troubleshooting.

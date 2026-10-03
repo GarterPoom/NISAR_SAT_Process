@@ -7,8 +7,8 @@ NISAR_Process.py
 Purpose
 -------
 Convert supported NISAR HDF5/NetCDF4 products into tiled, georeferenced GeoTIFF
-layers expressed in decibels (dB). Any supported product whose source pixels are
-rectangular is resampled to 5 m x 5 m before export.
+layers expressed in decibels (dB). Every output uses a 5 m x 5 m grid; source
+grids at another resolution are resampled before export.
 
 Supported products
 ------------------
@@ -17,9 +17,9 @@ HH and HV. Each tile is converted to intensity, multilooked, and optionally
 corrected with a local DEM before dB conversion.
 
 GCOV (Geocoded Polarimetric Covariance): real diagonal covariance layers such as
-HHHH and HVHV. These source layers have already been multilooked and radiometrically
-terrain corrected, so they bypass those processing steps and are converted directly
-to dB before GeoTIFF export.
+HHHH and HVHV. Each tile is multilooked before dB conversion. The source covariance
+values are already radiometrically terrain corrected, so no additional DEM-based RTC
+is applied.
 
 """
 
@@ -31,7 +31,7 @@ from __future__ import annotations
 # Import logging to track script execution and errors in real-time and to files
 import logging
 
-# Import math for rounding rectangular-grid output dimensions up to whole 5 m pixels.
+# Import math for rounding output dimensions up to whole target-resolution pixels.
 import math
 
 # Import os for operating system tasks like replacing files (os.replace)
@@ -39,6 +39,9 @@ import os
 
 # Import sys to interact with the interpreter (used for sys.stdout and exiting)
 import sys
+
+# Import perf_counter for precise elapsed-time measurements that are unaffected by clock changes
+from time import perf_counter
 
 # Import datetime to create unique, timestamped filenames for logs and outputs
 from datetime import datetime
@@ -127,11 +130,29 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # affects on-screen rendering in QGIS -- the dB pixel values written to the GeoTIFF are
 # untouched, so the data stays scientifically valid.
 
-# Resolution used for every supported product with rectangular (non-square) pixels.
-RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 5.0
+# Required horizontal and vertical output pixel size, in metres.
+TARGET_PIXEL_SIZE = 5.0
 
 
 # --- FUNCTION DEFINITIONS ---
+
+def format_elapsed_time(elapsed_seconds: float) -> str:
+    """Convert elapsed seconds to a readable hours, minutes, and seconds value.
+
+    Args:
+        elapsed_seconds: Measured duration in seconds from ``perf_counter``.
+
+    Returns:
+        A duration string formatted as HH:MM:SS.ss.
+    """
+    # Convert the measured duration to a non-negative floating-point value.
+    safe_seconds = max(0.0, float(elapsed_seconds))
+    # Separate complete minutes from the remaining seconds and fractional seconds.
+    total_minutes, seconds = divmod(safe_seconds, 60.0)
+    # Separate complete hours from the remaining complete minutes.
+    hours, minutes = divmod(int(total_minutes), 60)
+    # Return a fixed-width duration that remains readable for batches longer than one hour.
+    return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
 
 def setup_logger(log_directory: Path) -> logging.Logger:
     """
@@ -213,19 +234,22 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     return transform, f"EPSG:{epsg_code}"
 
 
-def grid_has_square_pixels(transform: Affine) -> bool:
-    """Return whether the grid's horizontal and vertical pixel sizes are equal."""
-    return bool(np.isclose(abs(transform.a), abs(transform.e), rtol=1e-9, atol=1e-9))
+def grid_has_target_pixel_size(transform: Affine) -> bool:
+    """Return whether both source pixel dimensions already equal the target size."""
+    return bool(
+        np.isclose(abs(transform.a), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
+        and np.isclose(abs(transform.e), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
+    )
 
 
-def rectangular_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
-    """Create an exact 5 m square-pixel GeoTIFF profile covering a rectangular source grid."""
+def target_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
+    """Create an exact 5 m square-pixel GeoTIFF profile covering the source grid."""
     source_pixel_x = abs(transform.a)
     source_pixel_y = abs(transform.e)
-    target_resolution = RECTANGULAR_PIXEL_OUTPUT_RESOLUTION
+    target_resolution = TARGET_PIXEL_SIZE
 
     # Preserve the source's upper-left pixel boundary and axis directions.  Rounding up
-    # covers the full source footprint, even when it is not an exact multiple of 5 m.
+    # covers the full source footprint when it is not an exact multiple of 5 m.
     target_width = math.ceil(width * source_pixel_x / target_resolution)
     target_height = math.ceil(height * source_pixel_y / target_resolution)
     target_transform = Affine(
@@ -386,7 +410,6 @@ def completed_output_path(
     frequency: str,
     polarization: str,
     logger: logging.Logger,
-    required_pixel_resolution: float | None = None,
 ) -> Path | None:
     """Return an existing final GeoTIFF for a layer, ignoring partial outputs.
 
@@ -394,8 +417,7 @@ def completed_output_path(
     export of this source/product/frequency/polarization combination.  The final
     GeoTIFF is only published with ``os.replace`` after writing, overviews, and
     statistics all succeed; ``*.part.tif`` files are therefore never treated as
-    completed results. When ``required_pixel_resolution`` is provided, an older
-    result with a different grid resolution is regenerated.
+    completed results.
     """
     output_prefix = (
         f"{source_file.stem}_{product_type}_{frequency}_{polarization}_Processed_dB_"
@@ -413,28 +435,13 @@ def completed_output_path(
         try:
             # Confirm the final-named file can still be opened as a nonempty GeoTIFF.
             with rasterio.open(candidate) as existing_raster:
-                valid_raster = (
+                if (
                     existing_raster.driver == "GTiff"
                     and existing_raster.count == 1
                     and existing_raster.width > 0
                     and existing_raster.height > 0
-                )
-                if valid_raster and required_pixel_resolution is not None:
-                    output_pixel_x, output_pixel_y = existing_raster.res
-                    valid_raster = bool(
-                        np.isclose(output_pixel_x, required_pixel_resolution)
-                        and np.isclose(output_pixel_y, required_pixel_resolution)
-                    )
-                    if not valid_raster:
-                        logger.info(
-                            "Existing output has %.6g m x %.6g m pixels; regenerating at %.6g m x %.6g m: %s",
-                            output_pixel_x,
-                            output_pixel_y,
-                            required_pixel_resolution,
-                            required_pixel_resolution,
-                            candidate,
-                        )
-                if valid_raster:
+                    and grid_has_target_pixel_size(existing_raster.transform)
+                ):
                     return candidate
         except (OSError, rasterio.errors.RasterioError) as exc:
             # A damaged result is not complete and should be regenerated.
@@ -455,10 +462,10 @@ def export_layer(
     Export one configured GSLC or GCOV polarization layer as a dB GeoTIFF.
 
     The function reads the source HDF5 dataset tile by tile so a full NISAR scene is
-    never loaded into memory. GSLC tiles are complex samples and require intensity,
-    multilook, and optional DEM-based RTC processing. GCOV diagonal covariance tiles
-    are already multilooked, intensity-like measurements with radiometric terrain
-    correction, so they proceed directly to dB conversion and GeoTIFF export.
+    never loaded into memory. GSLC tiles are complex samples and require intensity
+    conversion plus optional DEM-based RTC processing. GCOV diagonal covariance tiles
+    are intensity-like measurements with radiometric terrain correction already
+    applied. Both product types are multilooked before dB conversion and export.
 
     Args:
         source_file: Input NISAR HDF5/NetCDF4 file used to derive the output name.
@@ -473,6 +480,19 @@ def export_layer(
         ValueError: The selected product layer is absent or is not a two-dimensional raster.
         OSError: A source, DEM, temporary GeoTIFF, or output GeoTIFF operation fails.
     """
+    # Avoid repeating expensive tile processing when a previous run published this layer.
+    existing_output = completed_output_path(
+        source_file, product_type, frequency, polarization, logger
+    )
+    if existing_output is not None:
+        logger.info(
+            "Skipping %s/%s; completed GeoTIFF already exists: %s",
+            frequency,
+            polarization,
+            existing_output,
+        )
+        return existing_output
+
     # Convert the requested channel name to the dataset name used by this product type.
     dataset_name = dataset_name_for_polarization(product_type, polarization)
     # Keep the HDF5 dataset lazy; tile slices below read only the needed source pixels.
@@ -485,39 +505,15 @@ def export_layer(
     transform, crs = coordinate_transform(grid)
     # Read and process the HDF5 raster at its native dimensions before any output resampling.
     height, width = source_dataset.shape
-    # Square source pixels (for example 5 m x 5 m or 10 m x 10 m) are exported unchanged.
-    # Every rectangular source grid is converted to 5 m x 5 m, regardless of product type.
-    source_has_square_pixels = grid_has_square_pixels(transform)
+    # A native 5 m x 5 m grid can be exported unchanged; every other grid is
+    # converted to exactly 5 m x 5 m after the scientific processing steps.
+    source_has_target_pixel_size = grid_has_target_pixel_size(transform)
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
     pixel_y = abs(transform.e)
-    # Only GSLC requires complex-to-intensity conversion, multilooking, and optional DEM correction.
+    # Only GSLC requires complex-to-intensity conversion and optional DEM correction.
+    # Both supported product types are multilooked below.
     process_gslc = product_type == "GSLC"
-    # Resample either product type only when its source grid uses rectangular pixels.
-    resample_to_square_pixels = not source_has_square_pixels
-
-    # Avoid repeating expensive tile processing, but do not accept an output created
-    # at the former 10 m resolution (or a native rectangular GCOV grid) when this
-    # source now requires the common 5 m square-pixel output grid.
-    required_pixel_resolution = (
-        RECTANGULAR_PIXEL_OUTPUT_RESOLUTION if resample_to_square_pixels else None
-    )
-    existing_output = completed_output_path(
-        source_file,
-        product_type,
-        frequency,
-        polarization,
-        logger,
-        required_pixel_resolution=required_pixel_resolution,
-    )
-    if existing_output is not None:
-        logger.info(
-            "Skipping %s/%s; completed GeoTIFF already exists: %s",
-            frequency,
-            polarization,
-            existing_output,
-        )
-        return existing_output
 
     # Build a distinct filename that records the source, product type, frequency, and channel.
     out_path = PROCESSED_DIRECTORY / (
@@ -559,25 +555,22 @@ def export_layer(
     elif process_gslc:
         logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
-    if not resample_to_square_pixels:
+    if source_has_target_pixel_size:
         logger.info(
-            "%s/%s retains its native grid (%.6g m x %.6g m pixels).",
-            frequency,
-            polarization,
-            pixel_x,
-            pixel_y,
+            "%s/%s already has %.6g m x %.6g m pixels; retaining the native grid.",
+            frequency, polarization, pixel_x, pixel_y,
         )
     else:
         logger.info(
-            "%s/%s has rectangular pixels (%.6g m x %.6g m); resampling to %.0f m x %.0f m with nearest neighbor.",
+            "%s/%s has %.6g m x %.6g m pixels; resampling to %.0f m x %.0f m with nearest neighbor.",
             frequency, polarization, pixel_x, pixel_y,
-            RECTANGULAR_PIXEL_OUTPUT_RESOLUTION, RECTANGULAR_PIXEL_OUTPUT_RESOLUTION,
+            TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE,
         )
 
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
-    description = "Intensity Multilook RTC" if process_gslc else "RTC Gamma0 Covariance"
+    description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
     # Reserve a holder for output statistics needed by the QGIS display style.
     band_stats = None
 
@@ -596,10 +589,20 @@ def export_layer(
                 # Read only this native-grid source tile from the HDF5 dataset.
                 tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
 
-                # GSLC source samples are complex-valued and need the GSLC-specific workflow.
+                # Convert each product's source samples to the linear measurement that
+                # will be multilooked: intensity for GSLC and covariance for GCOV.
                 if process_gslc:
-                    # Convert complex samples to intensity, then suppress speckle with multilooking.
-                    processed_tile = apply_multilook(calculate_intensity(tile_data), looks=5)
+                    # Convert complex GSLC samples to intensity before multilooking.
+                    processed_tile = calculate_intensity(tile_data)
+                else:
+                    # GCOV diagonal covariance samples are already intensity-like.
+                    processed_tile = np.asarray(tile_data, dtype=np.float32)
+
+                # Apply the required multi-looking step to every supported product type.
+                processed_tile = apply_multilook(processed_tile, looks=5)
+
+                # GSLC alone receives the optional additional DEM-based RTC step.
+                if process_gslc:
                     # Apply DEM-based RTC only when a DEM was opened successfully.
                     if dem_dataset is not None:
                         try:
@@ -624,11 +627,6 @@ def export_layer(
                             logger.debug(
                                 "RTC failed on tile %d: %s. Using uncorrected intensity.", tile_num, exc
                             )
-                # GCOV is already multilooked and terrain corrected by the product generator.
-                else:
-                    # Preserve the native covariance samples, changing only their in-memory type.
-                    processed_tile = np.asarray(tile_data, dtype=np.float32)
-
                 # Convert valid linear intensity or covariance values to the logarithmic dB scale.
                 db_tile = convert_to_decibels(processed_tile)
                 # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
@@ -657,13 +655,13 @@ def export_layer(
         if dem_dataset is not None:
             dem_dataset.close()
 
-    if not resample_to_square_pixels:
-        # A square-pixel source grid needs no resampling, regardless of product type.
+    if source_has_target_pixel_size:
+        # Native 5 m x 5 m grids need no resampling, so promote the staging GeoTIFF directly.
         os.replace(native_temp_path, temp_path)
     else:
-        # Resample only rectangular grids after the scientific processing steps and before
-        # publishing the final GeoTIFF.  Nearest neighbour preserves source dB samples.
-        target_profile = rectangular_grid_profile(profile, transform, width, height)
+        # Resample to the required 5 m grid after the scientific processing steps and
+        # before publishing the final GeoTIFF. Nearest neighbour preserves source dB samples.
+        target_profile = target_grid_profile(profile, transform, width, height)
         with rasterio.open(native_temp_path) as source_raster:
             with rasterio.open(temp_path, "w", **target_profile) as destination_raster:
                 destination_raster.set_band_description(
@@ -734,9 +732,15 @@ def main() -> None:
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # State the amount of batch work before opening the first product.
     logger.info("Found %d product(s). Starting processing...", len(source_files))
+    # Capture a monotonic start time for the complete multi-file processing batch.
+    batch_start_time = perf_counter()
 
     # Process every input file independently so one damaged file cannot stop the batch.
     for source_file in source_files:
+        # Capture a separate monotonic start time for this individual source product.
+        file_start_time = perf_counter()
+        # Announce the start of the per-file timer in both the terminal and log file.
+        logger.info("Starting timer for file: %s", source_file.name)
         try:
             # Open the HDF5/NetCDF product in read-only mode for metadata and tile access.
             with h5py.File(source_file, "r") as product:
@@ -769,7 +773,7 @@ def main() -> None:
                             )
                             continue
 
-                        # Process and export the layer; every rectangular grid is resampled.
+                        # Process and export the layer on the required 5 m x 5 m output grid.
                         export_layer(
                             source_file,
                             product_type,
@@ -787,9 +791,26 @@ def main() -> None:
         except Exception as exc:
             logger.error("Failed to process product %s: %s", source_file.name, exc)
             logger.debug("Detailed traceback:", exc_info=True)
+        finally:
+            # Calculate this file's elapsed time even when processing raised an error.
+            file_elapsed_seconds = perf_counter() - file_start_time
+            # Report both a readable duration and exact seconds for monitoring and analysis.
+            logger.info(
+                "Processing time for %s: %s (%.2f seconds)",
+                source_file.name,
+                format_elapsed_time(file_elapsed_seconds),
+                file_elapsed_seconds,
+            )
 
-    # Record successful completion after every discoverable input product has been attempted.
-    logger.info("Export complete.")
+    # Calculate the complete duration after every discoverable input product has been attempted.
+    batch_elapsed_seconds = perf_counter() - batch_start_time
+    # Record completion together with the total time spent processing all source files.
+    logger.info(
+        "Export complete. Total processing time for all %d file(s): %s (%.2f seconds)",
+        len(source_files),
+        format_elapsed_time(batch_elapsed_seconds),
+        batch_elapsed_seconds,
+    )
 
 # --- EXECUTION START ---
 if __name__ == "__main__":
