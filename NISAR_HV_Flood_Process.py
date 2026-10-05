@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -137,34 +137,34 @@ RECTANGULAR_PIXEL_OUTPUT_RESOLUTION = 10.0
 def setup_logger(log_directory: Path) -> logging.Logger:
     """
     Configures and initializes the logging system.
-    
+
     Args:
         log_directory (Path): The path to the folder where log files will be stored.
-        
+
     Returns:
         logging.Logger: A configured logger object that outputs to both console and file.
     """
     # Create the directory if it doesn't already exist
     log_directory.mkdir(parents=True, exist_ok=True)
-    
+
     # Generate a unique filename using the current date and time
     log_path = log_directory / f"NISAR_L_Band_Process_{datetime.now():%Y%m%d_%H%M%S}.log"
-    
+
     # Define the logger name
     logger = logging.getLogger("NISAR_L_Band_Process")
     logger.setLevel(logging.DEBUG)  # Capture everything from DEBUG up to CRITICAL
     logger.propagate = False       # Prevent logs from being passed to the root logger
     logger.handlers.clear()        # Clear existing handlers to avoid duplicate logs
-    
+
     # Standardized timestamp format for logs
     formatter = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    
+
     # Add a StreamHandler (for terminal output) and a FileHandler (for file output)
     for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_path, encoding="utf-8")):
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(formatter)
         logger.addHandler(handler)
-        
+
     logger.info("Log file: %s", log_path)
     logger.info("Detailed terminal logging is enabled.")
     return logger
@@ -173,44 +173,44 @@ def setup_logger(log_directory: Path) -> logging.Logger:
 def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     """
     Converts HDF5 coordinate arrays into an Affine transform for GeoTIFF georeferencing.
-    
+
     Args:
-        grid (h5py.Group): The HDF5 group containing 'xCoordinates', 'yCoordinates', 
+        grid (h5py.Group): The HDF5 group containing 'xCoordinates', 'yCoordinates',
                             and 'projection' metadata.
-                            
+
     Returns:
         tuple[Affine, str]: A tuple containing the Affine transform matrix and the EPSG CRS string.
-        
+
     Raises:
         ValueError: If coordinate arrays are too small or if resolution is zero.
     """
     # Extract coordinate arrays from the HDF5 file
     x_coordinates = grid["xCoordinates"]
     y_coordinates = grid["yCoordinates"]
-    
+
     # Validation: We need at least two points to calculate resolution (distance between points)
     if len(x_coordinates) < 2 or len(y_coordinates) < 2:
         raise ValueError("xCoordinates and yCoordinates must each contain at least two values")
-        
+
     # Calculate pixel resolution by finding the difference between adjacent coordinates
     x_resolution = float(x_coordinates[1] - x_coordinates[0])
     y_resolution = float(y_coordinates[1] - y_coordinates[0])
-    
+
     # Prevent division by zero errors
     if x_resolution == 0 or y_resolution == 0:
         raise ValueError("Coordinate spacing cannot be zero")
-        
+
     # Retrieve the projection information from the HDF5 attributes
     projection = grid["projection"]
     # Extract the EPSG code (e.g., 4326) from the attributes or the group itself
     epsg_code = int(projection.attrs.get("epsg_code", projection[()]))
-    
+
     # Construct the Affine transform matrix
     # Parameters: (scale_x, shear_x, origin_x, shear_y, scale_y, origin_y)
     # Note: origin is shifted by half a pixel to align the center of the pixel with the coordinate
     transform = Affine(x_resolution, 0.0, float(x_coordinates[0]) - x_resolution / 2,
                        0.0, y_resolution, float(y_coordinates[0]) - y_resolution / 2)
-    
+
     return transform, f"EPSG:{epsg_code}"
 
 
@@ -242,11 +242,11 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
     """
     A generator function that yields 'Window' objects for tiling.
     This allows processing massive rasters by only loading small chunks into RAM.
-    
+
     Args:
         height (int): Total height of the image in pixels.
         width (int): Total width of the image in pixels.
-        
+
     Yields:
         Window: A rasterio Window object defining a specific rectangular sub-region.
     """
@@ -254,11 +254,11 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
     for row_offset in range(0, height, TILE_SIZE):
         # Ensure we don't try to grab a tile larger than the image height at the bottom edge
         tile_height = min(TILE_SIZE, height - row_offset)
-        
+
         for column_offset in range(0, width, TILE_SIZE):
             # Ensure we don't try to grab a tile larger than the image width at the right edge
             tile_width = min(TILE_SIZE, width - column_offset)
-            
+
             # Yield the sub-region window to the caller
             yield Window(column_offset, row_offset, tile_width, tile_height)
 
@@ -288,10 +288,10 @@ def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     """
     Converts complex-valued SAR data into intensity.
     Formula: Intensity = Real^2 + Imaginary^2.
-    
+
     Args:
         complex_data (np.ndarray): An array of complex numbers (e.g., from SAR signal).
-        
+
     Returns:
         np.ndarray: An array of floating-point intensity values.
     """
@@ -299,7 +299,7 @@ def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     real_sq = np.square(np.real(complex_data)).astype(np.float32)
     # Compute the square of the imaginary component
     imag_sq = np.square(np.imag(complex_data)).astype(np.float32)
-    
+
     # Combine components to get total intensity
     return real_sq + imag_sq
 
@@ -307,11 +307,11 @@ def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
 def apply_multilook(intensity: np.ndarray, looks: int = 5) -> np.ndarray:
     """
     Reduces 'speckle' noise using a spatial multi-looking (averaging) filter.
-    
+
     Args:
         intensity (np.ndarray): The input intensity array.
         looks (int): The size of the averaging window (e.g., 5x5).
-        
+
     Returns:
         np.ndarray: The spatially filtered intensity array.
     """
@@ -333,13 +333,13 @@ def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y:
     """
     Performs basic Radiometric Terrain Correction (RTC).
     Adjusts intensity based on the local terrain slope to compensate for shadows/illumination.
-    
+
     Args:
         intensity (np.ndarray): Input intensity tile.
         dem_array (np.ndarray): Corresponding elevation tile from the DEM.
         res_x (float): Horizontal resolution.
         res_y (float): Vertical resolution.
-        
+
     Returns:
         np.ndarray: Terrain-corrected intensity.
     """
@@ -349,14 +349,14 @@ def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y:
 
     # Calculate the gradient (rate of change) in Y and X directions
     dy, dx = np.gradient(dem_array, res_y, res_x)
-    
+
     # Calculate the local slope magnitude: sqrt(slope_x^2 + slope_y^2)
     slope = np.sqrt(dx**2 + dy**2)
-    
+
     # Calculate the cosine of the incidence angle (simplified using slope)
     # We add a tiny epsilon (1e-6) to prevent division by zero
     cos_i = np.cos(np.arctan(slope)) + 1e-6
-    
+
     # Correct the intensity: intensity / cos(incidence_angle)
     return intensity / cos_i
 
@@ -365,10 +365,10 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     """
     Converts linear intensity values to a logarithmic Decibel (dB) scale.
     Formula: 10 * log10(Intensity).
-    
+
     Args:
         intensity (np.ndarray): Input intensity array.
-        
+
     Returns:
         np.ndarray: Decibel-scale array.
     """
@@ -618,9 +618,6 @@ def export_layer(
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
     description = "Intensity Multilook RTC" if process_gslc else "RTC Gamma0 Covariance"
-    # Reserve a holder for output statistics needed by the QGIS display style.
-    band_stats = None
-
     try:
         # Create the native-grid staging GeoTIFF.
         with rasterio.open(native_temp_path, "w", **profile) as dst:
@@ -727,7 +724,7 @@ def export_layer(
     with rasterio.open(temp_path, "r+") as output_raster:
         output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
         output_raster.update_tags(ns="rio_overview", resampling="average")
-        band_stats = output_raster.statistics(1, approx=False)
+        output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
     os.replace(temp_path, out_path)

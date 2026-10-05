@@ -1,9 +1,9 @@
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
-import os  # Module for interacting with the operating system (e.g., creating directories).    
-import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).  
-import logging  # Standard logging module for recording execution steps, warnings, and errors.   
+import os  # Module for interacting with the operating system (e.g., creating directories).
+import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).
+import logging  # Standard logging module for recording execution steps, warnings, and errors.
 import copy  # Copy authenticated cookies into a separate session per worker thread.
 import re  # Regular expressions used to validate HTTP range responses.
 import threading  # Thread-local state and a lock for concurrent progress bars.
@@ -25,8 +25,8 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
-    """Central configuration for the search-and-download workflow.                        
-    
+    """Central configuration for the search-and-download workflow.
+
     Keeping these values in one place makes the script easier to adapt
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
@@ -117,7 +117,7 @@ def resolve_date_range(
         if isinstance(lookback_days, bool) or not isinstance(lookback_days, int) or lookback_days < 0:
             # Raise an exception if lookback_days does not meet requirements
             raise ValueError("DATE_LOOKBACK_DAYS must be a non-negative integer.")
-        
+
         # Get the current system date and time for the rolling end date
         resolved_end = datetime.now()
         # Compute start date by subtracting lookback_days from resolved_end
@@ -129,7 +129,7 @@ def resolve_date_range(
     if not isinstance(resolved_start, datetime) or not isinstance(resolved_end, datetime):
         # Raise an exception if input manual dates were not datetime objects
         raise ValueError("START_DATE and END_DATE must be datetime values.")
-    
+
     # Check if the start date occurs after the end date
     if resolved_start > resolved_end:
         # Raise an exception to prevent logically invalid date ranges
@@ -142,12 +142,12 @@ def resolve_date_range(
         resolved_start.strftime("%Y-%m-%d %H:%M:%S"),  # Replaces 2nd %s with formatted start date
         resolved_end.strftime("%Y-%m-%d %H:%M:%S"),    # Replaces 3rd %s with formatted end date
     )
-    
+
     # Return the final computed start and end datetimes as a tuple
     return resolved_start, resolved_end
 
 # --------------------------------------------------------------------------- #
-# Logging setup – configures logging to write to both a timestamped log file and stdout.  
+# Logging setup – configures logging to write to both a timestamped log file and stdout.
 # --------------------------------------------------------------------------- #
 def setup_logging(log_directory: str) -> str:  # Configure logging to write to both a timestamped log file and stdout.
     """Configure logging to write to both a timestamped log file and stdout.
@@ -160,7 +160,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
         The full path to the created log file.
     """
     os.makedirs(log_directory, exist_ok=True)  # Create log folder safely without raising errors if it exists.
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format current date/time as a timestamp string.
     log_filename = f"nisar_search_download_{timestamp}.log"  # Build a dynamic, timestamped log filename.
     log_filepath = os.path.join(log_directory, log_filename)  # Construct the full path for the log file.
@@ -178,7 +178,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
     return log_filepath  # Return the full path of the created log file.
 
 # --------------------------------------------------------------------------- #
-# Authentication – logs in to NASA Earthdata and returns an active ASFSession.         
+# Authentication – logs in to NASA Earthdata and returns an active ASFSession.
 # --------------------------------------------------------------------------- #
 def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # Authenticate with NASA Earthdata and return an active session.
     """Authenticate with NASA Earthdata and return an active session.
@@ -212,7 +212,7 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# AOI loading – reads a shapefile and returns a single WKT string for the AOI.         
+# AOI loading – reads a shapefile and returns a single WKT string for the AOI.
 # --------------------------------------------------------------------------- #
 def load_aoi_wkt_from_shapefile(shapefile_path: str) -> str:  # Read a shapefile and convert its geometry to a single WKT string.
     """Read a shapefile and convert its geometry to a single WKT string.
@@ -268,7 +268,7 @@ def load_aoi_wkt_from_shapefile(shapefile_path: str) -> str:  # Read a shapefile
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Search – queries the ASF catalog for NISAR granules matching the given filters.        
+# Search – queries the ASF catalog for NISAR granules matching the given filters.
 # --------------------------------------------------------------------------- #
 def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching the given filters.
     aoi_wkt: str,  # Area of interest as a WKT geometry string.
@@ -696,7 +696,7 @@ def download_files_with_thread_pool(  # Coordinate bounded, concurrent product d
     )
 
 # --------------------------------------------------------------------------- #
-# Entry point – orchestrates the full workflow using Config settings.                    
+# Entry point – orchestrates the full workflow using Config settings.
 # --------------------------------------------------------------------------- #
 def main() -> None:  # Run the full search-and-download workflow using Config settings.
     """Run the full search-and-download workflow using Config settings."""
@@ -734,7 +734,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 
 # --------------------------------------------------------------------------- #
-# Script entry – ensures the script runs only when executed directly.                    
+# Script entry – ensures the script runs only when executed directly.
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # Check if the script is being run directly (not imported).
     main()  # Call the main function to run the workflow.

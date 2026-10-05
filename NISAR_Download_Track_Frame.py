@@ -5,7 +5,7 @@ Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules
 within a given area of interest and date range, filter results down to
 HDF5 product files, and download them sequentially to a local directory.
 
-Each file download shows its own byte-level progress bar (current bytes / total bytes), 
+Each file download shows its own byte-level progress bar (current bytes / total bytes),
 rather than a single progress bar tracking file count.
 
 Requirements:
@@ -21,9 +21,9 @@ Usage:
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
-import os  # Module for interacting with the operating system (e.g., creating directories).    
-import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).  
-import logging  # Standard logging module for recording execution steps, warnings, and errors.   
+import os  # Module for interacting with the operating system (e.g., creating directories).
+import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).
+import logging  # Standard logging module for recording execution steps, warnings, and errors.
 import re  # Regular-expression support for confirming Track/Frame values in returned filenames.
 import time  # Monotonic speed measurements and retry backoff delays.
 from datetime import datetime, timedelta  # Date/time tools for configured and rolling search windows.
@@ -42,8 +42,8 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
-    """Central configuration for the search-and-download workflow.                        
-    
+    """Central configuration for the search-and-download workflow.
+
     Keeping these values in one place makes the script easier to adapt
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
@@ -142,7 +142,7 @@ def resolve_date_range(
         if isinstance(lookback_days, bool) or not isinstance(lookback_days, int) or lookback_days < 0:
             # Raise an exception if lookback_days does not meet requirements
             raise ValueError("DATE_LOOKBACK_DAYS must be a non-negative integer.")
-        
+
         # Get the current system date and time for the rolling end date
         resolved_end = datetime.now()
         # Compute start date by subtracting lookback_days from resolved_end
@@ -154,7 +154,7 @@ def resolve_date_range(
     if not isinstance(resolved_start, datetime) or not isinstance(resolved_end, datetime):
         # Raise an exception if input manual dates were not datetime objects
         raise ValueError("START_DATE and END_DATE must be datetime values.")
-    
+
     # Check if the start date occurs after the end date
     if resolved_start > resolved_end:
         # Raise an exception to prevent logically invalid date ranges
@@ -167,11 +167,11 @@ def resolve_date_range(
         resolved_start.strftime("%Y-%m-%d %H:%M:%S"),  # Replaces 2nd %s with formatted start date
         resolved_end.strftime("%Y-%m-%d %H:%M:%S"),    # Replaces 3rd %s with formatted end date
     )
-    
+
     # Return the final computed start and end datetimes as a tuple
     return resolved_start, resolved_end
 # --------------------------------------------------------------------------- #
-# Logging setup – configures logging to write to both a timestamped log file and stdout.  
+# Logging setup – configures logging to write to both a timestamped log file and stdout.
 # --------------------------------------------------------------------------- #
 def setup_logging(log_directory: str) -> str:  # Configure logging to write to both a timestamped log file and stdout.
     """Configure logging to write to both a timestamped log file and stdout.
@@ -184,7 +184,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
         The full path to the created log file.
     """
     os.makedirs(log_directory, exist_ok=True)  # Create log folder safely without raising errors if it exists.
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format current date/time as a timestamp string.
     log_filename = f"nisar_search_download_{timestamp}.log"  # Build a dynamic, timestamped log filename.
     log_filepath = os.path.join(log_directory, log_filename)  # Construct the full path for the log file.
@@ -202,7 +202,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
     return log_filepath  # Return the full path of the created log file.
 
 # --------------------------------------------------------------------------- #
-# Authentication – logs in to NASA Earthdata and returns an active ASFSession.         
+# Authentication – logs in to NASA Earthdata and returns an active ASFSession.
 # --------------------------------------------------------------------------- #
 def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # Authenticate with NASA Earthdata and return an active session.
     """Authenticate with NASA Earthdata and return an active session.
@@ -236,7 +236,7 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# AOI loading – reads a shapefile and returns a single WKT string for the AOI.         
+# AOI loading – reads a shapefile and returns a single WKT string for the AOI.
 # --------------------------------------------------------------------------- #
 def load_aoi_wkt_from_shapefile(shapefile_path: str) -> str:  # Read a shapefile and convert its geometry to a single WKT string.
     """Read a shapefile and convert its geometry to a single WKT string.
@@ -292,7 +292,7 @@ def load_aoi_wkt_from_shapefile(shapefile_path: str) -> str:  # Read a shapefile
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Search – queries the ASF catalog for NISAR granules matching the given filters.        
+# Search – queries the ASF catalog for NISAR granules matching the given filters.
 # --------------------------------------------------------------------------- #
 def prepare_track_frame_filters(
     track_frame_pairs: list[tuple[int, int]],
@@ -408,7 +408,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.              
+# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.
 # --------------------------------------------------------------------------- #
 def filter_hdf5_urls(
     results: asf.ASFSearchResults,
@@ -453,7 +453,7 @@ def filter_hdf5_urls(
             download_urls.append(url)  # Add the URL to the list.
 
     logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
-    
+
     if not download_urls:  # Check if the filtered URL list is empty.
         logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
         sys.exit(0)  # Exit script gracefully with a success status.
@@ -606,7 +606,7 @@ def download_with_retries(
             time.sleep(wait_seconds)
 
 # --------------------------------------------------------------------------- #
-# Download – sequential download of many files, each with its own progress bar.               
+# Download – sequential download of many files, each with its own progress bar.
 # --------------------------------------------------------------------------- #
 def download_files_sequentially(  # Download a list of files one at a time, each with its own progress bar.
     download_urls: list[str],  # URLs of the files to download.
@@ -652,7 +652,7 @@ def download_files_sequentially(  # Download a list of files one at a time, each
     )
 
 # --------------------------------------------------------------------------- #
-# Entry point – orchestrates the full workflow using Config settings.                    
+# Entry point – orchestrates the full workflow using Config settings.
 # --------------------------------------------------------------------------- #
 def main() -> None:  # Run the full search-and-download workflow using Config settings.
     """Run the full search-and-download workflow using Config settings."""
@@ -695,7 +695,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 
 # --------------------------------------------------------------------------- #
-# Script entry – ensures the script runs only when executed directly.                    
+# Script entry – ensures the script runs only when executed directly.
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # Check if the script is being run directly (not imported).
     main()  # Call the main function to run the workflow.
