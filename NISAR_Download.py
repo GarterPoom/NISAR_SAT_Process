@@ -48,7 +48,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
                              "Thailand_Admin",
-                             "L05_Province_ESRI_2559.shp")
+                             "L05_Province_ESRI_2559.shp")  # Path to the shapefile defining the area of interest (AOI).
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
@@ -62,12 +62,16 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     POLARIZATION_MODE = "DH"  # "SH" (single-pol H), "DH" (dual-pol H: HH+HV), or None to keep every mode.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
-    DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
+    MAX_DOWNLOADS = None  # Maximum number of filtered products to download; None downloads every match.
+    DOWNLOAD_CHUNK_SIZE = 256 * 1024  # 256 KB chunks keep progress and slow-link checks responsive.
     DOWNLOAD_WORKERS = 1  # Safe upper limit for simultaneous file downloads.
     DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
-    DOWNLOAD_READ_TIMEOUT = 120  # Seconds allowed without receiving download data.
-    DOWNLOAD_MAX_ATTEMPTS = 5  # Initial attempt plus retries for interrupted downloads.
+    DOWNLOAD_READ_TIMEOUT = 180  # Seconds allowed without receiving any download data.
+    DOWNLOAD_MIN_SPEED = 16 * 1024  # Retry when sustained throughput falls below 16 KiB/s; set to 0 to disable.
+    DOWNLOAD_SPEED_WINDOW = 300  # Seconds over which sustained low throughput is measured.
+    DOWNLOAD_MAX_ATTEMPTS = 8  # Initial attempt plus retries for interrupted or persistently slow downloads.
     DOWNLOAD_RETRY_BACKOFF = 5  # Base seconds between retries; doubles after each failure.
+    DOWNLOAD_MAX_BACKOFF = 120  # Cap retry delays so recovery does not pause for an excessive period.
 
 
 def resolve_date_range(
@@ -271,8 +275,8 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     start_date: datetime,  # Earliest acquisition date to include.
     end_date: datetime,  # Latest acquisition date to include.
     product_level: str,  # NISAR processing level to filter on (e.g. "GSLC").
+    frame_coverage: str,  # NISAR frame coverage to include ("FULL" excludes partial scenes).
     max_results: int,  # Maximum number of granules to return.
-    frame_coverage: str = "FULL",  # NISAR coverage to include ("FULL" excludes partial scenes).
 
 ) -> asf.ASFSearchResults:  # The raw ASF search results object.
     """Query the ASF catalog for NISAR granules matching the given filters.
@@ -282,8 +286,9 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         start_date: Earliest acquisition date to include.
         end_date: Latest acquisition date to include.
         product_level: NISAR processing level to filter on (e.g. "GSLC").
+        frame_coverage: NISAR frame coverage to include; use ``"FULL"`` to
+            exclude partial-frame products.
         max_results: Maximum number of granules to return.
-        frame_coverage: NISAR frame coverage to include.
 
     Returns:
         The raw ASF search results object.
@@ -316,7 +321,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.              
+# Filter – keeps HDF5 URLs, drops QA_STATS files and other polarization modes, caps the download count.
 # --------------------------------------------------------------------------- #
 def normalize_polarization_mode(polarization_mode: str | None) -> str | None:  # Validate the configured polarization mode.
     """Return an upper-case polarization mode code, or ``None`` for no filtering.
@@ -353,7 +358,10 @@ def filter_hdf5_urls(results: asf.ASFSearchResults, polarization_mode: str | Non
         polarization_mode: Optional ``"SH"`` or ``"DH"``; products with another mode are dropped.
 
     Returns:
-        A list of download URLs ending in .h5 or .hdf5, **excluding** any file whose name ends with `_QA_STATS.h5`.
+        A list of download URLs ending in .h5 or .hdf5, excluding any file
+        whose name ends with `_QA_STATS.h5` and any product whose
+        polarization mode differs from ``polarization_mode``. The list is capped at
+        ``Config.MAX_DOWNLOADS`` entries when that limit is configured.
 
     Exits:
         Gracefully (status 0) if no HDF5 URLs are found.
@@ -361,7 +369,7 @@ def filter_hdf5_urls(results: asf.ASFSearchResults, polarization_mode: str | Non
     polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
     all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
 
-    # Build a list of URLs that meet both criteria: file extension is .h5/.hdf5 **and** filename does NOT end with _QA_STATS.h5.
+    # Build a list of URLs that meet all criteria: HDF5 extension, no QA_STATS suffix, and the requested polarization mode.
     download_urls = []
     for url in all_urls:
         filename = url.split("/")[-1]  # Extract the filename from the URL.
@@ -376,6 +384,12 @@ def filter_hdf5_urls(results: asf.ASFSearchResults, polarization_mode: str | Non
     if not download_urls:  # Check if the filtered URL list is empty.
         logging.warning("No matching HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
         sys.exit(0)  # Exit script gracefully with a success status.
+
+    if Config.MAX_DOWNLOADS is not None and len(download_urls) > Config.MAX_DOWNLOADS:
+        logging.info(  # Announce the truncation so log readers understand why fewer files are downloaded than were found.
+            f"Limiting download list from {len(download_urls)} to the configured maximum of {Config.MAX_DOWNLOADS}."
+        )
+        download_urls = download_urls[:Config.MAX_DOWNLOADS]  # Cap the number of products actually downloaded.
 
     return download_urls  # Return the list of filtered HDF5 download URLs.
 
@@ -480,6 +494,10 @@ def make_worker_session_factory(authenticated_session: asf.ASFSession):
     return get_worker_session  # Provide the lazy getter to the thread-pool coordinator.
 
 
+class SlowDownloadError(requests.ConnectionError):
+    """Raised when a transfer remains below the configured useful speed."""
+
+
 def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
     """Download one file, resume a valid partial transfer, and finalize safely.
 
@@ -515,6 +533,11 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             if total_bytes is not None and starting_bytes == total_bytes:
                 os.replace(partial_path, destination_path)  # Atomically finalize the already-complete partial file.
                 return  # No additional network transfer is required.
+            with open(partial_path, "wb"):
+                pass  # Reset an invalid partial so the retry starts cleanly instead of repeating the same rejected range.
+            raise IOError(
+                f"Server rejected resume at byte {starting_bytes}; partial file was reset"
+            )
         response.raise_for_status()  # Propagate non-success responses to the retry wrapper.
 
         append = starting_bytes > 0 and response.status_code == requests.codes.partial_content  # Append only when the server honored the range request.
@@ -522,14 +545,22 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             content_range = response.headers.get("Content-Range", "")  # Read the range actually returned by the server.
             match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)  # Parse the returned segment's first byte.
             if not match or int(match.group(1)) != starting_bytes:
-                raise IOError(f"Unexpected Content-Range while resuming: {content_range!r}")  # Reject data that cannot safely continue the local file.
+                with open(partial_path, "wb"):
+                    pass  # Discard a partial that cannot be matched safely to the returned remote range.
+                raise IOError(
+                    f"Unexpected Content-Range while resuming: {content_range!r}; partial file was reset"
+                )
         elif starting_bytes:
             logging.warning("%s ignored its range request; restarting its partial download.", filename)  # Record that the server sent the entire object instead.
             starting_bytes = 0  # Reset progress because the partial file will be overwritten.
 
         total_bytes = response_total_bytes(response)  # Obtain the complete expected object size when the server sends it.
         if total_bytes is not None and starting_bytes > total_bytes:
-            raise IOError(f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes)")  # Reject a corrupt or mismatched partial file.
+            with open(partial_path, "wb"):
+                pass  # Clear a corrupt or stale partial so the next attempt can fetch the current remote object.
+            raise IOError(
+                f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes); partial file was reset"
+            )
 
         with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
             total=total_bytes,
@@ -542,10 +573,29 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
             leave=True,
             position=progress_position,
         ) as progress_bar:
+            speed_window_started = time.monotonic()  # Start a rolling measurement for detecting a connection that only trickles data.
+            speed_window_bytes = 0  # Count bytes received during the current slow-speed window.
             for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
                 if chunk:
                     output_file.write(chunk)  # Persist this non-empty streamed block to disk.
                     progress_bar.update(len(chunk))  # Advance the visual progress indicator by the written byte count.
+                    speed_window_bytes += len(chunk)
+
+                    elapsed = time.monotonic() - speed_window_started
+                    transfer_complete = total_bytes is not None and progress_bar.n >= total_bytes
+                    if (
+                        Config.DOWNLOAD_MIN_SPEED > 0
+                        and elapsed >= Config.DOWNLOAD_SPEED_WINDOW
+                        and not transfer_complete
+                    ):
+                        average_speed = speed_window_bytes / elapsed
+                        if average_speed < Config.DOWNLOAD_MIN_SPEED:
+                            raise SlowDownloadError(
+                                f"Sustained speed {average_speed / 1024:.1f} KiB/s is below "
+                                f"the {Config.DOWNLOAD_MIN_SPEED / 1024:.1f} KiB/s limit"
+                            )
+                        speed_window_started = time.monotonic()  # Begin a fresh window after acceptable sustained throughput.
+                        speed_window_bytes = 0
 
     downloaded_bytes = os.path.getsize(partial_path)  # Inspect the complete temporary file after the response closes.
     if total_bytes is not None and downloaded_bytes != total_bytes:
@@ -579,7 +629,10 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
         except (requests.RequestException, OSError, ValueError) as error:
             if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
                 raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error  # Surface the final failure with its original cause.
-            wait_seconds = Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1))  # Double the delay after each failed attempt.
+            wait_seconds = min(
+                Config.DOWNLOAD_MAX_BACKOFF,
+                Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1)),
+            )  # Double the delay after each failure, but keep it within the configured cap.
             logging.warning(
                 "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
                 filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
