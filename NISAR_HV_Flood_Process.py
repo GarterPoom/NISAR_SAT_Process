@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-NISAR_Process.py
+NISAR_HV_Flood_Process.py
 
 Purpose
 -------

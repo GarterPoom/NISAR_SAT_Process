@@ -1,8 +1,8 @@
 """
-nisar_search_download.py
+NISAR_Download_Track_Frame.py
 
 Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules
-within a given area of interest and date range, filter results down to
+within a given area of interest, date range and Track/Frame selection, filter results down to
 HDF5 product files, and download them sequentially to a local directory.
 
 Each file download shows its own byte-level progress bar (current bytes / total bytes),
@@ -16,7 +16,7 @@ Credentials:
     EARTHDATA_PASSWORD there before running the script. ".env" is git-ignored.
 
 Usage:
-    python nisar_search_download.py
+    python NISAR_Download_Track_Frame.py
 """  # End of module‑level docstring – describes the whole script.
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
