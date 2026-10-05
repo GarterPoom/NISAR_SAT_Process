@@ -62,7 +62,7 @@ Both scripts are designed for large-area, memory-safe batch processing: download
 ```bash
 git clone <https://github.com/GarterPoom/NISAR_SAT_Process.git>
 cd <NISAR_SAT_Process>
-pip install asf_search requests tqdm geopandas h5py numpy scipy rasterio affine
+pip install asf_search requests tqdm geopandas h5py numpy scipy rasterio affine python-dotenv
 ```
 
 > **Tip:** `geopandas` and `rasterio` have binary (GDAL) dependencies. If `pip install` fails on your platform, consider using `conda`/`mamba`:
@@ -112,8 +112,8 @@ All settings live in the `Config` class at the top of the file:
 
 ```python
 class Config:
-    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"  # NASA Earthdata login username.                                   
-    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"  # NASA Earthdata login password.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")  # Loaded from the git-ignored .env file.
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # Loaded from the git-ignored .env file.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -134,7 +134,7 @@ class Config:
 
 | Setting | Description |
 |---|---|
-| `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD` | Your NASA Earthdata credentials. |
+| `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD` | Your NASA Earthdata credentials, read from the `.env` file (see below). |
 | `LOG_DIRECTORY` | Folder for timestamped download logs. |
 | `OUTPUT_DIRECTORY` | Folder where downloaded HDF5 files are saved. |
 | `AOI_SHAPEFILE` | Path to a `.shp` file defining the search area (its `.shx`/`.dbf`/`.prj` siblings must be present). |
@@ -143,7 +143,22 @@ class Config:
 | `MAX_RESULTS` | Maximum number of granules returned by the search. |
 | `DOWNLOAD_CHUNK_SIZE` | Streaming download chunk size, in bytes. |
 
-> ⚠️ **Security note:** Credentials are hardcoded for local single-machine use. Do **not** commit real credentials to GitHub — use placeholder values in the repo and fill in your own locally, or better, load them from environment variables / a `.env` file before publishing.
+#### Credentials (`.env`)
+
+Earthdata credentials are **not** stored in the code. Create a `.env` file next to the scripts by copying the template, then fill in your own login:
+
+```bash
+cp .env.example .env      # Windows PowerShell: Copy-Item .env.example .env
+```
+
+```ini
+EARTHDATA_USERNAME='your_earthdata_username'
+EARTHDATA_PASSWORD='your_earthdata_password'
+```
+
+Keep the single quotes so passwords containing `&`, `!`, `*`, `@`, `#` or `$` are read literally. `.env` is listed in `.gitignore`; only `.env.example` (placeholders) is committed. Real environment variables, if set, take precedence over `.env`.
+
+> ⚠️ **Security note:** Never commit real credentials. If a password was ever committed, it stays in git history — change it at [urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov/).
 
 ### Usage
 

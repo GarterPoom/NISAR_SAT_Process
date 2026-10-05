@@ -9,11 +9,11 @@ Each file download shows its own byte-level progress bar (current bytes / total 
 rather than a single progress bar tracking file count.
 
 Requirements:
-    pip install asf_search tqdm requests geopandas shapely
+    pip install asf_search tqdm requests geopandas shapely python-dotenv
 
 Credentials:
-    Set the EARTHDATA_USERNAME and EARTHDATA_PASSWORD environment variables
-    before running the script.
+    Copy .env.example to .env and set EARTHDATA_USERNAME and
+    EARTHDATA_PASSWORD there before running the script. ".env" is git-ignored.
 
 Usage:
     python nisar_search_download.py
@@ -25,15 +25,19 @@ import os  # Module for interacting with the operating system (e.g., creating di
 import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).  
 import logging  # Standard logging module for recording execution steps, warnings, and errors.   
 import re  # Regular-expression support for confirming Track/Frame values in returned filenames.
-from datetime import datetime  # Module for handling date objects and generating dynamic timestamps. 
+from datetime import datetime, timedelta  # Date/time tools for configured and rolling search windows.
 
 import requests  # HTTP library; used here for its exceptions and streamed GET requests.
 from tqdm import tqdm  # Library for rendering dynamic progress bars in the terminal console.
 import asf_search as asf  # Alaska Satellite Facility Search Python package, imported under alias 'asf'.
 import geopandas as gpd  # Library for reading shapefiles and handling geospatial vector data.
+from dotenv import load_dotenv  # Loads Earthdata credentials from the git-ignored .env file.
+
+# Read .env from the script's own folder so credentials load regardless of the working directory.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # --------------------------------------------------------------------------- #
-# Configuration – all tunable settings are gathered in this class.                
+# Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
     """Central configuration for the search-and-download workflow.                        
@@ -42,8 +46,9 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "")  # NASA Earthdata login username.
-    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "")  # NASA Earthdata login password.
+    # Loaded from the git-ignored .env file (see .env.example); never store credentials in source control.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")  # NASA Earthdata login username.
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -57,28 +62,105 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                             "Thailand_Admin_Shapefile",
-                             "tha_admbnda_adm1_rtsd_20190221.shp")
+                                 "Thailand_Admin",
+                                 "L05_Province_ESRI_2559.shp")
 
-    START_DATE = datetime.strptime("2026-08-20", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
-    END_DATE = datetime.strptime("2026-08-21", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
+    # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
+    DATE_MODE = 1
+    START_DATE = datetime.strptime("2026-09-28", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("2026-10-01", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
+    FRAME_COVERAGE = "FULL"  # Exclude NISAR products that cover only a partial frame.
 
     # NISAR Track/Frame pairs to download.  Add every required pair here as
     # (track, frame); for example, (105, 78) means Track 105, Frame 078.
     #
-    # A pair is downloaded only when its product footprint intersects
-    # AOI_SHAPEFILE.  An intersection may be either partial or complete.
+    # A pair is downloaded only when its full-frame product footprint
+    # intersects AOI_SHAPEFILE; partial-frame products are excluded.
     # Leave no pairs configured only if you want the script to stop before
     # searching, rather than accidentally downloading every AOI result.
     TRACK_FRAME_PAIRS: list[tuple[int, int]] = [
-        (105, 79),
+        (4, 81),
     ]
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
     DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
 
+
+def resolve_date_range(
+    date_mode: int,        # Input parameter: integer mode selector (1 for manual, 2 for rolling)
+    start_date: datetime,  # Input parameter: user-specified start datetime object
+    end_date: datetime,    # Input parameter: user-specified end datetime object
+    lookback_days: int,    # Input parameter: number of days to look back from today
+) -> tuple[datetime, datetime]:  # Return type hint: returns a tuple containing two datetime objects
+    """
+    Calculates and returns a (start_date, end_date) pair based on the selected mode.
+
+    Modes:
+        - Mode 1 (Manual): Returns user-provided start_date and end_date.
+        - Mode 2 (Rolling): Sets end_date to current time and start_date to
+          (current time - lookback_days).
+
+    Parameters:
+        date_mode (int): 1 for manual dates, 2 for a rolling date window.
+        start_date (datetime): Manual start date (required if date_mode == 1).
+        end_date (datetime): Manual end date (required if date_mode == 1).
+        lookback_days (int): Days to look back from current time (required if date_mode == 2).
+
+    Returns:
+        tuple[datetime, datetime]: A tuple containing (resolved_start, resolved_end).
+
+    Raises:
+        ValueError: If date_mode is invalid, lookback_days is invalid, start/end dates
+                    are not datetime instances, or start_date occurs after end_date.
+    """
+    # Check if date_mode is invalid (must be 1 or 2, and must NOT be a boolean)
+    if isinstance(date_mode, bool) or date_mode not in (1, 2):
+        # Raise an exception stopping execution if the mode is invalid
+        raise ValueError("DATE_MODE must be 1 (manual dates) or 2 (rolling dates).")
+
+    # Evaluate execution path based on the validated date_mode
+    if date_mode == 1:
+        # Assign manual start_date and end_date to local variables
+        resolved_start, resolved_end = start_date, end_date
+        # Define description string used later in log output
+        mode_description = "manual"
+    else:
+        # Validate lookback_days for rolling mode (must be non-boolean, integer, and >= 0)
+        if isinstance(lookback_days, bool) or not isinstance(lookback_days, int) or lookback_days < 0:
+            # Raise an exception if lookback_days does not meet requirements
+            raise ValueError("DATE_LOOKBACK_DAYS must be a non-negative integer.")
+        
+        # Get the current system date and time for the rolling end date
+        resolved_end = datetime.now()
+        # Compute start date by subtracting lookback_days from resolved_end
+        resolved_start = resolved_end - timedelta(days=lookback_days)
+        # Define dynamic description string incorporating lookback_days count
+        mode_description = f"rolling {lookback_days}-day"
+
+    # Ensure resolved dates are valid datetime instances
+    if not isinstance(resolved_start, datetime) or not isinstance(resolved_end, datetime):
+        # Raise an exception if input manual dates were not datetime objects
+        raise ValueError("START_DATE and END_DATE must be datetime values.")
+    
+    # Check if the start date occurs after the end date
+    if resolved_start > resolved_end:
+        # Raise an exception to prevent logically invalid date ranges
+        raise ValueError("START_DATE must not be later than END_DATE.")
+
+    # Write informative log entry using the formatted date strings (%Y-%m-%d %H:%M:%S)
+    logging.info(
+        "Using %s date mode: %s to %s", # Log template string
+        mode_description,               # Replaces 1st %s (e.g., "manual" or "rolling 7-day")
+        resolved_start.strftime("%Y-%m-%d %H:%M:%S"),  # Replaces 2nd %s with formatted start date
+        resolved_end.strftime("%Y-%m-%d %H:%M:%S"),    # Replaces 3rd %s with formatted end date
+    )
+    
+    # Return the final computed start and end datetimes as a tuple
+    return resolved_start, resolved_end
 # --------------------------------------------------------------------------- #
 # Logging setup – configures logging to write to both a timestamped log file and stdout.  
 # --------------------------------------------------------------------------- #
@@ -131,7 +213,7 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
     if not username or not password:
         logging.error(
             "NASA Earthdata credentials are missing. Set EARTHDATA_USERNAME "
-            "and EARTHDATA_PASSWORD before running this script."
+            "and EARTHDATA_PASSWORD in the .env file (see .env.example)."
         )
         sys.exit(1)
 
@@ -262,6 +344,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     product_level: str,  # NISAR processing level to filter on (e.g. "GSLC").
     granule_patterns: list[str],  # NISAR filename patterns for selected Track/Frame pairs.
     max_results: int,  # Maximum number of granules to return.
+    frame_coverage: str = "FULL",  # NISAR coverage to include ("FULL" excludes partial scenes).
 
 ) -> asf.ASFSearchResults:  # The raw ASF search results object.
     """Query the ASF catalog for NISAR granules matching the given filters.
@@ -274,6 +357,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         granule_patterns: NISAR filename patterns representing the selected
             Track/Frame pairs.
         max_results: Maximum number of granules to return.
+        frame_coverage: NISAR frame coverage to include.
 
     Returns:
         The raw ASF search results object.
@@ -284,6 +368,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     logging.info(f"Area of Interest (AOI WKT): {aoi_wkt}")  # Log the specified spatial coverage WKT boundary.
     logging.info(f"Search date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")  # Log the search time range.
     logging.info(f"Target Processing Level: {product_level}")  # Log the selected target product level.
+    logging.info(f"Target Frame Coverage: {frame_coverage}")  # FULL prevents partial-frame products from being returned.
     logging.info(
         "Selected Track/Frame granule pattern(s): " + ", ".join(granule_patterns)
     )
@@ -299,6 +384,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         start=start_date,  # Filter granules acquired on or after the start date.
         end=end_date,  # Filter granules acquired on or before the end date.
         processingLevel=[product_level],  # Filter granules by the specified product level.
+        frameCoverage=frame_coverage,  # Retain full-frame products and exclude partial scenes.
         maxResults=max_results,  # Limit the maximum number of search results retrieved.
     )
 
@@ -456,6 +542,17 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     """Run the full search-and-download workflow using Config settings."""
     setup_logging(Config.LOG_DIRECTORY)  # Set up logging before anything else runs.
 
+    try:
+        start_date, end_date = resolve_date_range(
+            Config.DATE_MODE,
+            Config.START_DATE,
+            Config.END_DATE,
+            Config.DATE_LOOKBACK_DAYS,
+        )
+    except ValueError as date_error:
+        logging.error("Invalid date configuration: %s", date_error)
+        sys.exit(1)
+
     session = authenticate_earthdata(Config.EARTHDATA_USERNAME, Config.EARTHDATA_PASSWORD)  # Log in to Earthdata.
 
     aoi_wkt = load_aoi_wkt_from_shapefile(Config.AOI_SHAPEFILE)  # Derive the WKT search geometry from the AOI shapefile.
@@ -465,9 +562,10 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
 
     results = search_nisar_granules(  # Run the catalog search with all configured filters.
         aoi_wkt=aoi_wkt,
-        start_date=Config.START_DATE,
-        end_date=Config.END_DATE,
+        start_date=start_date,
+        end_date=end_date,
         product_level=Config.PRODUCT_LEVEL,
+        frame_coverage=Config.FRAME_COVERAGE,
         granule_patterns=granule_patterns,
         max_results=Config.MAX_RESULTS,
     )

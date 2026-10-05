@@ -9,16 +9,20 @@ import re  # Regular expressions used to validate HTTP range responses.
 import threading  # Thread-local state and a lock for concurrent progress bars.
 import time  # Retry backoff delays after transient download failures.
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Bounded concurrent downloads.
-from datetime import datetime  # Module for handling date objects and generating dynamic timestamps. 
+from datetime import datetime, timedelta  # Date/time tools for configured and rolling search windows.
 from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
 
 import requests  # HTTP library; used here for its exceptions and streamed GET requests.
 from tqdm import tqdm  # Library for rendering dynamic progress bars in the terminal console.
 import asf_search as asf  # Alaska Satellite Facility Search Python package, imported under alias 'asf'.
 import geopandas as gpd  # Library for reading shapefiles and handling geospatial vector data.
+from dotenv import load_dotenv  # Loads Earthdata credentials from the git-ignored .env file.
+
+# Read .env from the script's own folder so credentials load regardless of the working directory.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # --------------------------------------------------------------------------- #
-# Configuration – all tunable settings are gathered in this class.                
+# Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
     """Central configuration for the search-and-download workflow.                        
@@ -27,9 +31,9 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    # Set these in the environment; never store Earthdata credentials in source control.
-    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME", "")
-    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD", "")
+    # Loaded from the git-ignored .env file (see .env.example); never store credentials in source control.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")  # NASA Earthdata login username.
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
@@ -46,18 +50,97 @@ class Config:  # Groups every tunable setting in one place instead of scattering
                              "Thailand_Admin",
                              "L05_Province_ESRI_2559.shp")
 
-    START_DATE = datetime.strptime("2026-07-01", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
-    END_DATE = datetime.strptime("2026-07-31", "%Y-%m-%d") #datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
+    # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
+    # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
+    DATE_MODE = 1
+    START_DATE = datetime.strptime("2026-06-09", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("2026-06-21", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
+    FRAME_COVERAGE = "FULL"  # Exclude NISAR products that cover only a partial frame.
+    POLARIZATION_MODE = "DH"  # "SH" (single-pol H), "DH" (dual-pol H: HH+HV), or None to keep every mode.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
     DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB per chunk, used for streaming downloads and progress updates.
-    DOWNLOAD_WORKERS = 2  # Safe upper limit for simultaneous file downloads.
+    DOWNLOAD_WORKERS = 1  # Safe upper limit for simultaneous file downloads.
     DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
     DOWNLOAD_READ_TIMEOUT = 120  # Seconds allowed without receiving download data.
     DOWNLOAD_MAX_ATTEMPTS = 5  # Initial attempt plus retries for interrupted downloads.
     DOWNLOAD_RETRY_BACKOFF = 5  # Base seconds between retries; doubles after each failure.
+
+
+def resolve_date_range(
+    date_mode: int,        # Input parameter: integer mode selector (1 for manual, 2 for rolling)
+    start_date: datetime,  # Input parameter: user-specified start datetime object
+    end_date: datetime,    # Input parameter: user-specified end datetime object
+    lookback_days: int,    # Input parameter: number of days to look back from today
+) -> tuple[datetime, datetime]:  # Return type hint: returns a tuple containing two datetime objects
+    """
+    Calculates and returns a (start_date, end_date) pair based on the selected mode.
+
+    Modes:
+        - Mode 1 (Manual): Returns user-provided start_date and end_date.
+        - Mode 2 (Rolling): Sets end_date to current time and start_date to
+          (current time - lookback_days).
+
+    Parameters:
+        date_mode (int): 1 for manual dates, 2 for a rolling date window.
+        start_date (datetime): Manual start date (required if date_mode == 1).
+        end_date (datetime): Manual end date (required if date_mode == 1).
+        lookback_days (int): Days to look back from current time (required if date_mode == 2).
+
+    Returns:
+        tuple[datetime, datetime]: A tuple containing (resolved_start, resolved_end).
+
+    Raises:
+        ValueError: If date_mode is invalid, lookback_days is invalid, start/end dates
+                    are not datetime instances, or start_date occurs after end_date.
+    """
+    # Check if date_mode is invalid (must be 1 or 2, and must NOT be a boolean)
+    if isinstance(date_mode, bool) or date_mode not in (1, 2):
+        # Raise an exception stopping execution if the mode is invalid
+        raise ValueError("DATE_MODE must be 1 (manual dates) or 2 (rolling dates).")
+
+    # Evaluate execution path based on the validated date_mode
+    if date_mode == 1:
+        # Assign manual start_date and end_date to local variables
+        resolved_start, resolved_end = start_date, end_date
+        # Define description string used later in log output
+        mode_description = "manual"
+    else:
+        # Validate lookback_days for rolling mode (must be non-boolean, integer, and >= 0)
+        if isinstance(lookback_days, bool) or not isinstance(lookback_days, int) or lookback_days < 0:
+            # Raise an exception if lookback_days does not meet requirements
+            raise ValueError("DATE_LOOKBACK_DAYS must be a non-negative integer.")
+        
+        # Get the current system date and time for the rolling end date
+        resolved_end = datetime.now()
+        # Compute start date by subtracting lookback_days from resolved_end
+        resolved_start = resolved_end - timedelta(days=lookback_days)
+        # Define dynamic description string incorporating lookback_days count
+        mode_description = f"rolling {lookback_days}-day"
+
+    # Ensure resolved dates are valid datetime instances
+    if not isinstance(resolved_start, datetime) or not isinstance(resolved_end, datetime):
+        # Raise an exception if input manual dates were not datetime objects
+        raise ValueError("START_DATE and END_DATE must be datetime values.")
+    
+    # Check if the start date occurs after the end date
+    if resolved_start > resolved_end:
+        # Raise an exception to prevent logically invalid date ranges
+        raise ValueError("START_DATE must not be later than END_DATE.")
+
+    # Write informative log entry using the formatted date strings (%Y-%m-%d %H:%M:%S)
+    logging.info(
+        "Using %s date mode: %s to %s", # Log template string
+        mode_description,               # Replaces 1st %s (e.g., "manual" or "rolling 7-day")
+        resolved_start.strftime("%Y-%m-%d %H:%M:%S"),  # Replaces 2nd %s with formatted start date
+        resolved_end.strftime("%Y-%m-%d %H:%M:%S"),    # Replaces 3rd %s with formatted end date
+    )
+    
+    # Return the final computed start and end datetimes as a tuple
+    return resolved_start, resolved_end
 
 # --------------------------------------------------------------------------- #
 # Logging setup – configures logging to write to both a timestamped log file and stdout.  
@@ -108,6 +191,13 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
     Exits:
         If authentication fails.
     """
+    if not username or not password:
+        logging.error(
+            "NASA Earthdata credentials are missing. Set EARTHDATA_USERNAME "
+            "and EARTHDATA_PASSWORD in the .env file (see .env.example)."
+        )
+        sys.exit(1)
+
     session = asf.ASFSession()  # Create an unauthenticated ASFSession instance.
     try:  # Begin try block for the Earthdata authentication attempt.
         session.auth_with_creds(username, password)  # Authenticate the session using the provided credentials.
@@ -182,6 +272,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     end_date: datetime,  # Latest acquisition date to include.
     product_level: str,  # NISAR processing level to filter on (e.g. "GSLC").
     max_results: int,  # Maximum number of granules to return.
+    frame_coverage: str = "FULL",  # NISAR coverage to include ("FULL" excludes partial scenes).
 
 ) -> asf.ASFSearchResults:  # The raw ASF search results object.
     """Query the ASF catalog for NISAR granules matching the given filters.
@@ -192,6 +283,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         end_date: Latest acquisition date to include.
         product_level: NISAR processing level to filter on (e.g. "GSLC").
         max_results: Maximum number of granules to return.
+        frame_coverage: NISAR frame coverage to include.
 
     Returns:
         The raw ASF search results object.
@@ -202,6 +294,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
     logging.info(f"Area of Interest (AOI WKT): {aoi_wkt}")  # Log the specified spatial coverage WKT boundary.
     logging.info(f"Search date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")  # Log the search time range.
     logging.info(f"Target Processing Level: {product_level}")  # Log the selected target product level.
+    logging.info(f"Target Frame Coverage: {frame_coverage}")  # FULL prevents partial-frame products from being returned.
 
     search_options = asf.ASFSearchOptions(  # Initialize the ASF search configuration object.
         dataset=["NISAR"],  # Filter search results to the NISAR dataset platform.
@@ -209,6 +302,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         start=start_date,  # Filter granules acquired on or after the start date.
         end=end_date,  # Filter granules acquired on or before the end date.
         processingLevel=[product_level],  # Filter granules by the specified product level.
+        frameCoverage=frame_coverage,  # Retain full-frame products and exclude partial scenes.
         maxResults=max_results,  # Limit the maximum number of search results retrieved.
     )
 
@@ -224,11 +318,39 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
 # --------------------------------------------------------------------------- #
 # Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.              
 # --------------------------------------------------------------------------- #
-def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
+def normalize_polarization_mode(polarization_mode: str | None) -> str | None:  # Validate the configured polarization mode.
+    """Return an upper-case polarization mode code, or ``None`` for no filtering.
+
+    Args:
+        polarization_mode: ``"SH"`` (single-pol H) or ``"DH"`` (dual-pol H); ``None``/``"ANY"`` keeps every mode.
+
+    Raises:
+        ValueError: If the value is not SH, DH, ANY, or None.
+    """
+    if polarization_mode is None or str(polarization_mode).strip().upper() in ("", "ANY"):
+        return None  # No polarization filtering requested.
+    mode = str(polarization_mode).strip().upper()  # Normalize case and whitespace.
+    if mode not in ("SH", "DH"):
+        raise ValueError("POLARIZATION_MODE must be 'SH', 'DH', or None.")  # Reject unsupported modes early.
+    return mode
+
+
+def polarization_mode_from_filename(filename: str) -> str | None:  # Read the mode token from a NISAR product name.
+    """Extract the frequency-A polarization mode (e.g. ``DH``) from a NISAR filename.
+
+    NISAR names embed ``_<bandwidth>_<modeA><modeB>_`` such as ``_2005_DHDH_``;
+    the first two letters describe the frequency-A polarization mode.
+    """
+    match = re.search(r"_\d{4}_([A-Z]{2})([A-Z]{2})_", filename)  # Locate the 4-letter mode token after the bandwidth code.
+    return match.group(1) if match else None  # None when the name has no recognizable mode token.
+
+
+def filter_hdf5_urls(results: asf.ASFSearchResults, polarization_mode: str | None = None) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
     """Filter search results down to direct-download URLs for HDF5 files.
 
     Args:
         results: Search results returned by search_nisar_granules().
+        polarization_mode: Optional ``"SH"`` or ``"DH"``; products with another mode are dropped.
 
     Returns:
         A list of download URLs ending in .h5 or .hdf5, **excluding** any file whose name ends with `_QA_STATS.h5`.
@@ -236,6 +358,7 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
     Exits:
         Gracefully (status 0) if no HDF5 URLs are found.
     """
+    polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
     all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
 
     # Build a list of URLs that meet both criteria: file extension is .h5/.hdf5 **and** filename does NOT end with _QA_STATS.h5.
@@ -244,12 +367,14 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
         filename = url.split("/")[-1]  # Extract the filename from the URL.
         if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
             not filename.lower().endswith('_qa_stats.h5')):    # Exclude QA_STATS files.
+            if polarization_mode and polarization_mode_from_filename(filename) != polarization_mode:
+                continue  # Skip products acquired in a different polarization mode.
             download_urls.append(url)  # Add the URL to the list.
 
-    logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
-    
+    logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs (polarization mode: {polarization_mode or 'ANY'}).")  # Log counts.
+
     if not download_urls:  # Check if the filtered URL list is empty.
-        logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
+        logging.warning("No matching HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
         sys.exit(0)  # Exit script gracefully with a success status.
 
     return download_urls  # Return the list of filtered HDF5 download URLs.
@@ -270,10 +395,11 @@ shared between threads.  This preserves download throughput without creating
 unbounded connections, memory use, or console output contention.
 
 Requirements:
-    pip install asf_search tqdm requests geopandas shapely
+    pip install asf_search tqdm requests geopandas shapely python-dotenv
 
-Configure the Earthdata credentials, AOI shapefile, date range, output path,
-and worker limit in :class:`Config`, then run ``python NISAR_Download.py``.
+Put the Earthdata credentials in the git-ignored ``.env`` file (copy
+``.env.example``), configure the AOI shapefile, date range, output path, and
+worker limit in :class:`Config`, then run ``python NISAR_Download.py``.
 """
 
 # --------------------------------------------------------------------------- #
@@ -523,19 +649,32 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     """Run the full search-and-download workflow using Config settings."""
     setup_logging(Config.LOG_DIRECTORY)  # Set up logging before anything else runs.
 
+    try:
+        normalize_polarization_mode(Config.POLARIZATION_MODE)  # Fail fast on an invalid polarization mode.
+        start_date, end_date = resolve_date_range(
+            Config.DATE_MODE,
+            Config.START_DATE,
+            Config.END_DATE,
+            Config.DATE_LOOKBACK_DAYS,
+        )
+    except ValueError as date_error:
+        logging.error("Invalid configuration: %s", date_error)
+        sys.exit(1)
+
     session = authenticate_earthdata(Config.EARTHDATA_USERNAME, Config.EARTHDATA_PASSWORD)  # Log in to Earthdata.
 
     aoi_wkt = load_aoi_wkt_from_shapefile(Config.AOI_SHAPEFILE)  # Derive the WKT search geometry from the AOI shapefile.
 
     results = search_nisar_granules(  # Run the catalog search with all configured filters.
         aoi_wkt=aoi_wkt,
-        start_date=Config.START_DATE,
-        end_date=Config.END_DATE,
+        start_date=start_date,
+        end_date=end_date,
         product_level=Config.PRODUCT_LEVEL,
+        frame_coverage=Config.FRAME_COVERAGE,
         max_results=Config.MAX_RESULTS,
     )
 
-    download_urls = filter_hdf5_urls(results)  # Narrow results down to HDF5 file URLs only (excluding _QA_STATS.h5).
+    download_urls = filter_hdf5_urls(results, Config.POLARIZATION_MODE)  # Narrow results down to HDF5 file URLs only (excluding _QA_STATS.h5).
 
     download_files_with_thread_pool(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download files with bounded concurrency.
 

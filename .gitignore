@@ -18,7 +18,6 @@ NISAR_SME2_Download_logs/
 GeoTIFF_Processed/*.tif
 GeoTIFF_Processed/*.tif.aux.xml
 GeoTIFF_Processed/*.tif.ovr
-Observation Plan/NISAR_ROP358_TFDB_ObservationPlan_CY2026-20260305.kmz
 Thailand_Admin/L05_Province_ESRI_2559.cpg
 Thailand_Admin/L05_Province_ESRI_2559.dbf
 Thailand_Admin/L05_Province_ESRI_2559.prj
@@ -35,3 +34,20 @@ Thailand_Admin/L05_Thailand_ESRI_2559.sbx
 Thailand_Admin/L05_Thailand_ESRI_2559.shp
 Thailand_Admin/L05_Thailand_ESRI_2559.zip
 .vscode/settings.json
+
+# Local secrets (NASA Earthdata credentials) - never commit
+.env
+.env.*
+!.env.example
+
+# Run logs, Python caches and local tool scratch folders
+NISAR_logs/
+NISAR_Download_logs/
+*.log
+__pycache__/
+*.py[cod]
+.codex_tmp/
+
+# Large product outputs
+NISAR_Product_RSLC/
+Flood_Raster/
