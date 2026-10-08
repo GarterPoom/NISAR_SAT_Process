@@ -85,14 +85,14 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                                 "Thailand_Admin",
-                                 "L05_Province_ESRI_2559.shp")
+                                 "Administrative_Boundary_dir",
+                                 "Administrative_Boundary.shp")
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
     DATE_MODE = 1
-    START_DATE = datetime.strptime("2026-09-29", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
-    END_DATE = datetime.strptime("2026-10-01", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
     DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "RSLC"  # NISAR processing level to filter results by (L1 Range-Doppler SLC).

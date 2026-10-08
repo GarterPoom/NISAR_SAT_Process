@@ -65,7 +65,7 @@ All scripts process data in tiles/strips and stream downloads to disk, so they h
 | Process | `NISAR_RSLC_Process.py` | Converts radar-geometry RSLC into geocoded dB GeoTIFFs on the same 5 m grid (masking, multilook, calibration, DEM-iterated geolocation, geocoding, terrain normalization to gamma0). |
 | Process + flood | `NISAR_HV_Flood_Process.py` | Processes the HV channel from HDF5 and writes both the dB GeoTIFF and a binary flood mask (`HV < -20 dB`). |
 | Flood | `NISAR_HV_Flood_From_GeoTIFF.py` | Builds binary flood masks from GeoTIFFs that are already processed, without reopening the HDF5 products. |
-| Flood | `NISAR_Flood_Band_Stack.py` | Same-date RGB stack: R = HH, G = HV, B = HH − HV (dB). |
+| Flood | `NISAR_Flood_Band_Stack.py` | Same-date RGB stack: R = HV, G = HH, B = HH / HV (HH − HV in dB). |
 | Flood | `NISAR_Flood_Band_Stack_Blue_HH.py` | Same-date RGB stack: R = HH, G = HV, B = HH (dB). |
 | Flood | `NISAR_Flood_Multi_Temporal_RGB.py` | Two-date composite: R/B = HH low-flood date, G = HH high-flood date. |
 | Flood | `NISAR_Flood_Multi_Temporal_RGB_HV_Green.py` | Two-date composite: R/B = HH low-flood date, G = HV high-flood date. |
@@ -265,7 +265,7 @@ python NISAR_RSLC_Process.py
 All flood scripts read the processed dB GeoTIFFs in `GeoTIFF_Processed/` and never resample: paired rasters must share CRS, transform and size.
 
 - **Binary flood masks** – `NISAR_HV_Flood_From_GeoTIFF.py` writes `1` where the input is below the threshold (default **−20 dB**) and `0` elsewhere into `Flood_Raster/`. `NISAR_HV_Flood_Process.py` does the HV processing and masking in one run from HDF5.
-- **Same-date band stacks** – `NISAR_Flood_Band_Stack.py` (B = HH − HV) and `NISAR_Flood_Band_Stack_Blue_HH.py` (B = HH) pair HH and HV files with the same source name, product, frequency and export timestamp.
+- **Same-date band stacks** – `NISAR_Flood_Band_Stack.py` (B = HH − HV) and `NISAR_Flood_Band_Stack_Blue_HH.py` (B = HH) pair HH and HV files with the same source name, product, frequency and export timestamp. (`NISAR_Flood_Band_Stack.py` relaxes the timestamp rule when a source has exactly one HH and one HV file, so exports from separate runs still pair; the other script is unchanged.)
 - **Multi-temporal composites** – the three `NISAR_Flood_Multi_Temporal_*` scripts pair a low-flood and a high-flood acquisition of the same Track/Frame/orbit direction. By default the earliest date is "low flood" and the latest is "high flood"; pass `--low-date YYYYMMDD --high-date YYYYMMDD` to choose known event dates. Outputs go to `GeoTIFF_Processed/Multi_Temporal_RGB/`, `Multi_Temporal_RGB_HV_Green/` and `Multi_Temporal_HV_HH_RGB/`.
 
 ```bash
