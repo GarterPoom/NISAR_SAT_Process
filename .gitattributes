@@ -1,0 +1,10 @@
+# Normalize line endings: LF in the repository, native endings in working copies.
+* text=auto
+*.py text
+*.md text
+*.csv text
+*.kmz binary
+*.xlsx binary
+*.gpkg binary
+*.tif binary
+*.h5 binary

@@ -5,18 +5,22 @@
 Purpose
 -------
 Read final outputs created by NISAR_Process.py in GeoTIFF_Processed and stack:
-    Band 1 / Red   = HH (dB)
-    Band 2 / Green = HV (dB)
-    Band 3 / Blue  = HH (dB) - HV (dB)
+    Band 1 / Red   = HV (dB)
+    Band 2 / Green = HH (dB)
+    Band 3 / Blue  = HH (dB) - HV (dB), i.e. the HH/HV ratio in dB
 
-Same-date pairing
------------------
-HH and HV must have the SAME full source product name, product type, frequency,
-and export timestamp (YYYYMMDD_HHMMSS). Matching the full source name preserves
-any acquisition date/time identifiers in that name; different source products
-are never combined, even when acquired on the same day. Matching the complete
-export timestamp also prevents mixing separate processing runs on the same day.
-The export date is validated and recorded explicitly in output metadata.
+Pairing
+-------
+HH and HV must have the SAME full source product name, product type, and
+frequency. Matching the full source name preserves any acquisition date/time
+identifiers in that name; different source products are never combined, even
+when acquired on the same day.
+The export timestamp (YYYYMMDD_HHMMSS) is NOT required to match when a source
+has exactly one HH file and one HV file: HH and HV exported by separate runs of
+NISAR_Process.py are paired, and both timestamps are logged and recorded in the
+output metadata. When a source has several HH or HV files (multiple runs of the
+same channel), the export timestamp must match exactly, so runs are never mixed
+by guesswork. The output name uses the later of the two timestamps.
 Dates come from filenames produced by NISAR_Process.py. Filesystem creation and
 modification dates are not used because copying a file can change those dates.
 If a required channel is missing for a group, the group is reported and skipped.
@@ -32,7 +36,7 @@ Temporary .part.tif and .native.part.tif files are excluded automatically.
 
 Processing and outputs
 ----------------------
-The inputs are already in decibels, so blue is a difference of dB values.
+The inputs are already in decibels, so blue (the HH/HV ratio) is a difference of dB values.
 All three output bands retain float32 values without a display stretch.
 CRS, transform, dimensions, and pixel spacing are preserved. Different grids
 are rejected; this script does not resample either input. A pixel is valid in
@@ -60,8 +64,8 @@ In QGIS choose Multiband color, Red=1, Green=2, Blue=3, with a per-band stretch.
 Function guide
 --------------
 filename_info: Parse and validate the identifiers and date in an input filename.
-discover_pairs: Find complete HH/HV pairs with identical source and run identity.
-validate_pair: Recheck date/channel identity before opening a requested pair.
+discover_pairs: Find complete HH/HV pairs with identical source identity.
+validate_pair: Recheck source/channel identity before opening a requested pair.
 stack_pair: Validate spatial grids and write the three-band output tile by tile.
 main: Parse command-line options, process the batch, and report its outcome.
 """
@@ -90,7 +94,7 @@ INPUT_PATTERN = re.compile(  # Describe the complete expected input filename.
     r"(?P<pol>HH|HV)_Processed_dB_(?P<stamp>\d{8}_\d{6})\.tiff?$",  # Capture channel and export time.
     re.IGNORECASE,  # Accept uppercase or lowercase filename extensions and labels.
 )  # Finish compiling the filename pattern.
-IDENTITY_FIELDS = ("scene", "product", "frequency", "export_date", "stamp")  # Required pair matches.
+IDENTITY_FIELDS = ("scene", "product", "frequency")  # Required pair matches (export time may differ).
 LOG = logging.getLogger("NISAR_Band_Stack")  # Use one logger for all script functions.
 
 
@@ -159,19 +163,24 @@ def filename_info(path: Path) -> dict[str, str] | None:  # Define the filename p
 
 
 def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:  # Define pair discovery.
-    """Find complete same-source, same-date, same-run HH/HV pairs in one folder.
+    """Find complete HH/HV pairs with identical source identity in one folder.
+
+    A source with one HH and one HV file is paired even when their export
+    timestamps differ. A source with several HH or HV files is paired only by
+    identical export timestamp.
 
     Args:
         input_dir: Directory containing final GeoTIFFs from NISAR_Process.py.
     Returns:
         (pairs, incomplete_count). Each pair contains an output filename stem,
-        its HH path, and its HV path. Every complete processing run is included.
+        its HH path, and its HV path. Every complete pair is included.
     Raises:
         ValueError: A recognized filename has an invalid date, or two files
-            claim the same channel in the same group (for example .tif/.tiff).
+            claim the same channel and timestamp (for example .tif/.tiff).
         OSError: The input directory cannot be read.
     """
-    groups: dict[tuple[str, ...], dict[str, Path]] = {}  # Store channels by their shared identity.
+    # source identity -> channel -> export timestamp -> path
+    groups: dict[tuple[str, ...], dict[str, dict[str, Path]]] = {}
 
     for path in sorted(input_dir.iterdir()):  # Inspect files in deterministic filename order.
         if not path.is_file():  # Exclude folders, including the output subfolder.
@@ -181,34 +190,50 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
         if info is None:  # Detect unrelated files and unfinished raster outputs.
             continue  # Ignore entries that cannot be safely paired.
 
-        identity = tuple(info[field] for field in IDENTITY_FIELDS)  # Include source, date, and full run time.
-        channel = info["pol"]  # Select the normalized HH or HV channel.
-        group = groups.setdefault(identity, {})  # Retrieve or create this exact pairing group.
+        identity = tuple(info[field] for field in IDENTITY_FIELDS)  # Include source, product, and frequency.
+        runs = groups.setdefault(identity, {}).setdefault(info["pol"], {})  # Files of this channel by export time.
 
-        if channel in group:  # Detect multiple candidates for a single channel.
-            raise ValueError(f"Ambiguous {channel} pair: {group[channel]} and {path}")  # Refuse to guess.
+        if info["stamp"] in runs:  # Detect multiple candidates for a single channel and run.
+            raise ValueError(f"Ambiguous {info['pol']} pair: {runs[info['stamp']]} and {path}")  # Refuse to guess.
 
-        group[channel] = path  # Register this channel in its matching group.
+        runs[info["stamp"]] = path  # Register this channel's export.
 
     pairs: list[tuple[str, Path, Path]] = []  # Collect only complete and unambiguous pairs.
-    incomplete = 0  # Count groups lacking a required channel.
+    incomplete = 0  # Count exports lacking a required counterpart.
 
-    for identity, channels in sorted(groups.items()):  # Examine each source/run group independently.
-        scene, product, frequency, export_date, stamp = identity  # Unpack the shared identifiers.
-        name = f"{scene}_{product}_{frequency}_Flood_Bandstack_{stamp}"  # Name the output.
-        missing = {"HH", "HV"} - channels.keys()  # Determine whether either required channel is absent.
+    for identity, channels in sorted(groups.items()):  # Examine each source independently.
+        scene, product, frequency = identity  # Unpack the shared identifiers.
+        label = f"{scene}_{product}_{frequency}"  # Describe this source in log messages.
+        hh_runs = channels.get("HH", {})  # HH exports by timestamp.
+        hv_runs = channels.get("HV", {})  # HV exports by timestamp.
 
-        if missing:  # Prevent combining incomplete groups with another date or run.
-            incomplete += 1  # Count this unprocessed group.
-            LOG.warning("Skipping %s (date %s): missing %s", name, export_date, ", ".join(sorted(missing)))  # Explain why.
-        else:  # Both required channels have identical source/date/run identifiers.
-            pairs.append((name, channels["HH"], channels["HV"]))  # Preserve HH-first channel order.
+        if len(hh_runs) == 1 and len(hv_runs) == 1:  # Unambiguous: pair regardless of export time.
+            matches = [(next(iter(hh_runs)), next(iter(hv_runs)))]
+        else:  # Missing or multiple runs: require identical export timestamps.
+            matches = [(stamp, stamp) for stamp in sorted(hh_runs.keys() & hv_runs.keys())]
+            unmatched = [("HV", stamp) for stamp in sorted(hh_runs.keys() - hv_runs.keys())]  # HH without HV.
+            unmatched += [("HH", stamp) for stamp in sorted(hv_runs.keys() - hh_runs.keys())]  # HV without HH.
 
-    return pairs, incomplete  # Return the complete pair list and skipped-group count.
+            for missing, stamp in unmatched:  # Report each export lacking its counterpart.
+                incomplete += 1  # Count this unprocessed export.
+                LOG.warning("Skipping %s (export %s): missing %s", label, stamp, missing)  # Explain why.
+
+        for hh_stamp, hv_stamp in matches:  # Register each accepted pair.
+            stamp = max(hh_stamp, hv_stamp)  # Name the output after the later export.
+            name = f"{label}_Flood_Bandstack_{stamp}"  # Name the output.
+
+            if hh_stamp != hv_stamp:  # Make the differing run times visible.
+                LOG.warning("HH (%s) and HV (%s) export timestamps differ for %s; pairing them "
+                            "because they are the only HH/HV files for this source",
+                            hh_stamp, hv_stamp, label)
+
+            pairs.append((name, hh_runs[hh_stamp], hv_runs[hv_stamp]))  # Preserve HH-first channel order.
+
+    return pairs, incomplete  # Return the complete pair list and skipped-export count.
 
 
 def validate_pair(hh_path: Path, hv_path: Path) -> dict[str, str]:  # Define the direct-call pairing guard.
-    """Verify channel order and matching dates/source identifiers before stacking.
+    """Verify channel order and matching source identifiers before stacking.
 
     Args:
         hh_path: Final processed HH GeoTIFF path.
@@ -217,7 +242,7 @@ def validate_pair(hh_path: Path, hv_path: Path) -> dict[str, str]:  # Define the
         Validated HH filename metadata, also describing the pair's shared identity.
     Raises:
         ValueError: A filename/date is invalid, channels are reversed, or any
-            source, product, frequency, export date, or export timestamp differs.
+            source, product, or frequency differs. Export timestamps may differ.
     """
     hh_info = filename_info(hh_path)  # Parse the proposed red-band input.
     hv_info = filename_info(hv_path)  # Parse the proposed green-band input.
@@ -230,21 +255,21 @@ def validate_pair(hh_path: Path, hv_path: Path) -> dict[str, str]:  # Define the
 
     different = [field for field in IDENTITY_FIELDS if hh_info[field] != hv_info[field]]  # Compare pairing identifiers.
 
-    if different:  # Reject cross-date, cross-source, or cross-run input combinations.
-        raise ValueError("HH/HV must share source, frequency, date, and run; differing fields: " + ", ".join(different))  # Explain mismatch.
+    if different:  # Reject cross-source input combinations.
+        raise ValueError("HH/HV must share source, product, and frequency; differing fields: " + ", ".join(different))  # Explain mismatch.
 
     return hh_info  # Supply the validated pair metadata to the writer.
 
 
 def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Define the raster stacking function.
-    """Write an aligned same-date HH/HV pair as a georeferenced RGB float32 stack.
+    """Write an aligned HH/HV pair as a georeferenced RGB float32 stack.
 
     Args:
         hh_path: Single-band HH raster in dB, opened read-only.
         hv_path: Single-band HV raster in dB, opened read-only.
         output_path: Destination GeoTIFF; its parent directory must exist.
     Returns:
-        None. Writes a complete raster with R=HH, G=HV, B=HH-HV and metadata.
+        None. Writes a complete raster with R=HV, G=HH, B=HH/HV (HH-HV in dB) and metadata.
     Raises:
         ValueError: Pair identifiers, channels, band counts, or spatial grids
             are incompatible, or the output path would replace an input raster.
@@ -254,7 +279,8 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
         The final filename is published only after writing and overviews finish.
         This function replaces an existing output; main enforces --overwrite.
     """
-    info = validate_pair(hh_path, hv_path)  # Recheck source/date identity even for direct function calls.
+    info = validate_pair(hh_path, hv_path)  # Recheck source identity even for direct function calls.
+    hv_info = filename_info(hv_path)  # Parse HV's export time, which may differ from HH's.
 
     if output_path.resolve() in {hh_path.resolve(), hv_path.resolve()}:  # Protect both input files.
         raise ValueError("Output must not replace an input raster")  # Stop before opening a writer.
@@ -295,19 +321,19 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
                 with rasterio.open(temporary, "w", **profile) as dst:  # Create and automatically close the staging raster.
                     dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)  # Set R/G/B band roles.
 
-                    for index, label in enumerate(("HH (dB)", "HV (dB)", "HH - HV (dB)"), 1):  # Number bands from one.
+                    for index, label in enumerate(("HV (dB)", "HH (dB)", "HH/HV (dB)"), 1):  # Number bands from one.
                         dst.set_band_description(index, label)  # Attach a readable band label.
                         dst.set_band_unit(index, "dB")  # Record the numeric unit for this band.
 
                     dst.update_tags(  # Record provenance, pairing evidence, and calculation details.
-                        SOURCE_HH=hh_path.name,  # Identify the red-channel source file.
-                        SOURCE_HV=hv_path.name,  # Identify the green-channel source file.
+                        SOURCE_HH=hh_path.name,  # Identify the HH source file (green channel).
+                        SOURCE_HV=hv_path.name,  # Identify the HV source file (red channel).
                         SOURCE_PRODUCT=info["scene"],  # Preserve the source product and any acquisition identifiers.
-                        SOURCE_EXPORT_DATE=info["export_date"],  # Record the common GeoTIFF export date.
-                        SOURCE_EXPORT_TIMESTAMP=info["stamp"],  # Record the common processing run timestamp.
-                        PAIRING_RULE="Same source product, product type, frequency, export date and timestamp",  # Describe matching.
-                        BAND_MAPPING="R=HH; G=HV; B=HH-HV",  # Document output band order.
-                        BLUE_FORMULA="HH_dB - HV_dB",  # Make the subtraction's dB domain explicit.
+                        SOURCE_HH_EXPORT_TIMESTAMP=info["stamp"],  # Record the HH processing run timestamp.
+                        SOURCE_HV_EXPORT_TIMESTAMP=hv_info["stamp"],  # Record the HV processing run timestamp.
+                        PAIRING_RULE="Same source product, product type and frequency; export timestamps may differ",  # Describe matching.
+                        BAND_MAPPING="R=HV; G=HH; B=HH/HV",  # Document output band order.
+                        BLUE_FORMULA="HH_dB - HV_dB",  # HH/HV ratio expressed as a dB difference.
                         VALIDITY="All bands valid only where both source bands are valid",  # Describe the shared footprint.
                     )  # Finish dataset metadata.
 
@@ -316,18 +342,18 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
                     total = tile_rows * tile_columns  # Count tiles for progress reporting.
 
                     for number, (_, window) in enumerate(dst.block_windows(1), 1):  # Visit each output tile once.
-                        red = read_source_window(hh, window)  # Read HH and retry transient I/O failures.
-                        green = read_source_window(hv, window)  # Read matching HV pixels with the same checks.
+                        hh_tile = read_source_window(hh, window)  # Read HH and retry transient I/O failures.
+                        hv_tile = read_source_window(hv, window)  # Read matching HV pixels with the same checks.
 
-                        valid = ~np.ma.getmaskarray(red) & ~np.ma.getmaskarray(green)  # Require both source masks to be valid.
-                        valid &= np.isfinite(red.data) & np.isfinite(green.data)  # Exclude NaN and infinity in either source.
+                        valid = ~np.ma.getmaskarray(hh_tile) & ~np.ma.getmaskarray(hv_tile)  # Require both source masks to be valid.
+                        valid &= np.isfinite(hh_tile.data) & np.isfinite(hv_tile.data)  # Exclude NaN and infinity in either source.
 
-                        blue = np.full(red.shape, OUTPUT_NODATA, dtype=np.float32)  # Initialize the blue tile as invalid.
+                        blue = np.full(hh_tile.shape, OUTPUT_NODATA, dtype=np.float32)  # Initialize the blue tile as invalid.
                         with np.errstate(over="ignore", invalid="ignore"):  # Handle nonfinite arithmetic through validity checks.
-                            np.subtract(red.data, green.data, out=blue, where=valid)  # Compute HH minus HV only at valid pixels.
+                            np.subtract(hh_tile.data, hv_tile.data, out=blue, where=valid)  # HH/HV ratio in dB = HH minus HV.
 
                         valid &= np.isfinite(blue)  # Reject any nonfinite subtraction results.
-                        data = np.stack((red.data, green.data, blue))  # Arrange tile data in the requested band order.
+                        data = np.stack((hv_tile.data, hh_tile.data, blue))  # Arrange as R=HV, G=HH, B=HH/HV.
                         data[:, ~valid] = OUTPUT_NODATA  # Apply the same invalid footprint to all bands.
 
                         dst.write(data, window=window)  # Write the three completed tile bands.
@@ -393,12 +419,12 @@ def main() -> int:  # Define the command-line batch workflow.
         return 1  # Stop without producing potentially mismatched stacks.
 
     if not pairs:  # Detect an empty folder or groups with no complete channel pair.
-        LOG.error("No complete same-source, same-date, same-run HH/HV pairs found")  # Explain why nothing can be stacked.
+        LOG.error("No complete same-source HH/HV pairs found")  # Explain why nothing can be stacked.
         return 1  # Signal that no usable input pair was available.
 
     output_dir = args.output_dir or args.input_dir / "Band_Stacked"  # Choose the requested or default destination.
     output_dir.mkdir(parents=True, exist_ok=True)  # Create the output folder and any missing parents.
-    LOG.info("Found %d complete same-date pair(s)", len(pairs))  # Report the batch size.
+    LOG.info("Found %d complete HH/HV pair(s)", len(pairs))  # Report the batch size.
 
     created = skipped = failed = 0  # Initialize output, existing-file, and failure counters.
 

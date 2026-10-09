@@ -13,42 +13,48 @@ memory pressure predictable.  Thread-safe tqdm progress bars show the active
 transfers without corrupting terminal output.
 
 Requirements:
-    pip install asf_search tqdm requests
+    pip install asf_search tqdm requests python-dotenv
 
-Set the Earthdata credentials, WKT AOI, date range, output directory, and
-worker limit in :class:`Config`, then run ``python NISAR_SME2_Download.py``.
+Put the Earthdata credentials in the git-ignored ``.env`` file (copy
+``.env.example``), set the WKT AOI, date range, output directory, and worker
+limit in :class:`Config`, then run ``python NISAR_SME2_Download.py``.
 """
 
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
-import os  # Module for interacting with the operating system (e.g., creating directories).    
-import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).  
-import logging  # Standard logging module for recording execution steps, warnings, and errors.   
+import os  # Module for interacting with the operating system (e.g., creating directories).
+import sys  # Module for system-specific parameters and functions (e.g., standard output, exit).
+import logging  # Standard logging module for recording execution steps, warnings, and errors.
 import re  # Regular expressions; used to parse HTTP Content-Range headers.
 import time  # Used for retry backoff delays after transient download failures.
 import copy  # Copy authenticated cookies into a separate session per worker thread.
 import threading  # Thread-local state and a lock for concurrent progress bars.
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Concurrent downloads.
-from datetime import datetime  # Module for handling date objects and generating dynamic timestamps. 
+from datetime import datetime  # Module for handling date objects and generating dynamic timestamps.
 from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
 
 import requests  # HTTP library; used here for its exceptions and streamed GET requests.
 from tqdm import tqdm  # Library for rendering dynamic progress bars in the terminal console.
 import asf_search as asf  # Alaska Satellite Facility Search Python package, imported under alias 'asf'.
+from dotenv import load_dotenv  # Loads Earthdata credentials from the git-ignored .env file.
+
+# Read .env from the script's own folder so credentials load regardless of the working directory.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # --------------------------------------------------------------------------- #
-# Configuration – all tunable settings are gathered in this class.                
+# Configuration – all tunable settings are gathered in this class.
 # --------------------------------------------------------------------------- #
 class Config:  # Groups every tunable setting in one place instead of scattering local variables.
-    """Central configuration for the search-and-download workflow.                        
-    
+    """Central configuration for the search-and-download workflow.
+
     Keeping these values in one place makes the script easier to adapt
     (e.g., for a different AOI, date range, or product level) without
     hunting through function bodies.
     """
-    EARTHDATA_USERNAME = "----- your_username_of_NASA_Earthdata -----"  # NASA Earthdata login username.                                   
-    EARTHDATA_PASSWORD = "----- your_password_of_NASA_Earthdata -----"  # NASA Earthdata login password.
+    # Loaded from the git-ignored .env file (see .env.example); never store credentials in source control.
+    EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")  # NASA Earthdata login username.
+    EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_SME2_Download_logs"  # Folder where timestamped log files are written.
     OUTPUT_DIRECTORY = "your_directory_to_save_product"  # Folder where downloaded HDF5 product files are saved.
@@ -71,7 +77,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     DOWNLOAD_WORKERS = 4  # Number of files downloaded concurrently.
 
 # --------------------------------------------------------------------------- #
-# Logging setup – configures logging to write to both a timestamped log file and stdout.  
+# Logging setup – configures logging to write to both a timestamped log file and stdout.
 # --------------------------------------------------------------------------- #
 def setup_logging(log_directory: str) -> str:  # Configure logging to write to both a timestamped log file and stdout.
     """Configure logging to write to both a timestamped log file and stdout.
@@ -84,7 +90,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
         The full path to the created log file.
     """
     os.makedirs(log_directory, exist_ok=True)  # Create log folder safely without raising errors if it exists.
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Format current date/time as a timestamp string.
     log_filename = f"nisar_search_download_{timestamp}.log"  # Build a dynamic, timestamped log filename.
     log_filepath = os.path.join(log_directory, log_filename)  # Construct the full path for the log file.
@@ -102,7 +108,7 @@ def setup_logging(log_directory: str) -> str:  # Configure logging to write to b
     return log_filepath  # Return the full path of the created log file.
 
 # --------------------------------------------------------------------------- #
-# Authentication – logs in to NASA Earthdata and returns an active ASFSession.         
+# Authentication – logs in to NASA Earthdata and returns an active ASFSession.
 # --------------------------------------------------------------------------- #
 def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # Authenticate with NASA Earthdata and return an active session.
     """Authenticate with NASA Earthdata and return an active session.
@@ -119,6 +125,13 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
     Exits:
         If authentication fails.
     """
+    if not username or not password:
+        logging.error(
+            "NASA Earthdata credentials are missing. Set EARTHDATA_USERNAME "
+            "and EARTHDATA_PASSWORD in the .env file (see .env.example)."
+        )
+        sys.exit(1)
+
     session = asf.ASFSession()  # Create an unauthenticated ASFSession instance.
     try:  # Begin try block for the Earthdata authentication attempt.
         session.auth_with_creds(username, password)  # Authenticate the session using the provided credentials.
@@ -130,7 +143,7 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
 
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
-# Search – queries the ASF catalog for NISAR granules matching the given filters.        
+# Search – queries the ASF catalog for NISAR granules matching the given filters.
 # --------------------------------------------------------------------------- #
 def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching the given filters.
     aoi_wkt: str,  # Area of interest as a WKT geometry string.
@@ -178,7 +191,7 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.              
+# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.
 # --------------------------------------------------------------------------- #
 def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
     """Filter search results down to direct-download URLs for HDF5 files.
@@ -203,7 +216,7 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
             download_urls.append(url)  # Add the URL to the list.
 
     logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
-    
+
     if not download_urls:  # Check if the filtered URL list is empty.
         logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
         sys.exit(0)  # Exit script gracefully with a success status.
@@ -211,7 +224,7 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
     return download_urls  # Return the list of filtered HDF5 download URLs.
 
 # --------------------------------------------------------------------------- #
-# Download – downloads a single file, showing a byte‑level tqdm progress bar.               
+# Download – downloads a single file, showing a byte‑level tqdm progress bar.
 # --------------------------------------------------------------------------- #
 def filename_from_url(url: str) -> str:  # Derive a safe local name from the product URL.
     """Return the decoded URL basename, excluding query parameters."""
@@ -326,7 +339,7 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
             time.sleep(wait_seconds)  # Pause only this worker before resuming its retained partial download.
 
 # --------------------------------------------------------------------------- #
-# Download – sequential download of many files, each with its own progress bar.               
+# Download – sequential download of many files, each with its own progress bar.
 # --------------------------------------------------------------------------- #
 def download_files_with_thread_pool(  # Download files concurrently with one session per worker.
     download_urls: list[str],  # URLs of the files to download.
@@ -379,7 +392,7 @@ def download_files_with_thread_pool(  # Download files concurrently with one ses
     )
 
 # --------------------------------------------------------------------------- #
-# Entry point – orchestrates the full workflow using Config settings.                    
+# Entry point – orchestrates the full workflow using Config settings.
 # --------------------------------------------------------------------------- #
 def main() -> None:  # Run the full search-and-download workflow using Config settings.
     """Run the full search-and-download workflow using Config settings."""
@@ -404,7 +417,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 
 # --------------------------------------------------------------------------- #
-# Script entry – ensures the script runs only when executed directly.                    
+# Script entry – ensures the script runs only when executed directly.
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":  # Check if the script is being run directly (not imported).
     main()  # Call the main function to run the workflow.
