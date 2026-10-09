@@ -37,6 +37,9 @@ import math
 # Import os for operating system tasks like replacing files (os.replace)
 import os
 
+# Import re to extract coordinates from the WKT footprint string in the product metadata
+import re
+
 # Import sys to interact with the interpreter (used for sys.stdout and exiting)
 import sys
 
@@ -283,6 +286,177 @@ def dataset_name_for_polarization(product_type: str, polarization: str) -> str:
     if product_type == "GCOV":
         return polarization * 2
     raise ValueError(f"Unsupported NISAR product type: {product_type}")
+
+# --- SOURCE METADATA LOGGING ---
+
+# Root-level HDF5 attributes that identify the product family and its governing specification.
+ROOT_ATTRIBUTES = ("title", "mission_name", "institution", "contact", "reference_document", "Conventions")
+
+# Per-frequency datasets under science/LSAR/<product>/grids/<frequency> worth recording.
+GRID_FREQUENCY_KEYS = (
+    "listOfPolarizations", "centerFrequency", "rangeBandwidth", "azimuthBandwidth",
+    "xCoordinateSpacing", "yCoordinateSpacing", "projection", "numberOfSubSwaths",
+)
+
+# Per-frequency acquisition geometry under metadata/sourceData/swaths/<frequency>.
+SWATH_FREQUENCY_KEYS = (
+    "acquiredRangeBandwidth", "processedRangeBandwidth", "processedAzimuthBandwidth",
+    "nearRangeIncidenceAngle", "farRangeIncidenceAngle", "rangeResolution",
+    "sceneCenterAlongTrackResolution", "sceneCenterGroundRangeSpacing",
+    "sceneCenterAlongTrackSpacing", "slantRangeStart", "slantRangeSpacing",
+    "numberOfRangeSamples",
+)
+
+# Processing-parameter flags that state which corrections were already applied upstream.
+PROCESSING_PARAMETER_KEYS = (
+    "azimuthIonosphericGeolocationCorrectionApplied", "rangeIonosphericGeolocationCorrectionApplied",
+    "dryTroposphericGeolocationCorrectionApplied", "wetTroposphericGeolocationCorrectionApplied",
+    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied", "rfiMitigationApplied",
+)
+
+# Largest dataset (in elements) that is read into memory as metadata. Raster layers such as
+# HH (billions of samples) are far above this and are only described by shape and dtype.
+MAX_METADATA_ELEMENTS = 16
+
+# Longest string logged on a single line; larger blobs (run configuration, WKT) are summarised.
+MAX_METADATA_STRING = 300
+
+
+def to_plain_value(value):
+    """Convert h5py/numpy values (bytes, scalars, arrays) to plain Python types for logging."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.ndarray):
+        return [to_plain_value(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return to_plain_value(value.item())
+    return value
+
+
+def read_metadata_dataset(group: h5py.Group, name: str):
+    """Return ``(value, units)`` for a small dataset, or None when absent or too large.
+
+    Only scalar or tiny datasets are read, so a rasterised layer can never be loaded here.
+    """
+    if name not in group:
+        return None
+    dataset = group[name]
+    if not isinstance(dataset, h5py.Dataset) or dataset.size > MAX_METADATA_ELEMENTS:
+        return None
+    units = to_plain_value(dataset.attrs.get("units", ""))
+    # Dimensionless markers ("unitless", "1") add noise to the log, so they are dropped.
+    if units in ("unitless", "1"):
+        units = ""
+    return to_plain_value(dataset[()]), units
+
+
+def log_metadata_value(logger: logging.Logger, label: str, value, units: str = "") -> None:
+    """Write one ``label: value [units]`` line, summarising oversized strings."""
+    if isinstance(value, str) and len(value) > MAX_METADATA_STRING:
+        value = f"<{len(value)} characters omitted>"
+    suffix = f" [{units}]" if units else ""
+    logger.info("  %-44s : %s%s", label, value, suffix)
+
+
+def log_group_metadata(
+    logger: logging.Logger,
+    product: h5py.File,
+    group_path: str,
+    keys: tuple[str, ...] | None = None,
+) -> None:
+    """Log selected (or, with ``keys=None``, every small) datasets of one HDF5 group.
+
+    Missing groups or keys are skipped silently because the metadata layout differs between
+    GSLC and GCOV products and between processing-software versions.
+    """
+    if group_path not in product:
+        return
+    group = product[group_path]
+    for name in (keys if keys is not None else sorted(group.keys())):
+        found = read_metadata_dataset(group, name)
+        if found is not None:
+            log_metadata_value(logger, name, *found)
+
+
+def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
+    """Log the ``boundingPolygon`` WKT footprint as a longitude/latitude bounding box."""
+    identification_path = "science/LSAR/identification"
+    if identification_path not in product or "boundingPolygon" not in product[identification_path]:
+        return
+    wkt = to_plain_value(product[identification_path]["boundingPolygon"][()])
+    # WKT vertices are "lon lat height" triples; the height component is not needed here.
+    numbers = np.array(re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", wkt), dtype=float)
+    if numbers.size < 6 or numbers.size % 3:
+        return
+    longitudes, latitudes = numbers[0::3], numbers[1::3]
+    log_metadata_value(logger, "footprintVertices", len(longitudes))
+    log_metadata_value(logger, "footprintLongitudeRange", f"{longitudes.min():.5f} to {longitudes.max():.5f}", "degrees")
+    log_metadata_value(logger, "footprintLatitudeRange", f"{latitudes.min():.5f} to {latitudes.max():.5f}", "degrees")
+
+
+def log_product_metadata(
+    product: h5py.File,
+    source_file: Path,
+    product_type: str,
+    grids: h5py.Group,
+    logger: logging.Logger,
+) -> None:
+    """Log the original file's metadata before any of its layers are processed.
+
+    Only metadata is read (attributes and tiny datasets); the raster layers are described by
+    shape and dtype without loading pixels. Because the work happens before processing, the
+    record is written even when every layer is later skipped as already completed.
+    """
+    product_root = f"science/LSAR/{product_type}"
+    logger.info("=" * 78)
+    logger.info("SOURCE METADATA: %s", source_file.name)
+    logger.info("=" * 78)
+    try:
+        logger.info("[File]")
+        log_metadata_value(logger, "path", source_file.resolve())
+        log_metadata_value(logger, "sizeOnDisk", f"{source_file.stat().st_size / 1024 ** 3:.3f}", "GiB")
+        for name in ROOT_ATTRIBUTES:
+            if name in product.attrs:
+                log_metadata_value(logger, name, to_plain_value(product.attrs[name]))
+
+        logger.info("[Identification]")
+        log_group_metadata(logger, product, "science/LSAR/identification")
+        log_bounding_polygon(logger, product)
+
+        logger.info("[Orbit]")
+        log_group_metadata(logger, product, f"{product_root}/metadata/orbit", ("orbitType", "interpMethod"))
+        if f"{product_root}/metadata/orbit/position" in product:
+            log_metadata_value(
+                logger, "orbitStateVectors", product[f"{product_root}/metadata/orbit/position"].shape[0]
+            )
+
+        logger.info("[Processing Parameters]")
+        log_group_metadata(
+            logger, product, f"{product_root}/metadata/processingInformation/parameters",
+            PROCESSING_PARAMETER_KEYS,
+        )
+
+        for frequency in FREQUENCIES:
+            if frequency not in grids:
+                continue
+            grid = grids[frequency]
+            logger.info("[Grid %s]", frequency)
+            log_group_metadata(logger, product, grid.name.lstrip("/"), GRID_FREQUENCY_KEYS)
+            for polarization in POLARIZATIONS:
+                dataset_name = dataset_name_for_polarization(product_type, polarization)
+                if dataset_name in grid:
+                    layer = grid[dataset_name]
+                    log_metadata_value(logger, f"layer {dataset_name}", f"shape={layer.shape} dtype={layer.dtype}")
+            logger.info("[Swath %s]", frequency)
+            log_group_metadata(
+                logger, product, f"{product_root}/metadata/sourceData/swaths/{frequency}", SWATH_FREQUENCY_KEYS
+            )
+    except Exception as exc:
+        # Metadata is informational; a layout surprise must never stop the product's processing.
+        logger.warning("Could not read all source metadata for %s: %s", source_file.name, exc)
+        logger.debug("Metadata traceback:", exc_info=True)
+    logger.info("=" * 78)
+
 
 def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     """
@@ -786,6 +960,8 @@ def main() -> None:
                 product_type, grids = find_product_grids(product)
                 # Record which product type is being processed for operational traceability.
                 logger.info("Processing %s product: %s", product_type, source_file.name)
+                # Record the original file's metadata before any layer is processed.
+                log_product_metadata(product, source_file, product_type, grids, logger)
 
                 # Consider each frequency configured at the top of this module.
                 for frequency in FREQUENCIES:

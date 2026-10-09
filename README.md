@@ -237,6 +237,8 @@ Both scripts log to the console and to a timestamped file:
 - Downloads → `NISAR_Download_logs/nisar_search_download_<timestamp>.log`
 - Processing → `NISAR_logs/NISAR_L_Band_Process_<timestamp>.log`
 
+Before any layer of a product is processed, the processing scripts (`NISAR_Process.py`, `NISAR_HV_Flood_Process.py`) write a **SOURCE METADATA** block for the original file to the console and the log: identification (granule ID, track/frame, orbit and pass direction, acquisition times, footprint bounding box), orbit type, upstream correction flags, per-frequency grid and swath parameters, and the shape/dtype of each polarization layer. Only metadata is read, never pixel data.
+
 Logs include search parameters, per-file download/processing status, and detailed error messages (with tracebacks in debug mode) for troubleshooting failed items without stopping the whole batch.
 
 ---
