@@ -65,6 +65,7 @@ Function guide
 --------------
 filename_info: Parse and validate the identifiers and date in an input filename.
 discover_pairs: Find complete HH/HV pairs with identical source identity.
+log_source_metadata: Log the metadata of each original input raster before stacking.
 validate_pair: Recheck source/channel identity before opening a requested pair.
 stack_pair: Validate spatial grids and write the three-band output tile by tile.
 main: Parse command-line options, process the batch, and report its outcome.
@@ -109,31 +110,69 @@ def read_source_window(source: rasterio.io.DatasetReader, window: Window) -> np.
     TIFF decoding errors or accepting a partially decoded array. A persistent
     failure includes the source path and pixel window in its diagnostic.
     """
-    location = (
-        f"column={int(window.col_off)}, row={int(window.row_off)}, "
-        f"width={int(window.width)}, height={int(window.height)}"
+    location = (  # Human-readable description of the window, used in log/error messages.
+        f"column={int(window.col_off)}, row={int(window.row_off)}, "  # Window's left pixel offset and top pixel offset.
+        f"width={int(window.width)}, height={int(window.height)}"  # Window size in pixels.
     )
-    with rasterio.Env(GTIFF_IGNORE_READ_ERRORS=False):
-        try:
-            return source.read(1, window=window, masked=True, out_dtype="float32")
-        except RasterioIOError as exc:
-            LOG.warning("Source read failed: %s (%s): %s. Reopening and retrying once.",
-                        source.name, location, exc)
+    with rasterio.Env(GTIFF_IGNORE_READ_ERRORS=False):  # Force GDAL to raise on read errors instead of returning partial data.
+        try:  # First attempt: read through the already-open handle.
+            return source.read(1, window=window, masked=True, out_dtype="float32")  # Band 1 as a float32 masked array (nodata masked); returns immediately on success.
+        except RasterioIOError as exc:  # Only I/O errors are retried; other exceptions propagate.
+            LOG.warning("Source read failed: %s (%s): %s. Reopening and retrying once.",  # Record the failure before retrying.
+                        source.name, location, exc)  # Values for the %s placeholders: file path, window, original error.
 
-        try:
-            with rasterio.open(source.name, sharing=False) as reopened:
-                data = reopened.read(1, window=window, masked=True, out_dtype="float32")
-        except RasterioIOError as exc:
-            raise SourceReadError(
-                f"Source remains unreadable after retry: {source.name} ({location}). "
-                "Check the source file and storage. If the failure persists, regenerate "
-                "HH and HV together from the original product with NISAR_Process.py "
-                "so their export timestamps match. Move the previous HH/HV exports "
-                "out of GeoTIFF_Processed first, because existing exports are skipped."
-            ) from exc
+        try:  # Second attempt: read through a brand-new file handle.
+            with rasterio.open(source.name, sharing=False) as reopened:  # Open a private (non-shared) handle; closed automatically on exit.
+                data = reopened.read(1, window=window, masked=True, out_dtype="float32")  # Same read as the first attempt, using the fresh handle.
+        except RasterioIOError as exc:  # The retry failed too, so the problem is persistent.
+            raise SourceReadError(  # Raise a specific error type carrying a diagnostic and remediation steps.
+                f"Source remains unreadable after retry: {source.name} ({location}). "  # Which file and which window failed.
+                "Check the source file and storage. If the failure persists, regenerate "  # First remediation: inspect file and disk.
+                "HH and HV together from the original product with NISAR_Process.py "  # Rebuild both polarizations from the original product.
+                "so their export timestamps match. Move the previous HH/HV exports "  # Pairing relies on matching export timestamps.
+                "out of GeoTIFF_Processed first, because existing exports are skipped."  # Old exports must be moved or they would be skipped on re-export.
+            ) from exc  # Chain the original error so the root cause stays in the traceback.
 
-    LOG.warning("Source read recovered after reopening: %s (%s)", source.name, location)
-    return data
+    LOG.warning("Source read recovered after reopening: %s (%s)", source.name, location)  # Report that the retry succeeded (reached only on recovery).
+    return data  # Return the window data obtained from the fresh handle.
+
+
+def log_source_metadata(label: str, source: rasterio.io.DatasetReader) -> None:
+    """Log the metadata of one original input raster before it is stacked.
+
+    Args:
+        label: Channel label shown in the log (for example "HH" or "HV").
+        source: Open, read-only dataset whose metadata is reported.
+    Notes:
+        Reports only; a metadata field that cannot be read is logged as
+        unavailable and never prevents stacking.
+    """
+    try:  # Guard all metadata access so a bad field can never abort stacking.
+        res_x, res_y = source.res  # Pixel size along x and y in CRS units.
+        bounds = source.bounds  # Spatial extent (left, bottom, right, top).
+        profile = source.profile  # Dataset creation profile (driver, compression, tiling, ...).
+        lines = [  # One formatted text line per metadata item, joined for logging later.
+            f"Driver: {source.driver}",  # GDAL driver name (e.g. GTiff).
+            f"Size: {source.width} x {source.height} px, {source.count} band(s)",  # Raster dimensions and band count.
+            f"Data type: {', '.join(source.dtypes)}",  # Per-band pixel data types.
+            f"NoData: {source.nodata}",  # Value treated as missing data.
+            f"CRS: {source.crs.to_string() if source.crs else 'None'}",  # Coordinate reference system, or 'None' if unset.
+            f"Pixel size: {res_x} x {res_y}",  # Resolution values read above.
+            f"Bounds: left={bounds.left}, bottom={bounds.bottom}, right={bounds.right}, top={bounds.top}",  # Extent edges.
+            f"Transform: {tuple(source.transform)[:6]}",  # First six affine coefficients (a, b, c, d, e, f).
+            f"Compression: {profile.get('compress')} | Tiled: {profile.get('tiled')} | "  # Compression codec and whether tiled (None if absent).
+            f"Block: {profile.get('blockxsize')} x {profile.get('blockysize')}",  # Internal block (tile/strip) size.
+            f"Band 1 description: {source.descriptions[0]!r} | unit: {source.units[0]!r}",  # Band 1 label and unit; repr shows None/empty clearly.
+        ]
+
+        for namespace, tags in (("Dataset", source.tags()), ("Band 1", source.tags(1))):  # Visit dataset-level tags, then band-1 tags.
+            for key, value in sorted(tags.items()):  # Sort keys so the log output is stable.
+                lines.append(f"{namespace} tag {key}: {value}")  # Add one line per tag, prefixed with its scope.
+    except Exception as exc:  # Metadata is informational and must not block processing.
+        LOG.warning("%s metadata unavailable for %s: %s", label, source.name, exc)  # Note the failure and continue.
+        return  # Skip the summary log; the caller proceeds with stacking.
+
+    LOG.info("%s source metadata: %s\n    %s", label, Path(source.name).name, "\n    ".join(lines))  # Log channel label, file name, and indented metadata lines.
 
 
 def filename_info(path: Path) -> dict[str, str] | None:  # Define the filename parser.
@@ -289,6 +328,9 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
 
     try:  # Ensure staging-file cleanup on success or failure.
         with rasterio.open(hh_path) as hh, rasterio.open(hv_path) as hv:  # Open and automatically close both sources.
+            log_source_metadata("HH", hh)  # Report the original HH file's metadata before stacking.
+            log_source_metadata("HV", hv)  # Report the original HV file's metadata before stacking.
+
             if hh.count != 1 or hv.count != 1:  # Require the original script's single-band outputs.
                 raise ValueError("Expected single-band HH and HV inputs")  # Reject already stacked files.
 

@@ -136,6 +136,40 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # Required horizontal and vertical output pixel size, in metres.
 TARGET_PIXEL_SIZE = 5.0
 
+# --- SOURCE METADATA LOGGING ---
+
+# Root-level HDF5 attributes that identify the product family and its governing specification.
+ROOT_ATTRIBUTES = ("title", "mission_name", "institution", "contact", "reference_document", "Conventions")
+
+# Per-frequency datasets under science/LSAR/<product>/grids/<frequency> worth recording.
+GRID_FREQUENCY_KEYS = (
+    "listOfPolarizations", "centerFrequency", "rangeBandwidth", "azimuthBandwidth",
+    "xCoordinateSpacing", "yCoordinateSpacing", "projection", "numberOfSubSwaths",
+)
+
+# Per-frequency acquisition geometry under metadata/sourceData/swaths/<frequency>.
+SWATH_FREQUENCY_KEYS = (
+    "acquiredRangeBandwidth", "processedRangeBandwidth", "processedAzimuthBandwidth",
+    "nearRangeIncidenceAngle", "farRangeIncidenceAngle", "rangeResolution",
+    "sceneCenterAlongTrackResolution", "sceneCenterGroundRangeSpacing",
+    "sceneCenterAlongTrackSpacing", "slantRangeStart", "slantRangeSpacing",
+    "numberOfRangeSamples",
+)
+
+# Processing-parameter flags that state which corrections were already applied upstream.
+PROCESSING_PARAMETER_KEYS = (
+    "azimuthIonosphericGeolocationCorrectionApplied", "rangeIonosphericGeolocationCorrectionApplied",
+    "dryTroposphericGeolocationCorrectionApplied", "wetTroposphericGeolocationCorrectionApplied",
+    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied", "rfiMitigationApplied",
+)
+
+# Largest dataset (in elements) that is read into memory as metadata. Raster layers such as
+# HH (billions of samples) are far above this and are only described by shape and dtype.
+MAX_METADATA_ELEMENTS = 16
+
+# Longest string logged on a single line; larger blobs (run configuration, WKT) are summarised.
+MAX_METADATA_STRING = 300
+
 
 # --- FUNCTION DEFINITIONS ---
 
@@ -238,7 +272,23 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
 
 
 def grid_has_target_pixel_size(transform: Affine) -> bool:
-    """Return whether both source pixel dimensions already equal the target size."""
+    """
+    Check whether a grid already has the required output pixel size.
+
+    Used to decide if a layer can be exported unchanged (native grid) or must be
+    resampled to the TARGET_PIXEL_SIZE grid before publishing.
+
+    Args:
+        transform (Affine): Affine transform of the source grid. ``a`` is the pixel
+            width and ``e`` is the pixel height (negative for north-up rasters).
+
+    Returns:
+        bool: True when both the X and Y pixel sizes equal TARGET_PIXEL_SIZE.
+    """
+    # Compare the absolute pixel width (transform.a) with the target; abs() ignores axis direction.
+    # np.isclose tolerates floating-point noise in the stored coordinate spacing.
+    # The same test on the pixel height (transform.e) is combined with "and", so both
+    # axes must match. bool() converts the NumPy boolean to a plain Python bool.
     return bool(
         np.isclose(abs(transform.a), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
         and np.isclose(abs(transform.e), TARGET_PIXEL_SIZE, rtol=1e-9, atol=1e-9)
@@ -246,20 +296,40 @@ def grid_has_target_pixel_size(transform: Affine) -> bool:
 
 
 def target_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
-    """Create an exact 5 m square-pixel GeoTIFF profile covering the source grid."""
+    """
+    Create an exact 5 m square-pixel GeoTIFF profile covering the source grid.
+
+    Args:
+        profile (dict): Rasterio profile of the native-grid staging file (driver, dtype,
+            CRS, compression, tiling, ...). It is copied, never modified.
+        transform (Affine): Affine transform of the native source grid.
+        width (int): Native raster width in pixels.
+        height (int): Native raster height in pixels.
+
+    Returns:
+        dict: A copy of ``profile`` whose width, height and transform describe the
+        TARGET_PIXEL_SIZE grid over the same upper-left origin.
+    """
+    # Native pixel sizes in map units (metres); abs() removes the sign of the axis direction.
     source_pixel_x = abs(transform.a)
     source_pixel_y = abs(transform.e)
+    # Required output pixel size, held in a local name for readability in the formulas below.
     target_resolution = TARGET_PIXEL_SIZE
 
     # Preserve the source's upper-left pixel boundary and axis directions.  Rounding up
     # covers the full source footprint when it is not an exact multiple of 5 m.
+    # Ground extent (pixels x native size) divided by the target size gives the new pixel count.
     target_width = math.ceil(width * source_pixel_x / target_resolution)
     target_height = math.ceil(height * source_pixel_y / target_resolution)
+    # Build the new transform: 5 m scale with the original sign (copysign) so north-up
+    # rasters stay north-up, no shear terms (0.0), and the original origin (c, f) kept.
     target_transform = Affine(
         math.copysign(target_resolution, transform.a), 0.0, transform.c,
         0.0, math.copysign(target_resolution, transform.e), transform.f,
     )
+    # Copy the staging profile so the caller's native-grid profile is left untouched.
     target_profile = profile.copy()
+    # Override only the geometry keys; compression, dtype, CRS and nodata carry over unchanged.
     target_profile.update({"width": target_width, "height": target_height, "transform": target_transform})
     return target_profile
 
@@ -276,7 +346,7 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
     Yields:
         Window: A rasterio Window object defining a specific rectangular sub-region.
     """
-    # Iterate through the image in steps of TILE_SIZE (e.g., 512 pixels)
+    # Iterate through the image in steps of TILE_SIZE (currently 1024 pixels)
     for row_offset in range(0, height, TILE_SIZE):
         # Ensure we don't try to grab a tile larger than the image height at the bottom edge
         tile_height = min(TILE_SIZE, height - row_offset)
@@ -290,69 +360,79 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
 
 
 def find_product_grids(product: h5py.File) -> tuple[str, h5py.Group]:
-    """Return the supported product type and its spatial-grid group."""
+    """
+    Detect whether an opened file is a GSLC or GCOV product and locate its grids group.
+
+    Args:
+        product (h5py.File): Open NISAR HDF5/NetCDF4 file.
+
+    Returns:
+        tuple[str, h5py.Group]: The product type ("GSLC" or "GCOV") and the HDF5 group
+        holding the per-frequency spatial grids.
+
+    Raises:
+        ValueError: If none, or more than one, of the supported grid paths exist.
+    """
+    # Collect every (product type, HDF5 path) pair from PRODUCT_GRIDS_PATHS whose path
+    # is actually present in this file.
     matches = [
         (product_type, path)
         for product_type, path in PRODUCT_GRIDS_PATHS.items()
         if path in product
     ]
+    # A valid file contains exactly one product; zero means unsupported, several means ambiguous.
     if len(matches) != 1:
         raise ValueError(f"Expected exactly one supported product; found {matches}")
+    # Unpack the single match and return the type with the opened HDF5 group.
     product_type, path = matches[0]
     return product_type, product[path]
 
 
 def dataset_name_for_polarization(product_type: str, polarization: str) -> str:
-    """Map a requested channel to its product-specific HDF5 dataset name."""
+    """
+    Map a requested channel to its product-specific HDF5 dataset name.
+
+    Args:
+        product_type (str): "GSLC" or "GCOV".
+        polarization (str): Physical channel such as "HH" or "HV".
+
+    Returns:
+        str: Dataset name inside the frequency group ("HH" for GSLC, "HHHH" for GCOV).
+
+    Raises:
+        ValueError: If ``product_type`` is not supported.
+    """
+    # GSLC stores each complex channel under its plain polarization name (e.g. "HH").
     if product_type == "GSLC":
         return polarization
+    # GCOV stores diagonal covariance terms, named by repeating the channel (HH -> "HHHH").
     if product_type == "GCOV":
         return polarization * 2
+    # Any other product type has no known naming convention.
     raise ValueError(f"Unsupported NISAR product type: {product_type}")
-
-# --- SOURCE METADATA LOGGING ---
-
-# Root-level HDF5 attributes that identify the product family and its governing specification.
-ROOT_ATTRIBUTES = ("title", "mission_name", "institution", "contact", "reference_document", "Conventions")
-
-# Per-frequency datasets under science/LSAR/<product>/grids/<frequency> worth recording.
-GRID_FREQUENCY_KEYS = (
-    "listOfPolarizations", "centerFrequency", "rangeBandwidth", "azimuthBandwidth",
-    "xCoordinateSpacing", "yCoordinateSpacing", "projection", "numberOfSubSwaths",
-)
-
-# Per-frequency acquisition geometry under metadata/sourceData/swaths/<frequency>.
-SWATH_FREQUENCY_KEYS = (
-    "acquiredRangeBandwidth", "processedRangeBandwidth", "processedAzimuthBandwidth",
-    "nearRangeIncidenceAngle", "farRangeIncidenceAngle", "rangeResolution",
-    "sceneCenterAlongTrackResolution", "sceneCenterGroundRangeSpacing",
-    "sceneCenterAlongTrackSpacing", "slantRangeStart", "slantRangeSpacing",
-    "numberOfRangeSamples",
-)
-
-# Processing-parameter flags that state which corrections were already applied upstream.
-PROCESSING_PARAMETER_KEYS = (
-    "azimuthIonosphericGeolocationCorrectionApplied", "rangeIonosphericGeolocationCorrectionApplied",
-    "dryTroposphericGeolocationCorrectionApplied", "wetTroposphericGeolocationCorrectionApplied",
-    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied", "rfiMitigationApplied",
-)
-
-# Largest dataset (in elements) that is read into memory as metadata. Raster layers such as
-# HH (billions of samples) are far above this and are only described by shape and dtype.
-MAX_METADATA_ELEMENTS = 16
-
-# Longest string logged on a single line; larger blobs (run configuration, WKT) are summarised.
-MAX_METADATA_STRING = 300
 
 
 def to_plain_value(value):
-    """Convert h5py/numpy values (bytes, scalars, arrays) to plain Python types for logging."""
+    """
+    Convert h5py/numpy values (bytes, scalars, arrays) to plain Python types for logging.
+
+    Args:
+        value: Any value read from an HDF5 dataset or attribute.
+
+    Returns:
+        str for bytes, list for arrays (recursively converted), a native Python scalar for
+        NumPy scalars, or the value itself when it is already a plain type.
+    """
+    # HDF5 strings often arrive as bytes; decode them, replacing undecodable bytes instead of failing.
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
+    # Arrays become nested lists; each element is converted again (e.g. arrays of bytes).
     if isinstance(value, np.ndarray):
         return [to_plain_value(item) for item in value.tolist()]
+    # NumPy scalars (np.float64, np.int32, ...) are unwrapped to Python scalars via .item().
     if isinstance(value, np.generic):
         return to_plain_value(value.item())
+    # Anything else (str, int, float, ...) is already loggable.
     return value
 
 
@@ -360,24 +440,48 @@ def read_metadata_dataset(group: h5py.Group, name: str):
     """Return ``(value, units)`` for a small dataset, or None when absent or too large.
 
     Only scalar or tiny datasets are read, so a rasterised layer can never be loaded here.
+
+    Args:
+        group (h5py.Group): HDF5 group expected to contain the dataset.
+        name (str): Dataset name inside ``group``.
+
+    Returns:
+        tuple | None: ``(plain value, units string)``, or None if the name is missing,
+        is a sub-group, or holds more than MAX_METADATA_ELEMENTS elements.
     """
+    # Missing keys are normal because the layout varies by product and software version.
     if name not in group:
         return None
+    # Open the HDF5 object lazily; nothing is read from disk yet.
     dataset = group[name]
+    # Skip sub-groups and any large array, so raster layers are never pulled into memory.
     if not isinstance(dataset, h5py.Dataset) or dataset.size > MAX_METADATA_ELEMENTS:
         return None
+    # Read the optional "units" attribute (empty string when absent) as a plain string.
     units = to_plain_value(dataset.attrs.get("units", ""))
     # Dimensionless markers ("unitless", "1") add noise to the log, so they are dropped.
     if units in ("unitless", "1"):
         units = ""
+    # dataset[()] reads the whole (tiny) dataset; convert it to a plain Python value.
     return to_plain_value(dataset[()]), units
 
 
 def log_metadata_value(logger: logging.Logger, label: str, value, units: str = "") -> None:
-    """Write one ``label: value [units]`` line, summarising oversized strings."""
+    """
+    Write one ``label: value [units]`` line, summarising oversized strings.
+
+    Args:
+        logger (logging.Logger): Logger that receives the INFO line.
+        label (str): Metadata field name, left-aligned in a 44-character column.
+        value: Plain value to print.
+        units (str): Optional unit text appended in square brackets.
+    """
+    # Long blobs (run configuration, WKT) would flood the log; replace them with their length.
     if isinstance(value, str) and len(value) > MAX_METADATA_STRING:
         value = f"<{len(value)} characters omitted>"
+    # Append " [units]" only when units are known.
     suffix = f" [{units}]" if units else ""
+    # %-44s pads the label so the colons line up down the log; lazy %-formatting is used by logging.
     logger.info("  %-44s : %s%s", label, value, suffix)
 
 
@@ -391,27 +495,53 @@ def log_group_metadata(
 
     Missing groups or keys are skipped silently because the metadata layout differs between
     GSLC and GCOV products and between processing-software versions.
+
+    Args:
+        logger (logging.Logger): Logger that receives the metadata lines.
+        product (h5py.File): Open NISAR product file.
+        group_path (str): Absolute HDF5 path of the group (no leading slash needed).
+        keys (tuple[str, ...] | None): Dataset names to log, in order. None logs every
+            dataset in the group, sorted alphabetically.
     """
+    # Nothing to report when this product does not have the requested group.
     if group_path not in product:
         return
+    # Open the group once; its datasets are read individually below.
     group = product[group_path]
+    # Use the caller's key list if given, otherwise every child name in alphabetical order.
     for name in (keys if keys is not None else sorted(group.keys())):
+        # Returns (value, units), or None for missing/large/non-dataset entries.
         found = read_metadata_dataset(group, name)
         if found is not None:
+            # *found unpacks into the value and units arguments.
             log_metadata_value(logger, name, *found)
 
 
 def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
-    """Log the ``boundingPolygon`` WKT footprint as a longitude/latitude bounding box."""
+    """
+    Log the ``boundingPolygon`` WKT footprint as a longitude/latitude bounding box.
+
+    Args:
+        logger (logging.Logger): Logger that receives the footprint lines.
+        product (h5py.File): Open NISAR product file.
+    """
+    # HDF5 location of the product identification group that holds the footprint.
     identification_path = "science/LSAR/identification"
+    # Exit quietly if the group or the polygon is not present in this product.
     if identification_path not in product or "boundingPolygon" not in product[identification_path]:
         return
+    # Read the WKT text (stored as bytes) and convert it to a Python string.
     wkt = to_plain_value(product[identification_path]["boundingPolygon"][()])
     # WKT vertices are "lon lat height" triples; the height component is not needed here.
+    # The regex pulls out every signed integer/decimal/scientific-notation number in order.
     numbers = np.array(re.findall(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", wkt), dtype=float)
+    # Need at least two vertices (6 numbers) and a count divisible by 3, otherwise the
+    # string is not a well-formed triple list and the footprint is not logged.
     if numbers.size < 6 or numbers.size % 3:
         return
+    # Every third value starting at 0 is longitude; starting at 1 is latitude.
     longitudes, latitudes = numbers[0::3], numbers[1::3]
+    # Report the vertex count and the min/max extent of the footprint in degrees.
     log_metadata_value(logger, "footprintVertices", len(longitudes))
     log_metadata_value(logger, "footprintLongitudeRange", f"{longitudes.min():.5f} to {longitudes.max():.5f}", "degrees")
     log_metadata_value(logger, "footprintLatitudeRange", f"{latitudes.min():.5f} to {latitudes.max():.5f}", "degrees")
@@ -429,47 +559,76 @@ def log_product_metadata(
     Only metadata is read (attributes and tiny datasets); the raster layers are described by
     shape and dtype without loading pixels. Because the work happens before processing, the
     record is written even when every layer is later skipped as already completed.
+
+    Args:
+        product (h5py.File): Open NISAR product file.
+        source_file (Path): Path of that file, used for its name, location and size.
+        product_type (str): "GSLC" or "GCOV"; selects the metadata sub-tree.
+        grids (h5py.Group): The product's grids group (from ``find_product_grids``).
+        logger (logging.Logger): Logger that receives the report.
     """
+    # Root of the product-specific tree, e.g. "science/LSAR/GSLC".
     product_root = f"science/LSAR/{product_type}"
+    # Banner lines make each product's block easy to find in a long log.
     logger.info("=" * 78)
     logger.info("SOURCE METADATA: %s", source_file.name)
     logger.info("=" * 78)
+    # Everything is wrapped in try/except (see below) so logging can never abort processing.
     try:
+        # --- File-level information ---
         logger.info("[File]")
+        # Absolute path of the input file.
         log_metadata_value(logger, "path", source_file.resolve())
+        # File size converted from bytes to GiB (1024**3 bytes).
         log_metadata_value(logger, "sizeOnDisk", f"{source_file.stat().st_size / 1024 ** 3:.3f}", "GiB")
+        # Log each root attribute that exists in this file (title, mission, contact, ...).
         for name in ROOT_ATTRIBUTES:
             if name in product.attrs:
                 log_metadata_value(logger, name, to_plain_value(product.attrs[name]))
 
+        # --- Identification: acquisition ID, track/frame, times, and so on ---
         logger.info("[Identification]")
+        # keys=None logs every small dataset in the identification group.
         log_group_metadata(logger, product, "science/LSAR/identification")
+        # Add the scene footprint as a lon/lat bounding box.
         log_bounding_polygon(logger, product)
 
+        # --- Orbit information ---
         logger.info("[Orbit]")
+        # Only the orbit type and interpolation method; the full state vectors are too large.
         log_group_metadata(logger, product, f"{product_root}/metadata/orbit", ("orbitType", "interpMethod"))
+        # Report how many orbit state vectors are stored (first axis of the position array).
         if f"{product_root}/metadata/orbit/position" in product:
             log_metadata_value(
                 logger, "orbitStateVectors", product[f"{product_root}/metadata/orbit/position"].shape[0]
             )
 
+        # --- Corrections already applied by the upstream processor ---
         logger.info("[Processing Parameters]")
         log_group_metadata(
             logger, product, f"{product_root}/metadata/processingInformation/parameters",
             PROCESSING_PARAMETER_KEYS,
         )
 
+        # --- Per-frequency grid, layer and swath details ---
         for frequency in FREQUENCIES:
+            # Skip frequencies this acquisition did not record.
             if frequency not in grids:
                 continue
+            # Group holding this frequency's coordinates and raster layers.
             grid = grids[frequency]
             logger.info("[Grid %s]", frequency)
+            # grid.name is an absolute path ("/science/..."); strip the slash for the helper.
             log_group_metadata(logger, product, grid.name.lstrip("/"), GRID_FREQUENCY_KEYS)
+            # Describe each requested polarization layer without reading any pixels.
             for polarization in POLARIZATIONS:
+                # GSLC uses "HH"; GCOV uses "HHHH".
                 dataset_name = dataset_name_for_polarization(product_type, polarization)
                 if dataset_name in grid:
                     layer = grid[dataset_name]
+                    # Shape and dtype are available from the HDF5 header alone.
                     log_metadata_value(logger, f"layer {dataset_name}", f"shape={layer.shape} dtype={layer.dtype}")
+            # Acquisition geometry (bandwidths, incidence angles, range spacing) for this frequency.
             logger.info("[Swath %s]", frequency)
             log_group_metadata(
                 logger, product, f"{product_root}/metadata/sourceData/swaths/{frequency}", SWATH_FREQUENCY_KEYS
@@ -477,7 +636,9 @@ def log_product_metadata(
     except Exception as exc:
         # Metadata is informational; a layout surprise must never stop the product's processing.
         logger.warning("Could not read all source metadata for %s: %s", source_file.name, exc)
+        # The full traceback goes to the DEBUG level only, keeping the console readable.
         logger.debug("Metadata traceback:", exc_info=True)
+    # Closing banner marks the end of this product's metadata block.
     logger.info("=" * 78)
 
 
@@ -854,8 +1015,8 @@ def export_layer(
 
     # Build overviews on the actual exported grid and calculate its final statistics.
     with rasterio.open(temp_path, "r+") as output_raster:
-        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
-        output_raster.update_tags(ns="rio_overview", resampling="average")
+        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.nearest)
+        output_raster.update_tags(ns="rio_overview", resampling="nearest")
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.

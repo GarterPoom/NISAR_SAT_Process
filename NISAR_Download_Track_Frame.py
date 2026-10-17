@@ -64,28 +64,28 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                                 "Administrative_Boundary_dir",
-                                 "Administrative_Boundary.shp")
+                             "Thailand_Admin",
+                             "tha_admbnda_adm1_rtsd_20190221.shp")  # Path to the shapefile defining the area of interest (AOI).
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
     DATE_MODE = 1
-    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
-    END_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    START_DATE = datetime.strptime("2026-09-25", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("2026-10-08", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
     DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
     FRAME_COVERAGE = "FULL"  # Exclude NISAR products that cover only a partial frame.
+    POLARIZATION_MODE = "DH"  # "SH" (single-pol H), "DH" (dual-pol H: HH+HV), or None to keep every mode.
 
     # NISAR Track/Frame pairs to download.  Add every required pair here as
     # (track, frame); for example, (105, 78) means Track 105, Frame 078.
-    #
     # A pair is downloaded only when its full-frame product footprint
     # intersects AOI_SHAPEFILE; partial-frame products are excluded.
     # Leave no pairs configured only if you want the script to stop before
     # searching, rather than accidentally downloading every AOI result.
     TRACK_FRAME_PAIRS: list[tuple[int, int]] = [
-        (4, 81),
+        (112, 10), (112, 9), (112, 8), (105, 79), (105, 80), (105, 81)
     ]
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
@@ -410,22 +410,54 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
 # --------------------------------------------------------------------------- #
 # Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.
 # --------------------------------------------------------------------------- #
+def normalize_polarization_mode(polarization_mode: str | None) -> str | None:
+    """Return an upper-case polarization mode code, or ``None`` for no filtering.
+
+    Args:
+        polarization_mode: ``"SH"`` (single-pol H) or ``"DH"`` (dual-pol H); ``None``/``"ANY"`` keeps every mode.
+
+    Raises:
+        ValueError: If the value is not SH, DH, ANY, or None.
+    """
+    if polarization_mode is None or str(polarization_mode).strip().upper() in ("", "ANY"):
+        return None  # No polarization filtering requested.
+    mode = str(polarization_mode).strip().upper()  # Normalize case and whitespace.
+    if mode not in ("SH", "DH"):
+        raise ValueError("POLARIZATION_MODE must be 'SH', 'DH', or None.")  # Reject unsupported modes early.
+    return mode
+
+
+def polarization_mode_from_filename(filename: str) -> str | None:
+    """Extract the frequency-A polarization mode (e.g. ``DH``) from a NISAR filename.
+
+    NISAR names embed ``_<bandwidth>_<modeA><modeB>_`` such as ``_2005_DHDH_``;
+    the first two letters describe the frequency-A polarization mode.
+    """
+    match = re.search(r"_\d{4}_([A-Z]{2})([A-Z]{2})_", filename)  # Locate the 4-letter mode token after the bandwidth code.
+    return match.group(1) if match else None  # None when the name has no recognizable mode token.
+
+
 def filter_hdf5_urls(
     results: asf.ASFSearchResults,
     selected_track_frame_pairs: set[tuple[int, int]],
+    polarization_mode: str | None = None,
 ) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
     """Filter search results down to direct-download URLs for HDF5 files.
 
     Args:
         results: Search results returned by search_nisar_granules().
+        selected_track_frame_pairs: Exact (track, frame) pairs to keep.
+        polarization_mode: Optional ``"SH"`` or ``"DH"``; products with another mode are dropped.
 
     Returns:
         A list of direct download URLs for selected Track/Frame pairs ending in
-        .h5 or .hdf5, **excluding** any file ending with `_QA_STATS.h5`.
+        .h5 or .hdf5, **excluding** any file ending with `_QA_STATS.h5` and any
+        file whose polarization mode differs from ``polarization_mode``.
 
     Exits:
         Gracefully (status 0) if no HDF5 URLs are found.
     """
+    polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
     all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
 
     # Capture NISAR's ..._<track>_<direction>_<frame>_... filename fields.
@@ -450,9 +482,14 @@ def filter_hdf5_urls(
         if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
             not filename.lower().endswith('_qa_stats.h5') and  # Exclude QA_STATS files.
             track_frame_pair in selected_track_frame_pairs):  # Retain exact requested pairs only.
+            if polarization_mode and polarization_mode_from_filename(filename) != polarization_mode:
+                continue  # Skip products acquired in a different polarization mode.
             download_urls.append(url)  # Add the URL to the list.
 
-    logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
+    logging.info(
+        f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs "
+        f"(polarization mode: {polarization_mode or 'ANY'})."
+    )  # Log counts.
 
     if not download_urls:  # Check if the filtered URL list is empty.
         logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
@@ -671,6 +708,12 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
 
     session = authenticate_earthdata(Config.EARTHDATA_USERNAME, Config.EARTHDATA_PASSWORD)  # Log in to Earthdata.
 
+    try:
+        normalize_polarization_mode(Config.POLARIZATION_MODE)  # Fail fast on an invalid polarization mode.
+    except ValueError as mode_error:
+        logging.error("Invalid polarization configuration: %s", mode_error)
+        sys.exit(1)
+
     aoi_wkt = load_aoi_wkt_from_shapefile(Config.AOI_SHAPEFILE)  # Derive the WKT search geometry from the AOI shapefile.
     selected_track_frame_pairs, granule_patterns = prepare_track_frame_filters(
         Config.TRACK_FRAME_PAIRS
@@ -687,7 +730,7 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     )
 
     download_urls = filter_hdf5_urls(  # Narrow results to the exact pairs and HDF5 URLs (excluding _QA_STATS.h5).
-        results, selected_track_frame_pairs
+        results, selected_track_frame_pairs, Config.POLARIZATION_MODE
     )
 
     download_files_sequentially(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download each file in turn.
