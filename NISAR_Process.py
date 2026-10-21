@@ -339,7 +339,7 @@ def apply_multilook(intensity: np.ndarray, looks: int = 5) -> np.ndarray:
         np.ndarray: The spatially filtered intensity array.
     """
     # Mark zero, negative, NaN, and infinity values as invalid.  NISAR swath edges
-    # commonly contain zero-filled samples, which must not contribute to an average.
+    # commonly contain zero-filled samples, which must not contribute to an nearest.
     valid = np.isfinite(intensity) & (intensity > 0)
     # Filter data and valid-sample weights separately so NoData never darkens the
     # neighboring valid edge pixels.
@@ -680,8 +680,8 @@ def export_layer(
 
     # Build overviews on the actual exported grid and calculate its final statistics.
     with rasterio.open(temp_path, "r+") as output_raster:
-        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
-        output_raster.update_tags(ns="rio_overview", resampling="average")
+        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.nearest)
+        output_raster.update_tags(ns="rio_overview", resampling="nearest")
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
@@ -690,6 +690,172 @@ def export_layer(
     logger.info("Created processed %s GeoTIFF: %s", product_type, out_path)
     # Return the final GeoTIFF path to the caller.
     return out_path
+
+def read_metadata_value(group: h5py.Group, name: str) -> str | None:
+    """
+    Read one scalar or array metadata dataset and return it as printable text.
+
+    HDF5 stores strings as bytes and lists (e.g. polarizations) as arrays, neither of
+    which logs cleanly. This helper normalizes both into a plain string so callers can
+    pass the result straight to the logger. It never raises for missing or unreadable
+    fields; it returns None so the caller can simply skip them.
+
+    Args:
+        group (h5py.Group): HDF5 group expected to contain the dataset.
+        name (str): Dataset name inside the group (e.g. "trackNumber").
+
+    Returns:
+        str | None: The decoded value (arrays are comma-joined and capped at 10 items),
+        or None when the dataset is absent, is not a dataset, or cannot be read.
+    """
+    # Skip names that are missing, or that point to a sub-group rather than a dataset.
+    if name not in group or not isinstance(group[name], h5py.Dataset):
+        return None
+    try:
+        # Read the entire (small) dataset into memory; [()] returns scalars and arrays alike.
+        value = group[name][()]
+    except (OSError, ValueError, TypeError):
+        # A damaged or unsupported dataset is treated as "no metadata" instead of a failure.
+        return None
+    # Decode a scalar byte string (the usual HDF5 string form) into text.
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    # Handle array values such as lists of polarizations or frequencies.
+    if isinstance(value, np.ndarray):
+        # Flatten the array and convert each element to text, decoding bytes where needed.
+        items = [v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v) for v in value.ravel()]
+        # Join the first 10 items with commas and append "..." when more were truncated.
+        return ", ".join(items[:10]) + (" ..." if len(items) > 10 else "")
+    # Numbers, booleans, and other scalars are converted with plain str().
+    return str(value)
+
+
+def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
+    """
+    Log the identification and grid metadata of one NISAR product.
+
+    This is the pre-processing report shown for every file before any GeoTIFF is
+    written. It lets the operator review what is about to be processed: which
+    acquisition (orbit, track, frame, time span), which product type, and what each
+    configured frequency/polarization layer looks like (size, CRS, pixel spacing, and
+    whether resampling to the 5 m target grid will be needed).
+
+    The product is opened read-only and only small metadata datasets are read, so
+    this is cheap compared with processing. Missing fields are skipped, and a
+    damaged file is reported as a warning rather than raising, so one bad file
+    cannot stop the report for the remaining files.
+
+    Args:
+        source_file (Path): Input NISAR HDF5/NetCDF4 file to describe.
+        logger (logging.Logger): Configured logger used to emit the metadata block.
+
+    Returns:
+        None. The report is written to the console and log file.
+    """
+    # Print a separator line so each product's block is visually distinct in the log.
+    logger.info("-" * 70)
+    # Identify which file the following lines describe.
+    logger.info("Metadata: %s", source_file.name)
+    # Report the on-disk size in GB (bytes / 1024^3) to hint at processing time.
+    logger.info("  File size           : %.2f GB", source_file.stat().st_size / 1024**3)
+    try:
+        # Open read-only; the context manager closes the file even if a read fails.
+        with h5py.File(source_file, "r") as product:
+            # Product type and grids group (also validates that the file is supported).
+            product_type, grids = find_product_grids(product)
+            # Show whether this file is GSLC or GCOV.
+            logger.info("  Product type        : %s", product_type)
+
+            # Acquisition/identification fields stored under science/LSAR/identification,
+            # as (HDF5 dataset name, label shown in the log) pairs in display order.
+            identification_fields = (
+                ("granuleId", "Granule ID"),
+                ("missionId", "Mission"),
+                ("productType", "Product type (ID)"),
+                ("productVersion", "Product version"),
+                ("processingCenter", "Processing center"),
+                ("processingDateTime", "Processing time"),
+                ("absoluteOrbitNumber", "Absolute orbit"),
+                ("trackNumber", "Track"),
+                ("frameNumber", "Frame"),
+                ("orbitPassDirection", "Pass direction"),
+                ("lookDirection", "Look direction"),
+                ("zeroDopplerStartTime", "Start time (UTC)"),
+                ("zeroDopplerEndTime", "End time (UTC)"),
+                ("isGeocoded", "Geocoded"),
+                ("listOfFrequencies", "Frequencies"),
+                ("boundingPolygon", "Bounding polygon"),
+            )
+            # Only read identification metadata when the group exists in this file.
+            if "science/LSAR/identification" in product:
+                # Select the group that holds the acquisition/identification datasets.
+                identification = product["science/LSAR/identification"]
+                # Walk the fields in display order.
+                for dataset_name, label in identification_fields:
+                    # Fetch the decoded value, or None if this field is absent.
+                    value = read_metadata_value(identification, dataset_name)
+                    # Log only fields that exist, so missing ones leave no empty lines.
+                    if value is not None:
+                        logger.info("  %-20s: %s", label, value)
+            else:
+                # Tell the operator the file has no identification block at all.
+                logger.info("  (no science/LSAR/identification group)")
+
+            # Per-frequency grid details: size, pixel spacing, CRS, and available channels.
+            for frequency in FREQUENCIES:
+                # Note a configured frequency that this product does not contain.
+                if frequency not in grids:
+                    logger.info("  %s: not present in this product", frequency)
+                    continue
+                # Select the group holding this frequency's coordinates and layers.
+                grid = grids[frequency]
+                # Header line for this frequency's details.
+                logger.info("  [%s]", frequency)
+                try:
+                    # Derive the affine transform and CRS from the grid's coordinate arrays.
+                    transform, crs = coordinate_transform(grid)
+                    # Report the coordinate reference system (e.g. EPSG:32647).
+                    logger.info("    CRS               : %s", crs)
+                    # Report native pixel size in metres; abs() ignores the axis direction sign.
+                    logger.info("    Native pixel size : %.6g m x %.6g m", abs(transform.a), abs(transform.e))
+                    # Tell the operator whether the 5 m target grid needs resampling.
+                    logger.info(
+                        "    Resampling needed : %s",
+                        "no (already %.0f m)" % TARGET_PIXEL_SIZE
+                        if grid_has_target_pixel_size(transform)
+                        else "yes (to %.0f m)" % TARGET_PIXEL_SIZE,
+                    )
+                except (KeyError, ValueError, OSError) as exc:
+                    # Missing/invalid coordinates or projection: report and keep going.
+                    logger.info("    Georeferencing    : unavailable (%s)", exc)
+
+                # List the polarizations the product itself declares for this frequency.
+                polarizations = read_metadata_value(grid, "listOfPolarizations")
+                if polarizations is not None:
+                    logger.info("    Polarizations     : %s", polarizations)
+                # Check each polarization this script is configured to process.
+                for polarization in POLARIZATIONS:
+                    # Map HH/HV to the product-specific dataset name (HH for GSLC, HHHH for GCOV).
+                    dataset_name = dataset_name_for_polarization(product_type, polarization)
+                    # Only describe layers that exist and are real datasets.
+                    if dataset_name in grid and isinstance(grid[dataset_name], h5py.Dataset):
+                        # Get a lazy handle; reading shape/dtype does not load pixel data.
+                        dataset = grid[dataset_name]
+                        # Report raster dimensions and sample type (complex64 for GSLC, float32 for GCOV).
+                        logger.info(
+                            "    %-17s : %s rows x %s cols, %s",
+                            f"{polarization} ({dataset_name})",
+                            dataset.shape[0], dataset.shape[1], dataset.dtype,
+                        )
+                    else:
+                        # Warn that this requested layer will be skipped during processing.
+                        logger.info("    %-17s : not available", f"{polarization} ({dataset_name})")
+    except (OSError, ValueError) as exc:
+        # Unreadable or unsupported file: log a warning so the pre-pass continues to the next file.
+        logger.warning("  Unable to read metadata (%s)", exc)
+        # Keep the full traceback in the log file only (DEBUG level) for diagnosis.
+        logger.debug("Metadata read failure:", exc_info=True)
+
 
 def main() -> None:
     """
@@ -728,7 +894,19 @@ def main() -> None:
     # Use one timestamp for every output generated during this batch execution.
     run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # State the amount of batch work before opening the first product.
-    logger.info("Found %d product(s). Starting processing...", len(source_files))
+    logger.info("Found %d product(s).", len(source_files))
+
+    # Show every product's metadata up front so the batch can be reviewed before processing begins.
+    # Open the report with a banner so it stands out from the surrounding log lines.
+    logger.info("=" * 70)
+    logger.info("PRODUCT METADATA")
+    logger.info("=" * 70)
+    # Describe each product in turn; unreadable files only produce a warning here.
+    for source_file in source_files:
+        log_product_metadata(source_file, logger)
+    # Close the report and mark the point where actual processing begins.
+    logger.info("=" * 70)
+    logger.info("Starting processing...")
     # Capture a monotonic start time for the complete multi-file processing batch.
     batch_start_time = perf_counter()
 
