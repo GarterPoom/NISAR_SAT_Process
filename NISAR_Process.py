@@ -61,8 +61,17 @@ import h5py
 # Import numpy for high-performance numerical array manipulations (the backbone of data math)
 import numpy as np
 
-# Import uniform_filter to perform spatial averaging (the "multi-looking" process)
-from scipy.ndimage import uniform_filter
+# Import the SciPy ndimage module for CPU spatial averaging (the "multi-looking" process)
+import scipy.ndimage as cpu_ndimage
+
+# Import CuPy (NumPy-compatible GPU arrays) when it is installed; the script then runs
+# the per-tile math on the NVIDIA GPU.  Without CuPy it falls back to the CPU transparently.
+try:
+    import cupy as cp
+    import cupyx.scipy.ndimage as gpu_ndimage
+except ImportError:
+    cp = None
+    gpu_ndimage = None
 
 # Import rasterio for handling geospatial raster data (reading DEMs and writing GeoTIFFs)
 import rasterio
@@ -117,7 +126,8 @@ POLARIZATIONS = ("HH", "HV")
 SUPPORTED_EXTENSIONS = (".h5", ".hdf5", ".he5", ".nc", ".nc4", ".netcdf")
 
 # The dimensions (height/width) of the tiles used during processing to prevent memory overflow
-TILE_SIZE = 512
+TILE_SIZE = 2048
+
 
 # GeoTIFF value used for pixels outside the valid NISAR swath.  This is deliberately
 # outside the expected backscatter dB range, so invalid edge pixels are transparent
@@ -135,6 +145,11 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 
 # Required horizontal and vertical output pixel size, in metres.
 TARGET_PIXEL_SIZE = 5.0
+
+# Run the per-tile math (intensity, multilook, RTC, dB) on the GPU when CuPy and a CUDA
+# device are available.  Set to False to force the CPU path.  HDF5 reading, DEM
+# reprojection, GeoTIFF compression/writing, overviews and statistics always stay on the CPU.
+USE_GPU = True
 
 # --- SOURCE METADATA LOGGING ---
 
@@ -642,101 +657,165 @@ def log_product_metadata(
     logger.info("=" * 78)
 
 
-def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
+def init_gpu(logger: logging.Logger) -> bool:
+    """
+    Decide whether the per-tile math runs on the GPU and log the decision.
+
+    The GPU is used only when USE_GPU is True, CuPy imports, and a tiny test kernel plus
+    a ``uniform_filter`` call both succeed on the CUDA device.  Any failure (no CuPy, no
+    NVIDIA driver, unsupported architecture) is logged and the CPU path is used instead.
+
+    Args:
+        logger (logging.Logger): Logger that receives the device report.
+
+    Returns:
+        bool: True when the GPU will be used, False for the CPU fallback.
+    """
+    if not USE_GPU:
+        logger.info("GPU processing disabled (USE_GPU = False); using the CPU.")
+        return False
+    if cp is None:
+        logger.warning("CuPy is not installed; using the CPU. Install e.g. 'pip install cupy-cuda13x'.")
+        return False
+    try:
+        # Exercise the exact operations used per tile so a broken install fails here, not mid-run.
+        probe = cp.ones((16, 16), dtype=cp.float32)
+        gpu_ndimage.uniform_filter(probe, size=5, mode="reflect")
+        cp.cuda.Stream.null.synchronize()
+        properties = cp.cuda.runtime.getDeviceProperties(cp.cuda.Device().id)
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        logger.info(
+            "GPU processing enabled: %s (%.1f GiB free of %.1f GiB), CuPy %s",
+            properties["name"].decode(), free_bytes / 1024 ** 3, total_bytes / 1024 ** 3, cp.__version__,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("GPU unavailable (%s); using the CPU.", exc)
+        return False
+
+
+def array_module(array):
+    """
+    Return the array library and ndimage module that match where ``array`` lives.
+
+    Args:
+        array: A NumPy array (CPU) or CuPy array (GPU).
+
+    Returns:
+        tuple: ``(xp, ndimage)`` -- ``(cupy, cupyx.scipy.ndimage)`` for GPU arrays,
+        ``(numpy, scipy.ndimage)`` otherwise.
+    """
+    if cp is not None and isinstance(array, cp.ndarray):
+        return cp, gpu_ndimage
+    return np, cpu_ndimage
+
+
+def to_device(array: np.ndarray, use_gpu: bool):
+    """Copy a host array to the GPU when ``use_gpu`` is True; otherwise return it unchanged."""
+    return cp.asarray(array) if use_gpu else array
+
+
+def to_host(array) -> np.ndarray:
+    """Return a NumPy array, copying from the GPU first when ``array`` is a CuPy array."""
+    return cp.asnumpy(array) if cp is not None and isinstance(array, cp.ndarray) else array
+
+
+def calculate_intensity(complex_data):
     """
     Converts complex-valued SAR data into intensity.
     Formula: Intensity = Real^2 + Imaginary^2.
 
     Args:
-        complex_data (np.ndarray): An array of complex numbers (e.g., from SAR signal).
+        complex_data: NumPy or CuPy array of complex numbers (e.g., from SAR signal).
 
     Returns:
-        np.ndarray: An array of floating-point intensity values.
+        A float32 intensity array on the same device as the input.
     """
-    # Compute the square of the real component
-    real_sq = np.square(np.real(complex_data)).astype(np.float32)
-    # Compute the square of the imaginary component
-    imag_sq = np.square(np.imag(complex_data)).astype(np.float32)
-
-    # Combine components to get total intensity
+    xp, _ = array_module(complex_data)
+    # Compute the square of the real and imaginary components and combine them.
+    real_sq = xp.square(xp.real(complex_data)).astype(xp.float32)
+    imag_sq = xp.square(xp.imag(complex_data)).astype(xp.float32)
     return real_sq + imag_sq
 
 
-def apply_multilook(intensity: np.ndarray, looks: int = 5) -> np.ndarray:
+def apply_multilook(intensity, looks: int = 5):
     """
     Reduces 'speckle' noise using a spatial multi-looking (averaging) filter.
 
     Args:
-        intensity (np.ndarray): The input intensity array.
+        intensity: Input intensity array (NumPy or CuPy).
         looks (int): The size of the averaging window (e.g., 5x5).
 
     Returns:
-        np.ndarray: The spatially filtered intensity array.
+        The spatially filtered intensity array on the same device as the input.
     """
+    xp, ndimage = array_module(intensity)
     # Mark zero, negative, NaN, and infinity values as invalid.  NISAR swath edges
     # commonly contain zero-filled samples, which must not contribute to an average.
-    valid = np.isfinite(intensity) & (intensity > 0)
+    valid = xp.isfinite(intensity) & (intensity > 0)
     # Filter data and valid-sample weights separately so NoData never darkens the
     # neighboring valid edge pixels.
-    summed = uniform_filter(np.where(valid, intensity, 0.0), size=looks, mode="reflect")
-    weights = uniform_filter(valid.astype(np.float32), size=looks, mode="reflect")
+    summed = ndimage.uniform_filter(xp.where(valid, intensity, xp.float32(0.0)), size=looks, mode="reflect")
+    weights = ndimage.uniform_filter(valid.astype(xp.float32), size=looks, mode="reflect")
     # Preserve invalid source pixels as NaN; they become GeoTIFF NoData on export.
-    multilooked = np.full(intensity.shape, np.nan, dtype=np.float32)
+    # xp.where avoids boolean-mask indexing, which forces a GPU synchronisation.
     output_valid = valid & (weights > 0)
-    multilooked[output_valid] = summed[output_valid] / weights[output_valid]
-    return multilooked
+    safe_weights = xp.where(output_valid, weights, xp.float32(1.0))
+    return xp.where(output_valid, summed / safe_weights, xp.float32(xp.nan)).astype(xp.float32)
 
 
-def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y: float) -> np.ndarray:
+def apply_rtc(intensity, dem_array, res_x: float, res_y: float):
     """
     Performs basic Radiometric Terrain Correction (RTC).
     Adjusts intensity based on the local terrain slope to compensate for shadows/illumination.
 
     Args:
-        intensity (np.ndarray): Input intensity tile.
-        dem_array (np.ndarray): Corresponding elevation tile from the DEM.
+        intensity: Input intensity tile (NumPy or CuPy).
+        dem_array: Corresponding elevation tile from the DEM, on the same device as ``intensity``.
         res_x (float): Horizontal resolution.
         res_y (float): Vertical resolution.
 
     Returns:
-        np.ndarray: Terrain-corrected intensity.
+        Terrain-corrected intensity on the same device as the input.
     """
+    xp, _ = array_module(intensity)
     # Check if DEM array is valid; if not, return the original intensity
     if dem_array.shape[0] < 2 or dem_array.shape[1] < 2:
         return intensity
 
     # Calculate the gradient (rate of change) in Y and X directions
-    dy, dx = np.gradient(dem_array, res_y, res_x)
+    dy, dx = xp.gradient(dem_array, res_y, res_x)
 
     # Calculate the local slope magnitude: sqrt(slope_x^2 + slope_y^2)
-    slope = np.sqrt(dx**2 + dy**2)
+    slope = xp.sqrt(dx**2 + dy**2)
 
     # Calculate the cosine of the incidence angle (simplified using slope)
     # We add a tiny epsilon (1e-6) to prevent division by zero
-    cos_i = np.cos(np.arctan(slope)) + 1e-6
+    cos_i = xp.cos(xp.arctan(slope)) + 1e-6
 
     # Correct the intensity: intensity / cos(incidence_angle)
     return intensity / cos_i
 
 
-def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
+def convert_to_decibels(intensity):
     """
     Converts linear intensity values to a logarithmic Decibel (dB) scale.
     Formula: 10 * log10(Intensity).
 
     Args:
-        intensity (np.ndarray): Input intensity array.
+        intensity: Input intensity array (NumPy or CuPy).
 
     Returns:
-        np.ndarray: Decibel-scale array.
+        Decibel-scale float32 array on the same device as the input.
     """
+    xp, _ = array_module(intensity)
     # Only positive, finite linear values have a valid dB representation.  Invalid
     # values remain NaN and are written as OUTPUT_NODATA by export_layer, rather than
     # being converted to the artificial -100 dB value produced by log10(1e-10).
-    decibels = np.full(intensity.shape, np.nan, dtype=np.float32)
-    valid = np.isfinite(intensity) & (intensity > 0)
-    decibels[valid] = 10.0 * np.log10(intensity[valid])
-    return decibels
+    valid = xp.isfinite(intensity) & (intensity > 0)
+    safe_intensity = xp.where(valid, intensity, xp.float32(1.0))
+    decibels = xp.float32(10.0) * xp.log10(safe_intensity)
+    return xp.where(valid, decibels, xp.float32(xp.nan)).astype(xp.float32)
 
 
 def completed_output_path(
@@ -792,6 +871,7 @@ def export_layer(
     grid: h5py.Group,
     run_timestamp: str,
     logger: logging.Logger,
+    use_gpu: bool = False,
 ) -> Path:
     """
     Export one configured GSLC or GCOV polarization layer as a dB GeoTIFF.
@@ -810,6 +890,7 @@ def export_layer(
         grid: HDF5 group containing coordinate metadata and layer datasets.
         run_timestamp: Shared timestamp included in output filenames for this run.
         logger: Configured logger used for progress, warnings, and diagnostics.
+        use_gpu: Run the per-tile math on the GPU (CuPy) instead of the CPU.
 
     Raises:
         ValueError: The selected product layer is absent or is not a two-dimensional raster.
@@ -921,6 +1002,10 @@ def export_layer(
                 # Read only this native-grid source tile from the HDF5 dataset.
                 tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
 
+                # Move the raw tile to the GPU once; all math below stays on that device
+                # until the finished dB tile is copied back for writing.
+                tile_data = to_device(tile_data, use_gpu)
+
                 # Convert each product's source samples to the linear measurement that
                 # will be multilooked: intensity for GSLC and covariance for GCOV.
                 if process_gslc:
@@ -928,7 +1013,7 @@ def export_layer(
                     processed_tile = calculate_intensity(tile_data)
                 else:
                     # GCOV diagonal covariance samples are already intensity-like.
-                    processed_tile = np.asarray(tile_data, dtype=np.float32)
+                    processed_tile = tile_data.astype(np.float32, copy=False)
 
                 # Apply the required multi-looking step to every supported product type.
                 processed_tile = apply_multilook(processed_tile, looks=5)
@@ -953,14 +1038,16 @@ def export_layer(
                                 resampling=Resampling.bilinear,
                             )
                             # Correct the multilooked GSLC intensity using local terrain slope.
-                            processed_tile = apply_rtc(processed_tile, dem_tile, pixel_x, pixel_y)
+                            processed_tile = apply_rtc(
+                                processed_tile, to_device(dem_tile, use_gpu), pixel_x, pixel_y
+                            )
                         except Exception as exc:
                             # Keep the uncorrected multilooked tile when RTC fails for this window.
                             logger.debug(
                                 "RTC failed on tile %d: %s. Using uncorrected intensity.", tile_num, exc
                             )
                 # Convert valid linear intensity or covariance values to the logarithmic dB scale.
-                db_tile = convert_to_decibels(processed_tile)
+                db_tile = to_host(convert_to_decibels(processed_tile))
                 # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
                 # dB value.  GIS renderers therefore leave the outside-swath edge blank.
                 valid_db = np.isfinite(db_tile)
@@ -1040,6 +1127,8 @@ def main() -> None:
     """
     # Configure console and file logging before performing any filesystem work.
     logger = setup_logger(LOG_DIRECTORY)
+    # Decide once per batch whether the per-tile math runs on the GPU or the CPU.
+    use_gpu = init_gpu(logger)
 
     # Fail early when the configured input-product directory does not exist.
     if not ROOT_DIRECTORY.is_dir():
@@ -1116,6 +1205,7 @@ def main() -> None:
                             grid,
                             run_timestamp,
                             logger,
+                            use_gpu,
                         )
         # Handle unreadable or incomplete HDF5 files without stopping the remaining batch.
         except OSError as exc:
