@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
-r"""Extract and mosaic NISAR SME2 soil-moisture rasters by orbit pass.
+r"""Export each NISAR SME2 soil-moisture raster to its own GeoTIFF.
 
 The script performs the complete workflow requested for NISAR Level-3 SME2
-products:
+products, one output per input product:
 
 1. Find every NISAR SME2 HDF5 file in the input folder.
 2. Extract only ``/science/LSAR/SME2/grids/soilMoisture`` and its coordinate /
-   projection metadata to one GeoTIFF per selected HDF5 file.
-3. Separate scenes by their NISAR ``orbitPassDirection`` metadata. Ascending
-   and descending scenes are never mosaicked with one another.
-4. Mosaic each orbit-pass group on its native grid, without reprojection or
-   resampling. All scenes in one group must therefore have the same CRS,
-   pixel size, and grid alignment. The completed native mosaic is then
-   reprojected to the configured output CRS.
-5. Where scenes overlap, replace the overlap pixel with the arithmetic mean
-   of all valid source values at that pixel.  Thus, for two valid overlapping
-   scenes, the output value is ``(scene_1 + scene_2) / 2``.
-6. Exclude NaN, infinity, -9999, 0, and the HDF5 dataset's declared fill value
-   from the mosaic. Areas not covered by a valid input pixel remain nodata.
-7. Build an external ``.ovr`` pyramid for each output for ArcGIS.
+   projection metadata to a native-grid GeoTIFF.
+3. Exclude NaN, infinity, -9999, 0, and the HDF5 dataset's declared fill value.
+   Those pixels remain nodata.
+4. Reproject the native-grid GeoTIFF to the configured output CRS as
+   ``<HDF5 product name>_soilMoisture.tif``.
+5. Build an external ``.ovr`` pyramid for each output for ArcGIS.
+
+Products that already have both outputs are skipped unless ``OVERWRITE`` is
+set, so new files can be added to the input folder and the script run again.
 
 Configuration
 -------------
-Before running the script, edit ``INPUT_DIR`` and ``OUTPUT_PATH`` below. Then
+Before running the script, edit ``INPUT_DIR`` and ``OUTPUT_DIR`` below. Then
 run::
 
     python NISAR_SME2_Process.py
@@ -64,9 +60,8 @@ import rasterio
 from affine import Affine
 # Represent coordinate reference systems understood by GDAL and PROJ.
 from rasterio.crs import CRS
-# Reproject the completed native-grid mosaic to the requested deliverable CRS.
+# Reproject each native-grid raster to the requested deliverable CRS.
 from rasterio.warp import Resampling, calculate_default_transform, reproject
-from rasterio.windows import Window
 
 # Use the exact NISAR SME2 baseline-soil-moisture HDF5 dataset requested.
 SOIL_MOISTURE_PATH = "/science/LSAR/SME2/grids/soilMoisture"
@@ -74,8 +69,6 @@ SOIL_MOISTURE_PATH = "/science/LSAR/SME2/grids/soilMoisture"
 GRID_PATH = "/science/LSAR/SME2/grids"
 # Read the acquisition pass from the standard NISAR product-identification group.
 ORBIT_DIRECTION_PATH = "/science/LSAR/identification/orbitPassDirection"
-# Allow only the two physical pass directions that must be mosaicked separately.
-ORBIT_DIRECTIONS = ("Ascending", "Descending")
 # Use this sentinel for invalid source pixels and output areas not covered by a
 # valid source pixel.
 OUTPUT_NODATA = np.float32(-9999.0)
@@ -92,14 +85,11 @@ HDF5_SUFFIXES = {".h5", ".hdf5"}
 # -----------------------------------------------------------------------------
 # Folder containing the NISAR SME2 .h5/.hdf5 input products.
 INPUT_DIR = Path(r"NISAR_SME2_Product")
-# Folder for the final EPSG:4326 orbit-specific mosaic GeoTIFFs.
+# Folder for the final EPSG:4326 GeoTIFFs. Each one is named after its input
+# product: ``<HDF5 product name>_soilMoisture.tif``.
 OUTPUT_DIR = Path(r"soilMoisture")
-# Give each result a self-describing base name. ``main`` appends ``_Ascending``
-# or ``_Descending`` before the extension, so opposite orbit directions can
-# never share a mosaic.
-OUTPUT_PATH = OUTPUT_DIR / "NISAR_SME2_SoilMoisture_Mosaic.tif"
-# CRS of the final deliverables. Source pixels are mosaicked in their native
-# EASE-Grid first, then each completed mosaic is transformed to this CRS.
+# CRS of the final deliverables. Each scene is extracted on its native EASE-Grid
+# first, then transformed to this CRS.
 OUTPUT_CRS = "EPSG:4326"
 
 # Optional settings. These can normally remain unchanged.
@@ -134,24 +124,10 @@ class Scene:
     hdf5_path: Path
     # Store the start time so processing order and output metadata are stable.
     acquisition_start: datetime
-    # Store the end time so the mosaic's full acquisition span can be reported.
+    # Store the end time so the output metadata records the full acquisition.
     acquisition_end: datetime
-    # Keep orbit-pass metadata with the scene to prevent cross-pass mosaics.
+    # Keep orbit-pass metadata with the scene for the output's tags.
     orbit_direction: str
-
-
-@dataclass(frozen=True)
-class MosaicGrid:
-    """Describe the native grid shared by all mosaic pixels."""
-
-    # Map mosaic pixel indices to native source coordinates.
-    transform: Affine
-    # Store the number of mosaic columns.
-    width: int
-    # Store the number of mosaic rows.
-    height: int
-    # Keep the common source CRS with the grid.
-    crs: CRS
 
 
 def parse_nisar_interval(filename: str) -> tuple[datetime, datetime]:
@@ -192,11 +168,7 @@ def parse_nisar_interval(filename: str) -> tuple[datetime, datetime]:
 
 
 def read_orbit_direction(hdf5_path: Path) -> str:
-    """Read and normalize the required NISAR orbit-pass direction metadata.
-
-    A missing or unrecognized value is a hard error: guessing could combine
-    ascending and descending observations in the same output mosaic.
-    """
+    """Read and normalize a scene's orbit-pass direction for its output metadata."""
 
     # Open only the identification metadata needed to separate the scenes.
     with h5py.File(hdf5_path, "r") as hdf5_file:
@@ -216,7 +188,7 @@ def read_orbit_direction(hdf5_path: Path) -> str:
         "ascending": "Ascending",
         "descending": "Descending",
     }
-    # Reject unexpected metadata so there is no route to a mixed-direction mosaic.
+    # Reject unexpected metadata rather than recording a wrong orbit pass.
     if normalized not in direction_by_value:
         raise ValueError(
             f"Unrecognized orbit pass direction {raw_direction!r} in {hdf5_path}; "
@@ -513,7 +485,7 @@ def native_tiff_profile(width: int, height: int) -> dict[str, Any]:
     }
     # GeoTIFF tile dimensions must be multiples of 16 and fit small rasters.
     if width >= 16 and height >= 16:
-        # Enable tiled access so mosaic windows and ArcGIS display are efficient.
+        # Enable tiled access so ArcGIS display is efficient.
         profile["tiled"] = True
         # Choose the largest multiple-of-16 tile no larger than 512 or the raster width.
         profile["blockxsize"] = min(512, (width // 16) * 16)
@@ -531,7 +503,7 @@ def extract_scene(
 ) -> Path:
     """Extract one SME2 soil-moisture dataset to a georeferenced GeoTIFF.
 
-    Invalid cells are converted to ``-9999`` before mosaicking. The output is
+    Invalid cells are converted to ``-9999``. The output is
     normalized to a north-up, west-left orientation even when the HDF5 coordinate
     vectors are stored in the opposite direction.
     """
@@ -540,9 +512,9 @@ def extract_scene(
     output_path = extracted_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"                                                                                                                                                                                           
     # Preserve an existing extraction unless replacement was explicitly requested.
     if output_path.exists() and not overwrite:
-        # Report reuse so a later mosaic is not mistaken for a fresh extraction.
+        # Report reuse so the result is not mistaken for a fresh extraction.
         print(f"Reusing existing extraction: {output_path}")
-        # Return the existing path for mosaic validation and processing.
+        # Return the existing path for reprojection.
         return output_path
     # Open the HDF5 product read-only.
     with h5py.File(scene.hdf5_path, "r") as hdf5_file:
@@ -636,6 +608,7 @@ def extract_scene(
             source_dataset=SOIL_MOISTURE_PATH,
             acquisition_start=scene.acquisition_start.isoformat(),
             acquisition_end=scene.acquisition_end.isoformat(),
+            orbit_pass_direction=scene.orbit_direction,
             invalid_values="NaN, infinity, -9999, 0, and declared HDF5 fill values",
         )
         # Label the only band with the extracted NISAR variable name.
@@ -644,7 +617,7 @@ def extract_scene(
     os.replace(partial_path, output_path)
     # Report the completed extraction for long multi-scene jobs.
     print(f"Extracted: {output_path}")
-    # Return the extracted raster path to the mosaic stage.
+    # Return the extracted raster path to the reprojection stage.
     return output_path
 
 
@@ -660,9 +633,7 @@ def extract_scenes_parallel(
     ``extract_scene`` reads one complete soil-moisture array and creates
     several temporary NumPy arrays.  Therefore the executor deliberately has
     a small, fixed worker limit: at most ``max_workers`` full scenes can be in
-    memory at any instant.  The later mosaic phase stays
-    serial because they already keep every source dataset open and are the
-    dominant memory risk.
+    memory at any instant.
     """
 
     # Reject a nonsensical setting before creating any worker threads.
@@ -706,197 +677,13 @@ def extract_scenes_parallel(
     return extracted_by_scene
 
 
-def calculate_mosaic_grid(
-    extracted_paths: Sequence[Path],
-) -> MosaicGrid:
-    """Calculate a union grid without moving or interpolating any input pixel."""
-
-    reference_transform: Affine | None = None
-    reference_crs: CRS | None = None
-    source_bounds: list[tuple[float, float, float, float]] = []
-    for extracted_path in extracted_paths:
-        with rasterio.open(extracted_path) as source:
-            if source.crs is None:
-                raise ValueError(f"Extracted raster has no CRS: {extracted_path}")
-            transform = source.transform
-            if not np.isclose(transform.b, 0.0) or not np.isclose(transform.d, 0.0):
-                raise ValueError(
-                    "An ordinary mosaic cannot use rotated grids; no resampling was "
-                    f"performed. Recreate or select an unrotated source: {extracted_path}"
-                )
-            if transform.a <= 0.0 or transform.e >= 0.0:
-                raise ValueError(f"Extracted raster is not west-left/north-up: {extracted_path}")
-            if reference_transform is None:
-                reference_transform = transform
-                reference_crs = source.crs
-            else:
-                if source.crs != reference_crs or not np.isclose(transform.a, reference_transform.a) or not np.isclose(transform.e, reference_transform.e):
-                    raise ValueError(
-                        "An ordinary mosaic requires identical CRS and pixel size; "
-                        f"no resampling was performed for {extracted_path}."
-                    )
-                column_offset = (transform.c - reference_transform.c) / reference_transform.a
-                row_offset = (reference_transform.f - transform.f) / abs(reference_transform.e)
-                if not np.isclose(column_offset, round(column_offset)) or not np.isclose(row_offset, round(row_offset)):
-                    raise ValueError(
-                        "An ordinary mosaic requires pixel-aligned input grids; "
-                        f"no resampling was performed for {extracted_path}."
-                    )
-            source_bounds.append((source.bounds.left, source.bounds.bottom, source.bounds.right, source.bounds.top))
-    if reference_transform is None or reference_crs is None:
-        raise ValueError("Cannot calculate a mosaic grid from no extracted rasters.")
-    left = min(bounds[0] for bounds in source_bounds)
-    bottom = min(bounds[1] for bounds in source_bounds)
-    right = max(bounds[2] for bounds in source_bounds)
-    top = max(bounds[3] for bounds in source_bounds)
-    width = int(round((right - left) / reference_transform.a))
-    height = int(round((top - bottom) / abs(reference_transform.e)))
-    if width <= 0 or height <= 0:
-        raise ValueError(f"Invalid native-grid mosaic size: {width} x {height}.")
-    return MosaicGrid(
-        transform=Affine(reference_transform.a, 0.0, left, 0.0, reference_transform.e, top),
-        width=width,
-        height=height,
-        crs=reference_crs,
-    )
-
-
-def mosaic_extracted_rasters(
-    extracted_paths: Sequence[Path],
-    output_path: Path,
-    grid: MosaicGrid,
-    scenes: Sequence[Scene],
-    overwrite: bool,
-) -> None:
-    """Mosaic native source pixels with a mean in every overlap.
-
-    Each valid source pixel contributes to the output cell at its native-grid
-    location.  A cell supplied by one scene retains that value.  A cell
-    supplied by two valid scenes is replaced by their pixel-wise mean, i.e.
-    ``(scene_1 + scene_2) / 2``.  The contribution count is retained in a
-    temporary raster so the same arithmetic-mean rule remains correct if more
-    than two valid scenes happen to cover a cell.
-    """
-
-    # Require one and only one pass direction in this mosaic as a final guard
-    # against a future caller accidentally mixing ascending and descending data.
-    orbit_directions = {scene.orbit_direction for scene in scenes}
-    if len(orbit_directions) != 1:
-        raise ValueError(
-            "A mosaic must contain exactly one orbit pass direction; got "
-            f"{sorted(orbit_directions)}."
-        )
-    # Use the sole validated direction in output provenance.
-    orbit_direction = orbit_directions.pop()
-    # Protect an existing final mosaic unless replacement is authorized.
-    if output_path.exists() and not overwrite:
-        # Stop before creating a partial output or changing overviews.
-        raise FileExistsError(f"Output exists; set OVERWRITE = True to replace it: {output_path}")
-    # Build standard compressed floating-point GeoTIFF options.
-    profile = native_tiff_profile(grid.width, grid.height)
-    # Add the common native-grid metadata.
-    profile.update(
-        width=grid.width,
-        height=grid.height,
-        crs=grid.crs,
-        transform=grid.transform,
-    )
-    # Write beside the final pathname so the atomic replacement stays on one disk.
-    partial_path = output_path.with_name(output_path.name + ".partial.tif")
-    # Remove only this exact stale partial mosaic from an interrupted prior run.
-    partial_path.unlink(missing_ok=True)
-    # Keep per-pixel contribution counts on disk so a large union grid does not
-    # have to fit in memory.  This is removed before the final GeoTIFF is handed
-    # off, leaving only the requested single-band soil-moisture raster.
-    count_partial_path = output_path.with_name(output_path.name + ".partial.count.tif")
-    count_partial_path.unlink(missing_ok=True)
-    count_profile = profile.copy()
-    count_profile.update(dtype="uint16", nodata=0, predictor=2)
-    try:
-        # ``w`` datasets are write-only in Rasterio, whereas both the output
-        # mean and its count must be read and updated for every source block.
-        with rasterio.open(partial_path, "w+", **profile) as destination, rasterio.open(
-            count_partial_path, "w+", **count_profile
-        ) as contribution_counts:
-            # Initialize uncovered output cells as nodata and their contribution
-            # counts as zero.  No interpolation or resampling is performed.
-            for _, window in destination.block_windows(1):
-                destination.write(
-                    np.full((int(window.height), int(window.width)), OUTPUT_NODATA, dtype=np.float32),
-                    1,
-                    window=window,
-                )
-                contribution_counts.write(
-                    np.zeros((int(window.height), int(window.width)), dtype=np.uint16),
-                    1,
-                    window=window,
-                )
-            # Process each source at its exact aligned destination location.
-            for extracted_path in extracted_paths:
-                with rasterio.open(extracted_path) as source:
-                    # Grid compatibility was validated before this function; determine
-                    # exact integer offsets without any coordinate transformation.
-                    column_offset = int(round((source.transform.c - grid.transform.c) / grid.transform.a))
-                    row_offset = int(round((grid.transform.f - source.transform.f) / abs(grid.transform.e)))
-                    for _, source_window in source.block_windows(1):
-                        destination_window = Window(
-                            column_offset + int(source_window.col_off),
-                            row_offset + int(source_window.row_off),
-                            int(source_window.width),
-                            int(source_window.height),
-                        )
-                        source_values = source.read(1, window=source_window, masked=False)
-                        destination_values = destination.read(1, window=destination_window, masked=False)
-                        counts = contribution_counts.read(1, window=destination_window, masked=False)
-                        valid_source = make_valid_mask(source_values, (0.0, -9999.0))
-                        # uint16 permits 65,535 valid overlapping scenes at one pixel;
-                        # fail instead of silently overflowing that contribution count.
-                        if np.any(valid_source & (counts == np.iinfo(np.uint16).max)):
-                            raise ValueError("Too many valid scene overlaps at one output pixel.")
-                        existing = valid_source & (counts > 0)
-                        first_value = valid_source & ~existing
-                        # Use float64 for the intermediate calculation so the two-scene
-                        # average is not biased by float32 multiplication or summation.
-                        destination_values[existing] = (
-                            destination_values[existing].astype(np.float64) * counts[existing]
-                            + source_values[existing]
-                        ) / (counts[existing] + 1)
-                        destination_values[first_value] = source_values[first_value]
-                        counts[valid_source] += 1
-                        destination.write(destination_values, 1, window=destination_window)
-                        contribution_counts.write(counts, 1, window=destination_window)
-            # Record the no-resampling mosaic semantics directly in the output dataset.
-            destination.update_tags(
-                source_dataset=SOIL_MOISTURE_PATH,
-                source_scene_count=str(len(extracted_paths)),
-                selected_acquisition_start=min(scene.acquisition_start for scene in scenes).isoformat(),
-                selected_acquisition_end=max(scene.acquisition_end for scene in scenes).isoformat(),
-                orbit_pass_direction=orbit_direction,
-                overlap_method="pixel-wise arithmetic mean of all valid overlapping scene values",
-                invalid_values="NaN, infinity, -9999, 0, and declared HDF5 fill values",
-                uncovered_pixels="-9999 nodata",
-                mosaic_method="ordinary native-grid mosaic; no reprojection or resampling",
-            )
-            destination.set_band_description(1, "soilMoisture")
-        # Atomically replace the final mosaic after every block was written successfully.
-        os.replace(partial_path, output_path)
-    finally:
-        # The count raster is internal working state and must never be delivered.
-        count_partial_path.unlink(missing_ok=True)
-    # Report the new spatial grid for verification in the console log.
-    print(
-        f"{orbit_direction} mosaic written: {output_path} "
-        f"({grid.width} columns x {grid.height} rows, {grid.crs})"
-    )
-
-
-def reproject_mosaic_to_output_crs(
+def reproject_to_output_crs(
     source_path: Path,
     output_path: Path,
     output_crs: str | CRS,
     overwrite: bool,
 ) -> None:
-    """Reproject a completed native-grid mosaic into the final deliverable CRS.
+    """Reproject one native-grid raster into the final deliverable CRS.
 
     Nearest-neighbour sampling preserves source soil-moisture values exactly;
     it only relocates them onto a regular geographic grid. Nodata remains -9999.
@@ -909,9 +696,10 @@ def reproject_mosaic_to_output_crs(
     partial_path.unlink(missing_ok=True)
     with rasterio.open(source_path) as source:
         if source.crs is None:
-            raise ValueError(f"Native mosaic has no CRS: {source_path}")
+            raise ValueError(f"Native raster has no CRS: {source_path}")
         if source.crs == target_crs:
-            os.replace(source_path, output_path)
+            # Copy rather than move: the extraction is retained for later runs.
+            shutil.copyfile(source_path, output_path)
             return
         transform, width, height = calculate_default_transform(
             source.crs, target_crs, source.width, source.height, *source.bounds
@@ -939,7 +727,7 @@ def reproject_mosaic_to_output_crs(
             )
             destination.set_band_description(1, "soilMoisture")
     os.replace(partial_path, output_path)
-    print(f"Reprojected mosaic written: {output_path} ({target_crs})")
+    print(f"Reprojected raster written: {output_path} ({target_crs})")
 
 def pyramid_levels(width: int, height: int) -> list[int]:
     """Return power-of-two overview factors suitable for ArcGIS display."""
@@ -972,7 +760,7 @@ def build_external_overviews(raster_path: Path, overwrite: bool) -> Path:
     """
 
     # ArcGIS and GDAL use this exact sidecar naming convention.
-    overview_path = Path(str(raster_path) + ".ovr")
+    overview_path = overview_path_for(raster_path)
     # Protect an existing overview unless the caller authorized replacement.
     if overview_path.exists() and not overwrite:
         # Stop because rebuilding would modify an existing deliverable.
@@ -1009,10 +797,10 @@ def build_external_overviews(raster_path: Path, overwrite: bool) -> Path:
         gdal.SetConfigOption("BIGTIFF_OVERVIEW", "IF_SAFER")
         # Open read-only; this is what forces GeoTIFF overviews into a sidecar.
         dataset = gdal.Open(str(raster_path), gdal.GA_ReadOnly)
-        # Fail clearly if GDAL cannot open the completed mosaic.
+        # Fail clearly if GDAL cannot open the completed raster.
         if dataset is None:
             # Identify the exact path that GDAL rejected.
-            raise RuntimeError(f"GDAL could not open mosaic for pyramids: {raster_path}")
+            raise RuntimeError(f"GDAL could not open raster for pyramids: {raster_path}")
         # Build average-resampled overviews for continuous soil moisture values.
         error_code = dataset.BuildOverviews("AVERAGE", levels)
         # Close the GDAL dataset so all .ovr directory entries are flushed.
@@ -1062,37 +850,31 @@ def build_external_overviews(raster_path: Path, overwrite: bool) -> Path:
     return overview_path
 
 
-def output_path_for_orbit_direction(base_path: Path, orbit_direction: str) -> Path:
-    """Return the output pathname dedicated to one validated orbit direction."""
+def output_path_for_scene(output_dir: Path, scene: Scene) -> Path:
+    """Return the GeoTIFF path for one scene, named after its HDF5 product."""
 
-    # Reject unrecognized labels before they become output filenames.
-    if orbit_direction not in ORBIT_DIRECTIONS:
-        raise ValueError(
-            f"Unsupported orbit direction {orbit_direction!r}; "
-            f"expected one of {ORBIT_DIRECTIONS}."
-        )
-    # Keep the configured name and extension while making the pass explicit.
-    return base_path.with_name(
-        f"{base_path.stem}_{orbit_direction}{base_path.suffix}"
-    )
+    # The full product name is unique and already records dates and orbit pass.
+    return output_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"
+
+
+def overview_path_for(raster_path: Path) -> Path:
+    """Return the sidecar pathname that ArcGIS and GDAL expect for a raster."""
+
+    return Path(str(raster_path) + ".ovr")
 
 
 def main() -> None:
-    """Run scene discovery, extraction, per-pass mosaicking, and pyramid creation."""
+    """Run scene discovery, extraction, reprojection, and pyramid creation."""
 
-    # Resolve the configured output base to make direction-specific names absolute.
-    output_base_path = OUTPUT_PATH.expanduser().resolve()
-    # Restrict each direction-specific deliverable to a GeoTIFF filename.
-    if output_base_path.suffix.lower() not in {".tif", ".tiff"}:
-        # Prevent a driver/extension mismatch that can confuse ArcGIS.
-        raise ValueError("OUTPUT_PATH must end with .tif or .tiff.")
+    # Resolve the output folder so reported paths are absolute.
+    output_dir = OUTPUT_DIR.expanduser().resolve()
     # Create the final output directory when it does not yet exist.
-    output_base_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
     # Derive a clear default directory for retained per-scene extractions.
     extracted_dir = (
         EXTRACTED_DIR.expanduser().resolve()
         if EXTRACTED_DIR is not None
-        else output_base_path.parent / f"{output_base_path.stem}_extracted"
+        else output_dir / "native_extracted"
     )
     # Create the extraction directory before opening any output rasters.
     extracted_dir.mkdir(parents=True, exist_ok=True)
@@ -1101,104 +883,56 @@ def main() -> None:
         input_dir=INPUT_DIR.expanduser().resolve(),
         recursive=RECURSIVE,
     )
-    # Refuse to make an empty mosaic when the folder holds no SME2 files.
+    # Stop with a clear message when the folder holds no SME2 files.
     if not scenes:
         # Include the searched location in the actionable error.
         raise FileNotFoundError(f"No NISAR SME2 HDF5 files found in {INPUT_DIR}.")
-    # Group every selected scene before extraction so opposite passes cannot
-    # reach the same grid calculation or mosaicking loop.
-    scenes_by_direction = {
-        direction: [scene for scene in scenes if scene.orbit_direction == direction]
-        for direction in ORBIT_DIRECTIONS
-    }
-    # Identify only output files that will actually be produced in this run.
-    output_paths = {
-        direction: output_path_for_orbit_direction(output_base_path, direction)
-        for direction, scene_group in scenes_by_direction.items()
-        if scene_group
-    }
-    # Protect every pending orbit-specific mosaic and sidecar before extraction.
-    for direction, output_path in output_paths.items():
-        if output_path.exists() and not OVERWRITE:
-            raise FileExistsError(
-                f"{direction} output exists; set OVERWRITE = True to replace it: "
-                f"{output_path}"
-            )
-        existing_overview_path = Path(str(output_path) + ".ovr")
-        if existing_overview_path.exists() and not OVERWRITE:
-            raise FileExistsError(
-                f"{direction} overview exists; set OVERWRITE = True to replace it: "
-                f"{existing_overview_path}"
-            )
-    # Report the selected count and pass split before lengthy extraction begins.
+    # Leave finished products alone unless replacement was explicitly requested.
+    pending_scenes = []
+    for scene in scenes:
+        output_path = output_path_for_scene(output_dir, scene)
+        if (
+            not OVERWRITE
+            and output_path.exists()
+            and overview_path_for(output_path).exists()
+        ):
+            print(f"Skipping existing output: {output_path}")
+            continue
+        pending_scenes.append(scene)
+    # Report the workload before lengthy extraction begins.
     print(
-        f"Selected {len(scenes)} SME2 scene(s): "
-        + ", ".join(
-            f"{direction}={len(scene_group)}"
-            for direction, scene_group in scenes_by_direction.items()
-            if scene_group
-        )
+        f"Found {len(scenes)} SME2 scene(s); "
+        f"{len(pending_scenes)} to process."
     )
     # Extract independent HDF5 scenes concurrently, but never with more than
     # the conservative configured worker cap in memory at once.
     extracted_by_scene = extract_scenes_parallel(
-        scenes=scenes,
+        scenes=pending_scenes,
         extracted_dir=extracted_dir,
         fallback_source_crs=SOURCE_CRS,
         overwrite=OVERWRITE,
         max_workers=MAX_EXTRACTION_WORKERS,
     )
-    # Restore chronological order for deterministic metadata and processing even
-    # though extraction itself completed in non-deterministic parallel order.
-    extracted_paths_by_direction: dict[str, list[Path]] = {
-        direction: [
-            extracted_by_scene[scene.hdf5_path]
-            for scene in scenes_by_direction[direction]
-        ]
-        for direction in ORBIT_DIRECTIONS
-    }
-    # Create a grid, mosaic, and overview independently for each orbit pass.
-    completed_outputs: list[tuple[str, Path, Path]] = []
-    for direction in ORBIT_DIRECTIONS:
-        # Skip directions absent from the input scenes.
-        if not scenes_by_direction[direction]:
-            continue
-        # Use only this direction's extractions when calculating the union grid.
-        mosaic_grid = calculate_mosaic_grid(extracted_paths_by_direction[direction])
-        # Mosaic only the scenes with the matching orbit direction, preserving
-        # their native CRS and pixel values without resampling.
-        output_path = output_paths[direction]
-        # First mosaic in the native EASE-Grid so overlap averaging is performed
-        # on aligned source pixels, then reproject only the completed mosaic.
-        native_mosaic_path = output_path.with_name(output_path.stem + ".native.tif")
-        native_mosaic_path.unlink(missing_ok=True)
-        try:
-            mosaic_extracted_rasters(
-                extracted_paths=extracted_paths_by_direction[direction],
-                output_path=native_mosaic_path,
-                grid=mosaic_grid,
-                scenes=scenes_by_direction[direction],
-                overwrite=True,
-            )
-            reproject_mosaic_to_output_crs(
-                source_path=native_mosaic_path,
+    # Create one reprojected GeoTIFF and overview for each scene.
+    completed_outputs: list[tuple[Path, Path]] = []
+    for scene in pending_scenes:
+        output_path = output_path_for_scene(output_dir, scene)
+        # A raster may already exist when an earlier run stopped before its
+        # overview was built; in that case only the overview is still missing.
+        if OVERWRITE or not output_path.exists():
+            reproject_to_output_crs(
+                source_path=extracted_by_scene[scene.hdf5_path],
                 output_path=output_path,
                 output_crs=OUTPUT_CRS,
                 overwrite=OVERWRITE,
             )
-        finally:
-            # The native mosaic is temporary working state; final files use OUTPUT_CRS.
-            native_mosaic_path.unlink(missing_ok=True)
         # Build and verify a separate ArcGIS-compatible external overview.
         overview_path = build_external_overviews(output_path, OVERWRITE)
         # Preserve the generated paths for the final concise run summary.
-        completed_outputs.append((direction, output_path, overview_path))
-    # Print every completed direction-specific deliverable.
-    for direction, output_path, overview_path in completed_outputs:
-        print(
-            f"Complete. {direction} mosaic: {output_path}\n"
-            f"Complete. {direction} pyramid: {overview_path}"
-        )
+        completed_outputs.append((output_path, overview_path))
+    # Print every completed deliverable.
+    for output_path, overview_path in completed_outputs:
+        print(f"Complete. Raster: {output_path}\nComplete. Pyramid: {overview_path}")
 
 
 # Run the workflow only when this file is executed, not when imported for tests.
