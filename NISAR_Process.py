@@ -133,6 +133,14 @@ OVERVIEW_FACTORS = [2, 4, 8, 16, 32]
 # Required horizontal and vertical output pixel size, in metres.
 TARGET_PIXEL_SIZE = 5.0
 
+# Ground size of the square multilook (boxcar) averaging window, in metres.  The window
+# is converted to an odd number of pixels per axis from the source pixel spacing, so a
+# 5 m grid gets 7 x 7 pixels and a 10 m (x) x 5 m (y) grid gets 3 columns x 7 rows.  GSLC samples
+# are oversampled relative to the true radar resolution, so neighbouring pixels are
+# correlated and the effective number of looks is well below the pixel count.  Increase
+# this value for smoother (less speckled) but blurrier results; decrease it to keep detail.
+MULTILOOK_WINDOW_METRES = 35.0
+
 
 # --- FUNCTION DEFINITIONS ---
 
@@ -327,13 +335,23 @@ def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     return real_sq + imag_sq
 
 
-def apply_multilook(intensity: np.ndarray, looks: int = 5) -> np.ndarray:
+def multilook_window_pixels(pixel_x: float, pixel_y: float) -> tuple[int, int]:
+    """Convert MULTILOOK_WINDOW_METRES to odd (rows, columns) window sizes in pixels."""
+    def odd_size(pixel_size: float) -> int:
+        # Round to the nearest odd pixel count; an odd window stays centred on the pixel.
+        half = round((MULTILOOK_WINDOW_METRES / pixel_size - 1.0) / 2.0)
+        return 2 * max(0, int(half)) + 1
+
+    return odd_size(pixel_y), odd_size(pixel_x)
+
+
+def apply_multilook(intensity: np.ndarray, looks: int | tuple[int, int] = 5) -> np.ndarray:
     """
     Reduces 'speckle' noise using a spatial multi-looking (averaging) filter.
 
     Args:
         intensity (np.ndarray): The input intensity array.
-        looks (int): The size of the averaging window (e.g., 5x5).
+        looks: The averaging window size, either one int (square) or (rows, columns).
 
     Returns:
         np.ndarray: The spatially filtered intensity array.
@@ -567,10 +585,21 @@ def export_layer(
             TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE,
         )
 
+    # Convert the configured ground window to per-axis pixel counts for this grid.
+    looks_y, looks_x = multilook_window_pixels(pixel_x, pixel_y)
+    # Each tile is read with this many extra pixels on every side so the averaging
+    # window sees real neighbours across tile boundaries (no seams between tiles).
+    halo_y, halo_x = looks_y // 2, looks_x // 2
+    logger.info(
+        "%s/%s multilook window: %d x %d pixels (%.0f m x %.0f m).",
+        frequency, polarization, looks_y, looks_x, looks_y * pixel_y, looks_x * pixel_x,
+    )
+
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
     description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
+    description = f"{description} {looks_y}x{looks_x}"
     try:
         # Create the native-grid staging GeoTIFF.
         with rasterio.open(native_temp_path, "w", **profile) as dst:
@@ -583,8 +612,17 @@ def export_layer(
                 row_stop = row_start + int(window.height)
                 col_start = int(window.col_off)
                 col_stop = col_start + int(window.width)
-                # Read only this native-grid source tile from the HDF5 dataset.
-                tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
+                # Read this tile plus a halo (clamped to the raster) from the HDF5 dataset.
+                read_row_start = max(0, row_start - halo_y)
+                read_row_stop = min(height, row_stop + halo_y)
+                read_col_start = max(0, col_start - halo_x)
+                read_col_stop = min(width, col_stop + halo_x)
+                tile_data = source_dataset[read_row_start:read_row_stop, read_col_start:read_col_stop]
+                # Slices that crop the filtered halo tile back to the output window.
+                crop = (
+                    slice(row_start - read_row_start, row_stop - read_row_start),
+                    slice(col_start - read_col_start, col_stop - read_col_start),
+                )
 
                 # Convert each product's source samples to the linear measurement that
                 # will be multilooked: intensity for GSLC and covariance for GCOV.
@@ -595,8 +633,9 @@ def export_layer(
                     # GCOV diagonal covariance samples are already intensity-like.
                     processed_tile = np.asarray(tile_data, dtype=np.float32)
 
-                # Apply the required multi-looking step to every supported product type.
-                processed_tile = apply_multilook(processed_tile, looks=5)
+                # Apply the required multi-looking step to every supported product type,
+                # then drop the halo so the tile matches the output window exactly.
+                processed_tile = apply_multilook(processed_tile, looks=(looks_y, looks_x))[crop]
 
                 # GSLC alone receives the optional additional DEM-based RTC step.
                 if process_gslc:
@@ -680,8 +719,13 @@ def export_layer(
 
     # Build overviews on the actual exported grid and calculate its final statistics.
     with rasterio.open(temp_path, "r+") as output_raster:
-        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.nearest)
-        output_raster.update_tags(ns="rio_overview", resampling="nearest")
+        # Average overviews: nearest-neighbour overviews pick single pixels and make the
+        # image look far noisier when zoomed out in GIS software.  Overviews are only
+        # used for display; full-resolution dB values are unchanged.
+        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+        output_raster.update_tags(ns="rio_overview", resampling="average")
+        output_raster.update_tags(MULTILOOK_WINDOW_PIXELS=f"{looks_y}x{looks_x}",
+                                  MULTILOOK_WINDOW_METRES=str(MULTILOOK_WINDOW_METRES))
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
