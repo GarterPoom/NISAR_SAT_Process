@@ -8,8 +8,6 @@ import copy  # Copy authenticated cookies into a separate session per worker thr
 import re  # Regular expressions used to validate HTTP range responses.
 import threading  # Thread-local state and a lock for concurrent progress bars.
 import time  # Retry backoff delays after transient download failures.
-import shutil  # Removes a granule's staging folder once it has been zipped.
-import zipfile  # Packs each granule's HDF5, metadata and visualization files into one .zip.
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Bounded concurrent downloads.
 from datetime import datetime, timedelta  # Date/time tools for configured and rolling search windows.
 from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
@@ -38,8 +36,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
-    OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where one <granule>.zip per product is saved.
-    KEEP_GRANULE_FOLDERS = False  # True keeps the unzipped <granule>/ staging folder next to each .zip.
+    OUTPUT_DIRECTORY = "NISAR_Product"  # Each granule's files are saved together in <OUTPUT_DIRECTORY>/<granule_id>/.
     INCLUDE_PRIVATE_FILES = False  # Files in the NISAR-JPL-PRIVATE-DATA bucket need special access.
 
     # Area of interest, as a path to a shapefile (.shp). All features in the
@@ -705,7 +702,7 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
 
 
 # --------------------------------------------------------------------------- #
-# Zip – packs one granule's HDF5, metadata and visualization files together.
+# Paths – long-path support for the per-granule folders.
 # --------------------------------------------------------------------------- #
 def to_long_path(path: str) -> str:
     """Return a path usable beyond Windows' 260-character MAX_PATH limit.
@@ -718,69 +715,34 @@ def to_long_path(path: str) -> str:
         return "\\\\?\\" + absolute_path
     return absolute_path
 
-
-# Already-compressed formats are stored as-is; deflating multi-GB HDF5 files wastes time for ~no gain.
-STORED_EXTENSIONS = (".h5", ".hdf5", ".png", ".jpg", ".jpeg", ".pdf", ".zip", ".gz")
-
-
-def create_granule_zip(granule_id: str, granule_directory: str, filenames: list[str], zip_path: str) -> None:
-    """Write every file of a granule into ``zip_path`` atomically.
-
-    Files are placed under a ``<granule_id>/`` folder inside the archive.  The
-    archive is written to ``<zip_path>.part`` first and renamed only after it
-    is complete and verified, so an interrupted run never leaves a truncated .zip.
-    """
-    partial_zip_path = f"{zip_path}.part"
-    with zipfile.ZipFile(partial_zip_path, "w", allowZip64=True) as archive:
-        for filename in filenames:
-            compression = (
-                zipfile.ZIP_STORED if filename.lower().endswith(STORED_EXTENSIONS) else zipfile.ZIP_DEFLATED
-            )
-            archive.write(
-                os.path.join(granule_directory, filename),
-                arcname=f"{granule_id}/{filename}",
-                compress_type=compression,
-            )
-
-    # Confirm every file landed in the archive with its full size before replacing anything.
-    with zipfile.ZipFile(partial_zip_path) as archive:
-        archived_sizes = {info.filename: info.file_size for info in archive.infolist()}
-    for filename in filenames:
-        expected_size = os.path.getsize(os.path.join(granule_directory, filename))
-        if archived_sizes.get(f"{granule_id}/{filename}") != expected_size:
-            raise IOError(f"Zip verification failed for {filename}")
-    os.replace(partial_zip_path, zip_path)
-
 # --------------------------------------------------------------------------- #
-# Download – bounded concurrent per-granule downloads, then one .zip per granule.
+# Download – bounded concurrent per-granule downloads into one folder per granule.
 # --------------------------------------------------------------------------- #
-def download_and_zip_granule(
+def download_granule(
     granule_id: str,
     urls: list[str],
     output_directory: str,
     get_worker_session,
     progress_position: int,
-    keep_granule_folder: bool,
 ) -> str:
-    """Download every file of one granule, then pack them into ``<granule_id>.zip``.
+    """Download every file of one granule into ``<output_directory>/<granule_id>/``.
 
-    Runs inside a worker thread.  Files go to a staging folder
-    ``<output_directory>/<granule_id>/`` (resumable ``.part`` files).  The zip
-    is created only after *all* files arrived; otherwise the staging folder is
-    kept so the next run resumes, and a ``RuntimeError`` is raised.
+    Runs inside a worker thread.  Files already present are skipped and
+    interrupted transfers resume from their ``.part`` files, so re-running the
+    script completes a partially downloaded granule.
 
     Returns:
-        Absolute path of the created zip file.
+        Absolute path of the granule folder.
+
+    Raises:
+        RuntimeError: If any file of the granule could not be downloaded.
     """
-    zip_path = to_long_path(os.path.join(output_directory, f"{granule_id}.zip"))
     granule_directory = to_long_path(os.path.join(output_directory, granule_id))
     os.makedirs(granule_directory, exist_ok=True)
 
-    filenames: list[str] = []
     failed_files: list[str] = []
     for url in urls:
         filename = filename_from_url(url)
-        filenames.append(filename)
         destination_path = os.path.join(granule_directory, filename)
         if os.path.isfile(destination_path):
             logging.info("File already exists, skipping: %s", filename)
@@ -802,28 +764,22 @@ def download_and_zip_granule(
 
     if failed_files:
         raise RuntimeError(
-            f"{len(failed_files)} file(s) failed; granule not zipped. Downloaded files are kept for the next run."
+            f"{len(failed_files)} file(s) failed. Downloaded files are kept for the next run."
         )
-
-    logging.info("Creating zip: %s.zip", granule_id)
-    create_granule_zip(granule_id, granule_directory, filenames, zip_path)
-    if not keep_granule_folder:
-        shutil.rmtree(granule_directory)
-    return os.path.abspath(os.path.join(output_directory, f"{granule_id}.zip"))
+    return os.path.abspath(os.path.join(output_directory, granule_id))
 
 
 def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granule downloads.
     granule_urls: dict[str, list[str]],  # {granule_id: [HDF5 + metadata + visualization URLs]}.
     output_directory: str,  # Local destination directory, created when absent.
     session: asf.ASFSession,  # Earthdata-authenticated ASF session used to seed workers.
-    keep_granule_folders: bool = False,  # Keep the unzipped staging folder after zipping.
 ) -> None:
-    """Download granule bundles concurrently with a safe worker cap and zip each one.
+    """Download granule bundles concurrently with a safe worker cap.
 
-    Granules whose zip already exists are skipped.  Each remaining granule runs
-    in a worker with its own authenticated HTTP session; the worker downloads
-    all of that granule's files and then zips them.  A failed granule is
-    logged without preventing unrelated granules from completing.
+    Each granule runs in a worker with its own authenticated HTTP session; the
+    worker downloads all of that granule's files into ``<granule_id>/``.
+    Granules whose files are all present already are skipped.  A failed
+    granule is logged without preventing unrelated granules from completing.
     """
     os.makedirs(output_directory, exist_ok=True)  # Ensure the requested local destination is ready for file output.
     logging.info(f"Data download directory: {os.path.abspath(output_directory)}")
@@ -836,13 +792,14 @@ def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granul
     pending_granules: list[tuple[str, list[str]]] = []
     skipped_granules = 0
     for granule_id, urls in granule_urls.items():
-        if os.path.isfile(to_long_path(os.path.join(output_directory, f"{granule_id}.zip"))):
-            logging.info("Zip already exists, skipping granule: %s.zip", granule_id)
+        granule_directory = to_long_path(os.path.join(output_directory, granule_id))
+        if all(os.path.isfile(os.path.join(granule_directory, filename_from_url(url))) for url in urls):
+            logging.info("All files already downloaded, skipping granule: %s", granule_id)
             skipped_granules += 1
         else:
             pending_granules.append((granule_id, urls))
 
-    zipped_granules = 0
+    downloaded_granules = 0
     failed_granules = 0
     tqdm.set_lock(threading.RLock())  # Serialize progress-bar output from simultaneous worker threads.
     worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_granules))  # Do not create more workers than pending granules.
@@ -850,29 +807,28 @@ def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granul
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
             futures = {
                 executor.submit(
-                    download_and_zip_granule,
+                    download_granule,
                     granule_id,
                     urls,
                     output_directory,
                     get_worker_session,
                     index % worker_count,  # Stable progress-bar row per worker slot.
-                    keep_granule_folders,
                 ): granule_id
                 for index, (granule_id, urls) in enumerate(pending_granules)
             }
             for future in as_completed(futures):  # Process granules in completion order.
                 granule_id = futures[future]
                 try:
-                    zip_path = future.result()  # Re-raise any worker exception in the coordinating thread.
-                    zipped_granules += 1
-                    logging.info("Successfully created zip: %s", zip_path)
+                    granule_path = future.result()  # Re-raise any worker exception in the coordinating thread.
+                    downloaded_granules += 1
+                    logging.info("Granule complete: %s", granule_path)
                 except Exception as granule_error:
                     failed_granules += 1
                     logging.error("Failed granule %s: %s", granule_id, granule_error)
 
     logging.info(
         "Download complete. Summary -> "
-        f"Zipped: {zipped_granules}, Already zipped: {skipped_granules}, Failed: {failed_granules}"
+        f"Downloaded: {downloaded_granules}, Already complete: {skipped_granules}, Failed: {failed_granules}"
     )
 
 # --------------------------------------------------------------------------- #
@@ -911,8 +867,8 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
         results, Config.POLARIZATION_MODE, Config.INCLUDE_PRIVATE_FILES
     )
 
-    download_granules_with_thread_pool(  # Download each granule's files, then zip them together.
-        granule_urls, Config.OUTPUT_DIRECTORY, session, Config.KEEP_GRANULE_FOLDERS
+    download_granules_with_thread_pool(  # Download each granule's files into its own folder.
+        granule_urls, Config.OUTPUT_DIRECTORY, session
     )
 
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
