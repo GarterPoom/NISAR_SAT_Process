@@ -8,6 +8,8 @@ import copy  # Copy authenticated cookies into a separate session per worker thr
 import re  # Regular expressions used to validate HTTP range responses.
 import threading  # Thread-local state and a lock for concurrent progress bars.
 import time  # Retry backoff delays after transient download failures.
+import shutil  # Removes a granule's staging folder once it has been zipped.
+import zipfile  # Packs each granule's HDF5, metadata and visualization files into one .zip.
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Bounded concurrent downloads.
 from datetime import datetime, timedelta  # Date/time tools for configured and rolling search windows.
 from urllib.parse import unquote, urlparse  # Safely extracts filenames from download URLs.
@@ -36,7 +38,9 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
-    OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
+    OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where one <granule>.zip per product is saved.
+    KEEP_GRANULE_FOLDERS = False  # True keeps the unzipped <granule>/ staging folder next to each .zip.
+    INCLUDE_PRIVATE_FILES = False  # Files in the NISAR-JPL-PRIVATE-DATA bucket need special access.
 
     # Area of interest, as a path to a shapefile (.shp). All features in the
     # file are dissolved into a single geometry and reprojected to WGS84
@@ -62,7 +66,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     POLARIZATION_MODE = "DH"  # "SH" (single-pol H), "DH" (dual-pol H: HH+HV), or None to keep every mode.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
-    MAX_DOWNLOADS = None  # Maximum number of filtered products to download; None downloads every match.
+    MAX_DOWNLOADS = None  # Maximum number of filtered granules to download; None downloads every match.
     DOWNLOAD_CHUNK_SIZE = 256 * 1024  # 256 KB chunks keep progress and slow-link checks responsive.
     DOWNLOAD_WORKERS = 1  # Safe upper limit for simultaneous file downloads.
     DOWNLOAD_CONNECT_TIMEOUT = 30  # Seconds allowed to establish an HTTP connection.
@@ -321,7 +325,8 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps HDF5 URLs, drops QA_STATS files and other polarization modes, caps the download count.
+# Filter – groups every file (HDF5, metadata, visualizations) per granule, drops other
+# polarization modes, caps the granule count.
 # --------------------------------------------------------------------------- #
 def normalize_polarization_mode(polarization_mode: str | None) -> str | None:  # Validate the configured polarization mode.
     """Return an upper-case polarization mode code, or ``None`` for no filtering.
@@ -350,48 +355,107 @@ def polarization_mode_from_filename(filename: str) -> str | None:  # Read the mo
     return match.group(1) if match else None  # None when the name has no recognizable mode token.
 
 
-def filter_hdf5_urls(results: asf.ASFSearchResults, polarization_mode: str | None = None) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
-    """Filter search results down to direct-download URLs for HDF5 files.
+# ASF lists some files from a JPL-internal bucket that ordinary Earthdata accounts cannot access.
+PRIVATE_JPL_BUCKET = "/NISAR-JPL-PRIVATE-DATA/"
+
+
+def get_product_urls(product: asf.ASFProduct) -> list[str]:
+    """Return every HTTPS URL ASF lists for one product.
+
+    Covers the main HDF5 file plus ``additionalUrls`` (QA_STATS, ISO XML,
+    KML, JSON/YAML metadata, QA reports) and browse images (PNG).
+    """
+    if hasattr(product, "find_urls"):
+        urls = list(product.find_urls())
+    else:  # Older asf_search versions without ASFProduct.find_urls().
+        properties = product.properties
+        urls = [properties.get("url")]
+        urls.extend(properties.get("additionalUrls") or [])
+        browse = properties.get("browse") or []
+        urls.extend([browse] if isinstance(browse, str) else browse)
+    return [url for url in urls if url]
+
+
+def group_granule_urls(
+    results: asf.ASFSearchResults,
+    polarization_mode: str | None = None,
+    include_private_files: bool = False,
+) -> dict[str, list[str]]:
+    """Group search results into ``{granule_id: [every file URL of that granule]}``.
+
+    Every file belonging to a granule is kept – the main HDF5 product, all
+    metadata (QA_STATS.h5, ISO XML, JSON, YAML, logs, QA reports) and all
+    visualizations (PNG browse images, KML footprints).  Non-file links such
+    as the ``s3credentials`` endpoint are dropped because their filenames do
+    not start with the granule ID.  The mapping is capped at
+    ``Config.MAX_DOWNLOADS`` granules when that limit is configured.
 
     Args:
         results: Search results returned by search_nisar_granules().
-        polarization_mode: Optional ``"SH"`` or ``"DH"``; products with another mode are dropped.
-
-    Returns:
-        A list of download URLs ending in .h5 or .hdf5, excluding any file
-        whose name ends with `_QA_STATS.h5` and any product whose
-        polarization mode differs from ``polarization_mode``. The list is capped at
-        ``Config.MAX_DOWNLOADS`` entries when that limit is configured.
+        polarization_mode: Optional ``"SH"`` or ``"DH"``; granules with another mode are dropped.
+        include_private_files: Whether to keep files from the NISAR-JPL-PRIVATE-DATA bucket.
 
     Exits:
-        Gracefully (status 0) if no HDF5 URLs are found.
+        Gracefully (status 0) if no matching granules are found.
     """
     polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
-    all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
+    granule_urls: dict[str, list[str]] = {}
+    total_urls = 0
 
-    # Build a list of URLs that meet all criteria: HDF5 extension, no QA_STATS suffix, and the requested polarization mode.
-    download_urls = []
-    for url in all_urls:
-        filename = url.split("/")[-1]  # Extract the filename from the URL.
-        if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
-            not filename.lower().endswith('_qa_stats.h5')):    # Exclude QA_STATS files.
-            if polarization_mode and polarization_mode_from_filename(filename) != polarization_mode:
-                continue  # Skip products acquired in a different polarization mode.
-            download_urls.append(url)  # Add the URL to the list.
+    for product in results:
+        granule_id = product.properties.get("sceneName") or product.properties.get("fileID")
+        if not granule_id:
+            logging.warning("Skipping a search result without a sceneName/fileID.")
+            continue
+        if granule_id.lower().endswith((".h5", ".hdf5")):
+            granule_id = os.path.splitext(granule_id)[0]
+        if polarization_mode and polarization_mode_from_filename(granule_id) != polarization_mode:
+            continue  # Skip products acquired in a different polarization mode.
+        if granule_id in granule_urls:  # Same granule returned twice – nothing new to add.
+            continue
 
-    logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs (polarization mode: {polarization_mode or 'ANY'}).")  # Log counts.
+        urls: list[str] = []
+        seen_filenames: set[str] = set()
+        for url in get_product_urls(product):
+            total_urls += 1
+            filename = filename_from_url(url)
+            if not url.lower().startswith("https://") or not filename.startswith(granule_id):
+                continue  # Not a granule file (e.g. the s3credentials endpoint).
+            if PRIVATE_JPL_BUCKET in url and not include_private_files:
+                continue
+            if filename in seen_filenames:
+                continue
+            seen_filenames.add(filename)
+            urls.append(url)
 
-    if not download_urls:  # Check if the filtered URL list is empty.
-        logging.warning("No matching HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
-        sys.exit(0)  # Exit script gracefully with a success status.
-
-    if Config.MAX_DOWNLOADS is not None and len(download_urls) > Config.MAX_DOWNLOADS:
-        logging.info(  # Announce the truncation so log readers understand why fewer files are downloaded than were found.
-            f"Limiting download list from {len(download_urls)} to the configured maximum of {Config.MAX_DOWNLOADS}."
+        has_main_hdf5 = any(
+            filename_from_url(url).lower() in (f"{granule_id}.h5".lower(), f"{granule_id}.hdf5".lower())
+            for url in urls
         )
-        download_urls = download_urls[:Config.MAX_DOWNLOADS]  # Cap the number of products actually downloaded.
+        if not has_main_hdf5:
+            logging.warning(f"Skipping {granule_id}: ASF lists no main HDF5 file for it.")
+            continue
+        granule_urls[granule_id] = urls
 
-    return download_urls  # Return the list of filtered HDF5 download URLs.
+    file_count = sum(len(urls) for urls in granule_urls.values())
+    logging.info(
+        f"Selected {len(granule_urls)} granule(s) with {file_count} file(s) out of {total_urls} "
+        f"total URLs (polarization mode: {polarization_mode or 'ANY'})."
+    )
+
+    if not granule_urls:
+        logging.warning("No matching NISAR granules found in search results. Exiting script.")
+        sys.exit(0)
+
+    if Config.MAX_DOWNLOADS is not None and len(granule_urls) > Config.MAX_DOWNLOADS:
+        logging.info(  # Announce the truncation so log readers understand why fewer granules are downloaded than were found.
+            f"Limiting download list from {len(granule_urls)} to the configured maximum of {Config.MAX_DOWNLOADS} granule(s)."
+        )
+        granule_urls = dict(list(granule_urls.items())[:Config.MAX_DOWNLOADS])
+
+    for granule_id, urls in granule_urls.items():
+        logging.info(f"  {granule_id}: {len(urls)} file(s)")
+    return granule_urls
 
 # --------------------------------------------------------------------------- #
 # Download – bounded concurrent downloads with resumable partial files.
@@ -640,59 +704,175 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
             time.sleep(wait_seconds)  # Pause before retrying to reduce pressure on a transiently failing service.
 
 
-def download_files_with_thread_pool(  # Coordinate bounded, concurrent product downloads.
-    download_urls: list[str],  # Candidate product URLs, including any duplicates.
+# --------------------------------------------------------------------------- #
+# Zip – packs one granule's HDF5, metadata and visualization files together.
+# --------------------------------------------------------------------------- #
+def to_long_path(path: str) -> str:
+    """Return a path usable beyond Windows' 260-character MAX_PATH limit.
+
+    NISAR granule IDs are ~90 characters and appear in both the staging folder
+    and the file names, so full paths easily exceed MAX_PATH on Windows.
+    """
+    absolute_path = os.path.abspath(path)
+    if os.name == "nt" and not absolute_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + absolute_path
+    return absolute_path
+
+
+# Already-compressed formats are stored as-is; deflating multi-GB HDF5 files wastes time for ~no gain.
+STORED_EXTENSIONS = (".h5", ".hdf5", ".png", ".jpg", ".jpeg", ".pdf", ".zip", ".gz")
+
+
+def create_granule_zip(granule_id: str, granule_directory: str, filenames: list[str], zip_path: str) -> None:
+    """Write every file of a granule into ``zip_path`` atomically.
+
+    Files are placed under a ``<granule_id>/`` folder inside the archive.  The
+    archive is written to ``<zip_path>.part`` first and renamed only after it
+    is complete and verified, so an interrupted run never leaves a truncated .zip.
+    """
+    partial_zip_path = f"{zip_path}.part"
+    with zipfile.ZipFile(partial_zip_path, "w", allowZip64=True) as archive:
+        for filename in filenames:
+            compression = (
+                zipfile.ZIP_STORED if filename.lower().endswith(STORED_EXTENSIONS) else zipfile.ZIP_DEFLATED
+            )
+            archive.write(
+                os.path.join(granule_directory, filename),
+                arcname=f"{granule_id}/{filename}",
+                compress_type=compression,
+            )
+
+    # Confirm every file landed in the archive with its full size before replacing anything.
+    with zipfile.ZipFile(partial_zip_path) as archive:
+        archived_sizes = {info.filename: info.file_size for info in archive.infolist()}
+    for filename in filenames:
+        expected_size = os.path.getsize(os.path.join(granule_directory, filename))
+        if archived_sizes.get(f"{granule_id}/{filename}") != expected_size:
+            raise IOError(f"Zip verification failed for {filename}")
+    os.replace(partial_zip_path, zip_path)
+
+# --------------------------------------------------------------------------- #
+# Download – bounded concurrent per-granule downloads, then one .zip per granule.
+# --------------------------------------------------------------------------- #
+def download_and_zip_granule(
+    granule_id: str,
+    urls: list[str],
+    output_directory: str,
+    get_worker_session,
+    progress_position: int,
+    keep_granule_folder: bool,
+) -> str:
+    """Download every file of one granule, then pack them into ``<granule_id>.zip``.
+
+    Runs inside a worker thread.  Files go to a staging folder
+    ``<output_directory>/<granule_id>/`` (resumable ``.part`` files).  The zip
+    is created only after *all* files arrived; otherwise the staging folder is
+    kept so the next run resumes, and a ``RuntimeError`` is raised.
+
+    Returns:
+        Absolute path of the created zip file.
+    """
+    zip_path = to_long_path(os.path.join(output_directory, f"{granule_id}.zip"))
+    granule_directory = to_long_path(os.path.join(output_directory, granule_id))
+    os.makedirs(granule_directory, exist_ok=True)
+
+    filenames: list[str] = []
+    failed_files: list[str] = []
+    for url in urls:
+        filename = filename_from_url(url)
+        filenames.append(filename)
+        destination_path = os.path.join(granule_directory, filename)
+        if os.path.isfile(destination_path):
+            logging.info("File already exists, skipping: %s", filename)
+            continue
+
+        # Reuse a loose file left in the output folder by earlier versions of this script.
+        legacy_path = to_long_path(os.path.join(output_directory, filename))
+        if os.path.isfile(legacy_path):
+            logging.info("Reusing previously downloaded file: %s", filename)
+            os.replace(legacy_path, destination_path)
+            continue
+
+        try:
+            download_with_retries(url, granule_directory, get_worker_session, progress_position)
+            logging.info("Successfully finished downloading file: %s", filename)
+        except Exception as file_error:
+            failed_files.append(filename)
+            logging.error("Failed to download %s: %s", filename, file_error)
+
+    if failed_files:
+        raise RuntimeError(
+            f"{len(failed_files)} file(s) failed; granule not zipped. Downloaded files are kept for the next run."
+        )
+
+    logging.info("Creating zip: %s.zip", granule_id)
+    create_granule_zip(granule_id, granule_directory, filenames, zip_path)
+    if not keep_granule_folder:
+        shutil.rmtree(granule_directory)
+    return os.path.abspath(os.path.join(output_directory, f"{granule_id}.zip"))
+
+
+def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granule downloads.
+    granule_urls: dict[str, list[str]],  # {granule_id: [HDF5 + metadata + visualization URLs]}.
     output_directory: str,  # Local destination directory, created when absent.
     session: asf.ASFSession,  # Earthdata-authenticated ASF session used to seed workers.
+    keep_granule_folders: bool = False,  # Keep the unzipped staging folder after zipping.
 ) -> None:
-    """Download product URLs concurrently with a safe worker cap.
+    """Download granule bundles concurrently with a safe worker cap and zip each one.
 
-    Existing files and duplicate URLs are skipped.  Each remaining URL runs in
-    a worker with its own authenticated HTTP session.  Completion is collected
-    as each future finishes, so a single failed transfer is logged without
-    preventing unrelated products from completing.
-
-    Args:
-        download_urls: Candidate product URLs to process.
-        output_directory: Local directory used for downloaded products.
-        session: Authenticated ASF session whose credentials are copied per worker.
+    Granules whose zip already exists are skipped.  Each remaining granule runs
+    in a worker with its own authenticated HTTP session; the worker downloads
+    all of that granule's files and then zips them.  A failed granule is
+    logged without preventing unrelated granules from completing.
     """
     os.makedirs(output_directory, exist_ok=True)  # Ensure the requested local destination is ready for file output.
-    logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Record the fully resolved output location.
-    logging.info("Starting download of %d file(s) with at most %d worker threads.", len(download_urls), Config.DOWNLOAD_WORKERS)  # Announce the workload and concurrency ceiling.
+    logging.info(f"Data download directory: {os.path.abspath(output_directory)}")
+    logging.info(
+        "Starting download of %d granule(s) with at most %d worker threads.",
+        len(granule_urls), Config.DOWNLOAD_WORKERS,
+    )
 
     get_worker_session = make_worker_session_factory(session)  # Create a thread-local authenticated-session provider.
-    pending_urls = []  # Accumulate URLs that still need a network transfer.
-    successful_downloads = 0  # Count existing and newly completed products as successes.
-    for url in dict.fromkeys(download_urls):  # Preserve order while removing duplicate URLs before scheduling work.
-        filename = filename_from_url(url)  # Determine the destination filename for this candidate URL.
-        if os.path.isfile(os.path.join(output_directory, filename)):
-            logging.info("File already exists, skipping: %s", filename)  # Avoid replacing an already completed product.
-            successful_downloads += 1  # Treat a reusable existing product as a successful result.
+    pending_granules: list[tuple[str, list[str]]] = []
+    skipped_granules = 0
+    for granule_id, urls in granule_urls.items():
+        if os.path.isfile(to_long_path(os.path.join(output_directory, f"{granule_id}.zip"))):
+            logging.info("Zip already exists, skipping granule: %s.zip", granule_id)
+            skipped_granules += 1
         else:
-            pending_urls.append(url)  # Queue the missing product for a worker thread.
+            pending_granules.append((granule_id, urls))
 
-    failed_downloads = 0  # Count files that exhaust their retry attempts.
+    zipped_granules = 0
+    failed_granules = 0
     tqdm.set_lock(threading.RLock())  # Serialize progress-bar output from simultaneous worker threads.
-    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_urls))  # Do not create more workers than pending files.
+    worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_granules))  # Do not create more workers than pending granules.
     if worker_count:
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
             futures = {
-                executor.submit(download_with_retries, url, output_directory, get_worker_session, index % worker_count): url  # Assign each URL a retrying task and stable progress-bar row.
-                for index, url in enumerate(pending_urls)  # Submit every missing URL to the bounded executor.
+                executor.submit(
+                    download_and_zip_granule,
+                    granule_id,
+                    urls,
+                    output_directory,
+                    get_worker_session,
+                    index % worker_count,  # Stable progress-bar row per worker slot.
+                    keep_granule_folders,
+                ): granule_id
+                for index, (granule_id, urls) in enumerate(pending_granules)
             }
-            for future in as_completed(futures):  # Process tasks in completion order rather than submission order.
-                filename = filename_from_url(futures[future])  # Recover the product name associated with this future.
+            for future in as_completed(futures):  # Process granules in completion order.
+                granule_id = futures[future]
                 try:
-                    future.result()  # Re-raise any worker exception in the coordinating thread.
-                    successful_downloads += 1  # Include this newly completed file in the final summary.
-                    logging.info("Successfully finished downloading file: %s", filename)  # Record individual transfer success.
-                except Exception as file_error:
-                    failed_downloads += 1  # Record the failure while allowing other futures to finish.
-                    logging.error("Failed to download %s: %s", filename, file_error)  # Preserve the filename and root error in the log.
+                    zip_path = future.result()  # Re-raise any worker exception in the coordinating thread.
+                    zipped_granules += 1
+                    logging.info("Successfully created zip: %s", zip_path)
+                except Exception as granule_error:
+                    failed_granules += 1
+                    logging.error("Failed granule %s: %s", granule_id, granule_error)
 
-    logging.info(  # Emit a final operational summary after all scheduled work completes.
-        f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"  # Include skipped existing files as successes.
+    logging.info(
+        "Download complete. Summary -> "
+        f"Zipped: {zipped_granules}, Already zipped: {skipped_granules}, Failed: {failed_granules}"
     )
 
 # --------------------------------------------------------------------------- #
@@ -727,9 +907,13 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
         max_results=Config.MAX_RESULTS,
     )
 
-    download_urls = filter_hdf5_urls(results, Config.POLARIZATION_MODE)  # Narrow results down to HDF5 file URLs only (excluding _QA_STATS.h5).
+    granule_urls = group_granule_urls(  # Every HDF5, metadata and visualization file per granule.
+        results, Config.POLARIZATION_MODE, Config.INCLUDE_PRIVATE_FILES
+    )
 
-    download_files_with_thread_pool(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download files with bounded concurrency.
+    download_granules_with_thread_pool(  # Download each granule's files, then zip them together.
+        granule_urls, Config.OUTPUT_DIRECTORY, session, Config.KEEP_GRANULE_FOLDERS
+    )
 
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 
