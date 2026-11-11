@@ -13,11 +13,12 @@ grids at another resolution are resampled before export.
 Supported products
 ------------------
 GSLC (Geocoded Single Look Complex): complex-valued polarization layers such as
-HH and HV. Each tile is converted to intensity, multilooked, and optionally
-corrected with a local DEM before dB conversion.
+HH and HV. Each tile is converted to intensity, speckle filtered (Lee adaptive
+filter or boxcar multilook, see SPECKLE_FILTER), and optionally corrected with a
+local DEM before dB conversion.
 
 GCOV (Geocoded Polarimetric Covariance): real diagonal covariance layers such as
-HHHH and HVHV. Each tile is multilooked before dB conversion. The source covariance
+HHHH and HVHV. Each tile is speckle filtered before dB conversion. The source covariance
 values are already radiometrically terrain corrected, so no additional DEM-based RTC
 is applied.
 
@@ -150,6 +151,34 @@ TARGET_PIXEL_SIZE = 5.0
 # device are available.  Set to False to force the CPU path.  HDF5 reading, DEM
 # reprojection, GeoTIFF compression/writing, overviews and statistics always stay on the CPU.
 USE_GPU = True
+
+# --- SPECKLE REDUCTION ---
+
+# Ground size of the square speckle-filter window, in metres.  It is converted to an odd
+# pixel count per axis from the source pixel spacing, so a 5 m x 5 m grid gets 9 x 9 pixels
+# and a 10 m (x) x 5 m (y) grid gets 5 columns x 9 rows -- the same footprint on the ground.
+# GSLC pixels are roughly single-look (range resolution ~3.7 m on a 5 m grid), so the old
+# fixed 5 x 5 window left about 1 dB of speckle.  Larger = smoother but blurrier.
+MULTILOOK_WINDOW_METRES = 45.0
+
+# Speckle filter applied to the linear intensity/covariance before dB conversion:
+#   "lee"    -- small boxcar pre-average (SPECKLE_PRE_AVERAGE_METRES), then a Lee adaptive
+#               filter over MULTILOOK_WINDOW_METRES.  Smooths homogeneous areas strongly
+#               but keeps edges, field boundaries and point targets sharp. (default)
+#   "boxcar" -- plain moving-average multilook over the whole window (blurs edges too).
+# Measured on a 5 m GSLC crop, flat-area equivalent number of looks (higher = smoother):
+# old 5 x 5 boxcar ~16, 9 x 9 boxcar ~53, "lee" ~65.
+SPECKLE_FILTER = "lee"
+
+# Ground size of the boxcar pre-average used by the "lee" filter (3 x 3 pixels on a 5 m grid).
+# It turns single-look pixels into a few looks so Lee can tell speckle from real structure.
+SPECKLE_PRE_AVERAGE_METRES = 15.0
+
+# Lee filter strength, expressed as the looks it assumes for each pre-averaged pixel.
+# Lower = stronger smoothing (more pixels treated as pure speckle); higher = more detail
+# kept but more residual speckle.  2.0 gave the smoothest result on GSLC with edges kept.
+# GCOV is already multilooked by the NISAR processor, so it starts from a higher value.
+SPECKLE_LEE_LOOKS = {"GSLC": 2.0, "GCOV": 4.0}
 
 # --- SOURCE METADATA LOGGING ---
 
@@ -738,13 +767,29 @@ def calculate_intensity(complex_data):
     return real_sq + imag_sq
 
 
-def apply_multilook(intensity, looks: int = 5):
+def multilook_window_pixels(
+    pixel_x: float, pixel_y: float, window_metres: float = MULTILOOK_WINDOW_METRES
+) -> tuple[int, int]:
     """
-    Reduces 'speckle' noise using a spatial multi-looking (averaging) filter.
+    Convert a ground window size in metres to an odd ``(rows, columns)`` size in pixels.
+
+    An odd size keeps the window centred on the output pixel; each axis uses its own
+    pixel spacing so non-square grids (e.g. 10 m x 5 m) get a square ground footprint.
+    """
+    def odd_size(pixel_size: float) -> int:
+        half = round((window_metres / pixel_size - 1.0) / 2.0)
+        return 2 * max(0, int(half)) + 1
+
+    return odd_size(pixel_y), odd_size(pixel_x)
+
+
+def apply_multilook(intensity, looks: int | tuple[int, int] = 5):
+    """
+    Reduces 'speckle' noise using a spatial multi-looking (boxcar averaging) filter.
 
     Args:
         intensity: Input intensity array (NumPy or CuPy).
-        looks (int): The size of the averaging window (e.g., 5x5).
+        looks: Averaging window size, one int (square) or ``(rows, columns)``.
 
     Returns:
         The spatially filtered intensity array on the same device as the input.
@@ -762,6 +807,75 @@ def apply_multilook(intensity, looks: int = 5):
     output_valid = valid & (weights > 0)
     safe_weights = xp.where(output_valid, weights, xp.float32(1.0))
     return xp.where(output_valid, summed / safe_weights, xp.float32(xp.nan)).astype(xp.float32)
+
+
+def apply_lee_filter(intensity, looks: int | tuple[int, int], input_looks: float = 1.0):
+    """
+    Reduce speckle with the Lee adaptive filter while preserving edges and point targets.
+
+    For each pixel the local mean and variance are measured over the window.  Where the
+    variance is no more than speckle alone would produce (homogeneous area), the output is
+    the local mean -- as smooth as a boxcar.  Where the variance is higher (edge, field
+    boundary, bright target), the output keeps more of the original pixel value.
+
+    Args:
+        intensity: Linear intensity/covariance array (NumPy or CuPy).
+        looks: Window size, one int (square) or ``(rows, columns)``.
+        input_looks: Equivalent number of looks of one input pixel (1.0 for GSLC intensity).
+
+    Returns:
+        The filtered float32 array on the same device as the input; invalid pixels are NaN.
+    """
+    xp, ndimage = array_module(intensity)
+    # Same validity rule as the boxcar: zero-filled swath edges never enter the statistics.
+    valid = xp.isfinite(intensity) & (intensity > 0)
+    values = xp.where(valid, intensity, xp.float32(0.0)).astype(xp.float32)
+    weights = ndimage.uniform_filter(valid.astype(xp.float32), size=looks, mode="reflect")
+    output_valid = valid & (weights > 0)
+    safe_weights = xp.where(output_valid, weights, xp.float32(1.0))
+
+    # Local mean and variance computed from valid samples only.
+    local_mean = ndimage.uniform_filter(values, size=looks, mode="reflect") / safe_weights
+    local_mean_sq = ndimage.uniform_filter(values * values, size=looks, mode="reflect") / safe_weights
+    local_variance = xp.maximum(local_mean_sq - local_mean * local_mean, xp.float32(0.0))
+
+    # Speckle's squared coefficient of variation for an L-look intensity is 1 / L.
+    speckle_cv2 = xp.float32(1.0 / max(float(input_looks), 1e-6))
+    # Variance of the underlying (speckle-free) signal, from the multiplicative noise model.
+    signal_variance = xp.maximum(
+        (local_variance - local_mean * local_mean * speckle_cv2) / (xp.float32(1.0) + speckle_cv2),
+        xp.float32(0.0),
+    )
+    # Weight 0 -> pure local mean (homogeneous area); weight 1 -> original pixel (edge/target).
+    safe_variance = xp.where(local_variance > 0, local_variance, xp.float32(1.0))
+    weight = xp.clip(xp.where(local_variance > 0, signal_variance / safe_variance, xp.float32(0.0)), 0.0, 1.0)
+    filtered = local_mean + weight * (values - local_mean)
+    return xp.where(output_valid, filtered, xp.float32(xp.nan)).astype(xp.float32)
+
+
+def speckle_settings_tag(product_type: str) -> str:
+    """Summarise the speckle settings; outputs made with other settings are regenerated."""
+    lee_looks = SPECKLE_LEE_LOOKS.get(product_type, 2.0) if SPECKLE_FILTER == "lee" else "-"
+    return f"{SPECKLE_FILTER};window={MULTILOOK_WINDOW_METRES:g}m;pre={SPECKLE_PRE_AVERAGE_METRES:g}m;lee_looks={lee_looks}"
+
+
+def reduce_speckle(intensity, looks: tuple[int, int], pre_looks: tuple[int, int], product_type: str):
+    """
+    Apply the configured SPECKLE_FILTER to a linear intensity/covariance tile.
+
+    Args:
+        intensity: Linear tile (NumPy or CuPy).
+        looks: Main filter window ``(rows, columns)``.
+        pre_looks: Boxcar pre-average window used by "lee" (``(1, 1)`` skips it).
+        product_type: "GSLC" or "GCOV"; selects the Lee strength.
+    """
+    if SPECKLE_FILTER == "lee":
+        if pre_looks != (1, 1):
+            intensity = apply_multilook(intensity, pre_looks)
+        return apply_lee_filter(intensity, looks, SPECKLE_LEE_LOOKS.get(product_type, 2.0))
+    if SPECKLE_FILTER == "boxcar":
+        return apply_multilook(intensity, looks)
+    raise ValueError(f"SPECKLE_FILTER must be 'lee' or 'boxcar', not {SPECKLE_FILTER!r}")
 
 
 def apply_rtc(intensity, dem_array, res_x: float, res_y: float):
@@ -856,6 +970,10 @@ def completed_output_path(
                     and existing_raster.height > 0
                     and grid_has_target_pixel_size(existing_raster.transform)
                 ):
+                    # Regenerate outputs made with different (or older, untagged) speckle settings.
+                    if existing_raster.tags().get("speckle_settings") != speckle_settings_tag(product_type):
+                        logger.info("Existing GeoTIFF used other speckle settings; regenerating: %s", candidate.name)
+                        continue
                     return candidate
         except (OSError, rasterio.errors.RasterioError) as exc:
             # A damaged result is not complete and should be regenerated.
@@ -930,6 +1048,17 @@ def export_layer(
     # Only GSLC requires complex-to-intensity conversion and optional DEM correction.
     # Both supported product types are multilooked below.
     process_gslc = product_type == "GSLC"
+    # Speckle-filter window in pixels (rows, columns), sized from MULTILOOK_WINDOW_METRES.
+    look_rows, look_cols = multilook_window_pixels(pixel_x, pixel_y)
+    # Pre-average window for the "lee" filter; the boxcar filter does not use one.
+    pre_looks = (
+        multilook_window_pixels(pixel_x, pixel_y, SPECKLE_PRE_AVERAGE_METRES)
+        if SPECKLE_FILTER == "lee" else (1, 1)
+    )
+    # Extra source pixels read around each tile so the filters see real neighbours at tile
+    # edges instead of reflected ones -- this removes seams between 2048-pixel tiles.
+    halo_rows = look_rows // 2 + pre_looks[0] // 2
+    halo_cols = look_cols // 2 + pre_looks[1] // 2
 
     # Build a distinct filename that records the source, product type, frequency, and channel.
     out_path = PROCESSED_DIRECTORY / (
@@ -971,6 +1100,11 @@ def export_layer(
     elif process_gslc:
         logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
+    # Average when the output grid is coarser than the source on either axis (adds looks);
+    # nearest neighbour otherwise, which keeps upsampled dB samples unchanged.
+    downsampling = pixel_x < TARGET_PIXEL_SIZE or pixel_y < TARGET_PIXEL_SIZE
+    output_resampling = Resampling.average if downsampling else Resampling.nearest
+
     if source_has_target_pixel_size:
         logger.info(
             "%s/%s already has %.6g m x %.6g m pixels; retaining the native grid.",
@@ -978,20 +1112,34 @@ def export_layer(
         )
     else:
         logger.info(
-            "%s/%s has %.6g m x %.6g m pixels; resampling to %.0f m x %.0f m with nearest neighbor.",
+            "%s/%s has %.6g m x %.6g m pixels; resampling to %.0f m x %.0f m with %s.",
             frequency, polarization, pixel_x, pixel_y,
-            TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE,
+            TARGET_PIXEL_SIZE, TARGET_PIXEL_SIZE, output_resampling.name,
         )
+    logger.info(
+        "%s/%s speckle filter: %s, %d x %d pixels (%.0f m x %.0f m window), pre-average %d x %d pixels.",
+        frequency, polarization, SPECKLE_FILTER, look_cols, look_rows,
+        look_cols * pixel_x, look_rows * pixel_y, pre_looks[1], pre_looks[0],
+    )
 
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
-    description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
+    filter_label = f"{SPECKLE_FILTER.capitalize()} {look_cols}x{look_rows}"
+    description = (
+        f"Intensity {filter_label} RTC" if process_gslc else f"{filter_label} RTC Gamma0 Covariance"
+    )
     try:
         # Create the native-grid staging GeoTIFF.
         with rasterio.open(native_temp_path, "w", **profile) as dst:
             # Attach a human-readable label to the sole output band.
             dst.set_band_description(1, f"{product_type} {frequency} {polarization} {description} dB")
+            dst.update_tags(
+                speckle_filter=SPECKLE_FILTER,
+                speckle_window_pixels=f"{look_cols}x{look_rows}",
+                speckle_window_metres=f"{look_cols * pixel_x:g}x{look_rows * pixel_y:g}",
+                speckle_settings=speckle_settings_tag(product_type),
+            )
             # Iterate over fixed-size source windows to keep memory usage bounded.
             for tile_num, window in enumerate(source_windows(height, width), start=1):
                 # Convert Rasterio window offsets to integers accepted by HDF5 slicing.
@@ -999,8 +1147,18 @@ def export_layer(
                 row_stop = row_start + int(window.height)
                 col_start = int(window.col_off)
                 col_stop = col_start + int(window.width)
-                # Read only this native-grid source tile from the HDF5 dataset.
-                tile_data = source_dataset[row_start:row_stop, col_start:col_stop]
+                # Read this tile plus a halo of neighbouring pixels (clipped at the image edge)
+                # so the speckle filter is seamless across tile boundaries.
+                read_row_start = max(0, row_start - halo_rows)
+                read_row_stop = min(height, row_stop + halo_rows)
+                read_col_start = max(0, col_start - halo_cols)
+                read_col_stop = min(width, col_stop + halo_cols)
+                tile_data = source_dataset[read_row_start:read_row_stop, read_col_start:read_col_stop]
+                # Slices that crop the filtered halo tile back to the output window.
+                crop = (
+                    slice(row_start - read_row_start, row_stop - read_row_start),
+                    slice(col_start - read_col_start, col_stop - read_col_start),
+                )
 
                 # Move the raw tile to the GPU once; all math below stays on that device
                 # until the finished dB tile is copied back for writing.
@@ -1015,8 +1173,10 @@ def export_layer(
                     # GCOV diagonal covariance samples are already intensity-like.
                     processed_tile = tile_data.astype(np.float32, copy=False)
 
-                # Apply the required multi-looking step to every supported product type.
-                processed_tile = apply_multilook(processed_tile, looks=5)
+                # Reduce speckle on the halo tile, then keep only this tile's own pixels.
+                processed_tile = reduce_speckle(
+                    processed_tile, (look_rows, look_cols), pre_looks, product_type
+                )[crop]
 
                 # GSLC alone receives the optional additional DEM-based RTC step.
                 if process_gslc:
@@ -1086,6 +1246,7 @@ def export_layer(
                 destination_raster.set_band_description(
                     1, f"{product_type} {frequency} {polarization} {description} dB"
                 )
+                destination_raster.update_tags(**source_raster.tags())
                 reproject(
                     source=rasterio.band(source_raster, 1),
                     destination=rasterio.band(destination_raster, 1),
@@ -1095,15 +1256,16 @@ def export_layer(
                     dst_transform=destination_raster.transform,
                     dst_crs=destination_raster.crs,
                     dst_nodata=OUTPUT_NODATA,
-                    resampling=Resampling.nearest,
+                    resampling=output_resampling,
                     init_dest_nodata=True,
                 )
         native_temp_path.unlink()
 
     # Build overviews on the actual exported grid and calculate its final statistics.
     with rasterio.open(temp_path, "r+") as output_raster:
-        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.nearest)
-        output_raster.update_tags(ns="rio_overview", resampling="nearest")
+        # Averaging overviews look smoother when zoomed out than picking single noisy pixels.
+        output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+        output_raster.update_tags(ns="rio_overview", resampling="average")
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.
