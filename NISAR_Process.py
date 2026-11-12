@@ -1258,11 +1258,14 @@ def main() -> None:
 
     # Create the output directory now so every successful layer has a destination.
     PROCESSED_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    # Recursively select supported HDF5 or NetCDF files from the product directory.
+    # Recursively select supported HDF5 or NetCDF files from the product directory,
+    # skipping QA statistics companion files (e.g. <granule>_QA_STATS.h5).
     source_files = [
         path
         for path in ROOT_DIRECTORY.rglob("*")
-        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        if path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and "qa_stats.h5" not in path.name.lower()
     ]
 
     # End successfully when there are no products to process in the input directory.
