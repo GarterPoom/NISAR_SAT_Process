@@ -2,8 +2,10 @@
 NISAR_Download_Track_Frame.py
 
 Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules
-within a given area of interest, date range and Track/Frame selection, filter results down to
-HDF5 product files, and download them sequentially to a local directory.
+within a given area of interest, date range and Track/Frame selection, and download
+*every* file of each granule – the main HDF5 product plus all metadata (QA_STATS.h5,
+ISO XML, JSON/YAML, QA reports) and visualizations (PNG browse images, KML footprints).
+All files of one granule are saved together in ``<OUTPUT_DIRECTORY>/<granule_id>/``.
 
 Each file download shows its own byte-level progress bar (current bytes / total bytes),
 rather than a single progress bar tracking file count.
@@ -53,7 +55,8 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_Download_logs"  # Folder where timestamped log files are written.
-    OUTPUT_DIRECTORY = "NISAR_Product"  # Folder where downloaded HDF5 product files are saved.
+    OUTPUT_DIRECTORY = "NISAR_Product"  # Each granule's files are saved together in <OUTPUT_DIRECTORY>/<granule_id>/.
+    INCLUDE_PRIVATE_FILES = False  # Files in the NISAR-JPL-PRIVATE-DATA bucket need special access.
 
     # Area of interest, as a path to a shapefile (.shp). All features in the
     # file are dissolved into a single geometry and reprojected to WGS84
@@ -64,28 +67,28 @@ class Config:  # Groups every tunable setting in one place instead of scattering
 
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
-                                 "Administrative_Boundary_dir",
-                                 "Administrative_Boundary.shp")
+                             "Thailand_Admin",
+                             "tha_admbnda_adm1_rtsd_20190221.shp")  # Path to the shapefile defining the area of interest (AOI).
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
     DATE_MODE = 1
-    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
-    END_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    START_DATE = datetime.strptime("2026-11-05", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("2026-11-06", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
     DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
     FRAME_COVERAGE = "FULL"  # Exclude NISAR products that cover only a partial frame.
+    POLARIZATION_MODE = "DH"  # "SH" (single-pol H), "DH" (dual-pol H: HH+HV), or None to keep every mode.
 
     # NISAR Track/Frame pairs to download.  Add every required pair here as
     # (track, frame); for example, (105, 78) means Track 105, Frame 078.
-    #
     # A pair is downloaded only when its full-frame product footprint
     # intersects AOI_SHAPEFILE; partial-frame products are excluded.
     # Leave no pairs configured only if you want the script to stop before
     # searching, rather than accidentally downloading every AOI result.
     TRACK_FRAME_PAIRS: list[tuple[int, int]] = [
-        (4, 81),
+        (4, 81), (4, 82), (11, 8), (11, 9), (11, 10)
     ]
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
@@ -408,57 +411,147 @@ def search_nisar_granules(  # Query the ASF catalog for NISAR granules matching 
         sys.exit(1)  # Exit script execution with a failure status code.
 
 # --------------------------------------------------------------------------- #
-# Filter – keeps only HDF5 URLs and excludes files ending with _QA_STATS.h5.
+# Filter – groups every file (HDF5, metadata, visualizations) per granule.
 # --------------------------------------------------------------------------- #
-def filter_hdf5_urls(
+def normalize_polarization_mode(polarization_mode: str | None) -> str | None:
+    """Return an upper-case polarization mode code, or ``None`` for no filtering.
+
+    Args:
+        polarization_mode: ``"SH"`` (single-pol H) or ``"DH"`` (dual-pol H); ``None``/``"ANY"`` keeps every mode.
+
+    Raises:
+        ValueError: If the value is not SH, DH, ANY, or None.
+    """
+    if polarization_mode is None or str(polarization_mode).strip().upper() in ("", "ANY"):
+        return None  # No polarization filtering requested.
+    mode = str(polarization_mode).strip().upper()  # Normalize case and whitespace.
+    if mode not in ("SH", "DH"):
+        raise ValueError("POLARIZATION_MODE must be 'SH', 'DH', or None.")  # Reject unsupported modes early.
+    return mode
+
+
+def polarization_mode_from_filename(filename: str) -> str | None:
+    """Extract the frequency-A polarization mode (e.g. ``DH``) from a NISAR filename.
+
+    NISAR names embed ``_<bandwidth>_<modeA><modeB>_`` such as ``_2005_DHDH_``;
+    the first two letters describe the frequency-A polarization mode.
+    """
+    match = re.search(r"_\d{4}_([A-Z]{2})([A-Z]{2})_", filename)  # Locate the 4-letter mode token after the bandwidth code.
+    return match.group(1) if match else None  # None when the name has no recognizable mode token.
+
+
+# Capture NISAR's ..._<track>_<direction>_<frame>_... granule-name fields.
+TRACK_FRAME_PATTERN = re.compile(r"^NISAR_L2_[^_]+_[^_]+_\d+_(\d+)_[AD]_(\d+)_")
+
+# ASF lists some files from a JPL-internal bucket that ordinary Earthdata accounts cannot access.
+PRIVATE_JPL_BUCKET = "/NISAR-JPL-PRIVATE-DATA/"
+
+
+def get_product_urls(product: asf.ASFProduct) -> list[str]:
+    """Return every HTTPS URL ASF lists for one product.
+
+    Covers the main HDF5 file plus ``additionalUrls`` (QA_STATS, ISO XML,
+    KML, JSON/YAML metadata, QA reports) and browse images (PNG).
+    """
+    if hasattr(product, "find_urls"):
+        urls = list(product.find_urls())
+    else:  # Older asf_search versions without ASFProduct.find_urls().
+        properties = product.properties
+        urls = [properties.get("url")]
+        urls.extend(properties.get("additionalUrls") or [])
+        browse = properties.get("browse") or []
+        urls.extend([browse] if isinstance(browse, str) else browse)
+    return [url for url in urls if url]
+
+
+def group_granule_urls(
     results: asf.ASFSearchResults,
     selected_track_frame_pairs: set[tuple[int, int]],
-) -> list[str]:  # Filter search results down to direct-download URLs for HDF5 files.
-    """Filter search results down to direct-download URLs for HDF5 files.
+    polarization_mode: str | None = None,
+    include_private_files: bool = False,
+) -> dict[str, list[str]]:
+    """Group search results into ``{granule_id: [every file URL of that granule]}``.
+
+    Every file belonging to a granule is kept – the main HDF5 product, all
+    metadata (QA_STATS.h5, ISO XML, JSON, YAML, logs, QA reports) and all
+    visualizations (PNG browse images, KML footprints).  Non-file links such
+    as the ``s3credentials`` endpoint are dropped because their filenames do
+    not start with the granule ID.
 
     Args:
         results: Search results returned by search_nisar_granules().
+        selected_track_frame_pairs: Exact (track, frame) pairs to keep.
+        polarization_mode: Optional ``"SH"`` or ``"DH"``; granules with another mode are dropped.
+        include_private_files: Whether to keep files from the NISAR-JPL-PRIVATE-DATA bucket.
 
     Returns:
-        A list of direct download URLs for selected Track/Frame pairs ending in
-        .h5 or .hdf5, **excluding** any file ending with `_QA_STATS.h5`.
+        Ordered mapping of granule ID (no extension) to its de-duplicated URLs.
 
     Exits:
-        Gracefully (status 0) if no HDF5 URLs are found.
+        Gracefully (status 0) if no matching granules are found.
     """
-    all_urls = results.find_urls(directAccess=False)  # Extract all download URLs from the search results.
+    polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
+    granule_urls: dict[str, list[str]] = {}
+    total_urls = 0
 
-    # Capture NISAR's ..._<track>_<direction>_<frame>_... filename fields.
-    # This local check is deliberately kept in addition to the server-side
-    # `granule_list` filter, so only exact requested pairs are downloaded.
-    track_frame_pattern = re.compile(r"^NISAR_L2_[^_]+_[^_]+_\d+_(\d+)_[AD]_(\d+)_")
+    for product in results:
+        granule_id = product.properties.get("sceneName") or product.properties.get("fileID")
+        if not granule_id:
+            logging.warning("Skipping a search result without a sceneName/fileID.")
+            continue
+        if granule_id.lower().endswith((".h5", ".hdf5")):
+            granule_id = os.path.splitext(granule_id)[0]
 
-    # Build a list of URLs that meet all criteria: exact Track/Frame pair,
-    # HDF5 extension, and no QA statistics suffix.
-    download_urls = []
-    for url in all_urls:
-        filename = url.split("/")[-1]  # Extract the filename from the URL.
-        track_frame_match = track_frame_pattern.match(filename)
+        # This local check is deliberately kept in addition to the server-side
+        # `granule_list` filter, so only exact requested pairs are downloaded.
+        track_frame_match = TRACK_FRAME_PATTERN.match(granule_id)
         if track_frame_match is None:
-            logging.warning(f"Skipping URL with an unrecognised NISAR filename: {filename}")
+            logging.warning(f"Skipping granule with an unrecognised NISAR name: {granule_id}")
+            continue
+        track_frame_pair = (int(track_frame_match.group(1)), int(track_frame_match.group(2)))
+        if track_frame_pair not in selected_track_frame_pairs:
+            continue
+        if polarization_mode and polarization_mode_from_filename(granule_id) != polarization_mode:
+            continue  # Skip products acquired in a different polarization mode.
+        if granule_id in granule_urls:  # Same granule returned twice – nothing new to add.
             continue
 
-        track_frame_pair = (
-            int(track_frame_match.group(1)),
-            int(track_frame_match.group(2)),
+        urls: list[str] = []
+        seen_filenames: set[str] = set()
+        for url in get_product_urls(product):
+            total_urls += 1
+            filename = filename_from_url(url)
+            if not url.lower().startswith("https://") or not filename.startswith(granule_id):
+                continue  # Not a granule file (e.g. the s3credentials endpoint).
+            if PRIVATE_JPL_BUCKET in url and not include_private_files:
+                continue
+            if filename in seen_filenames:
+                continue
+            seen_filenames.add(filename)
+            urls.append(url)
+
+        has_main_hdf5 = any(
+            filename_from_url(url).lower() in (f"{granule_id}.h5".lower(), f"{granule_id}.hdf5".lower())
+            for url in urls
         )
-        if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.
-            not filename.lower().endswith('_qa_stats.h5') and  # Exclude QA_STATS files.
-            track_frame_pair in selected_track_frame_pairs):  # Retain exact requested pairs only.
-            download_urls.append(url)  # Add the URL to the list.
+        if not has_main_hdf5:
+            logging.warning(f"Skipping {granule_id}: ASF lists no main HDF5 file for it.")
+            continue
+        granule_urls[granule_id] = urls
 
-    logging.info(f"Extracted {len(download_urls)} HDF5 download URLs out of {len(all_urls)} total URLs.")  # Log counts.
+    file_count = sum(len(urls) for urls in granule_urls.values())
+    logging.info(
+        f"Selected {len(granule_urls)} granule(s) with {file_count} file(s) out of {total_urls} "
+        f"total URLs (polarization mode: {polarization_mode or 'ANY'})."
+    )
+    for granule_id, urls in granule_urls.items():
+        logging.info(f"  {granule_id}: {len(urls)} file(s)")
 
-    if not download_urls:  # Check if the filtered URL list is empty.
-        logging.warning("No HDF5 (.h5 / .hdf5) files found in search results. Exiting script.")  # Log a warning.
-        sys.exit(0)  # Exit script gracefully with a success status.
+    if not granule_urls:
+        logging.warning("No matching NISAR granules found in search results. Exiting script.")
+        sys.exit(0)
 
-    return download_urls  # Return the list of filtered HDF5 download URLs.
+    return granule_urls
 
 # --------------------------------------------------------------------------- #
 # Download – resumable sequential downloads with retry and slow-link handling.
@@ -606,49 +699,88 @@ def download_with_retries(
             time.sleep(wait_seconds)
 
 # --------------------------------------------------------------------------- #
-# Download – sequential download of many files, each with its own progress bar.
+# Paths – long-path support for the per-granule folders.
 # --------------------------------------------------------------------------- #
-def download_files_sequentially(  # Download a list of files one at a time, each with its own progress bar.
-    download_urls: list[str],  # URLs of the files to download.
-    output_directory: str,  # Local directory to save files into (created if it doesn't already exist).
+def to_long_path(path: str) -> str:
+    """Return a path usable beyond Windows' 260-character MAX_PATH limit.
+
+    NISAR granule IDs are ~90 characters and appear in both the staging folder
+    and the file names, so full paths easily exceed MAX_PATH on Windows.
+    """
+    absolute_path = os.path.abspath(path)
+    if os.name == "nt" and not absolute_path.startswith("\\\\?\\"):
+        return "\\\\?\\" + absolute_path
+    return absolute_path
+
+# --------------------------------------------------------------------------- #
+# Download – sequential per-granule download into one folder per granule.
+# --------------------------------------------------------------------------- #
+def download_granules_sequentially(
+    granule_urls: dict[str, list[str]],  # {granule_id: [HDF5 + metadata + visualization URLs]}.
+    output_directory: str,  # Folder that holds one <granule_id>/ sub-folder per granule.
     session: asf.ASFSession,  # Authenticated ASFSession used for the HTTP requests.
 ) -> None:
-    """Download a list of files one at a time, each with its own progress bar.
+    """Download each granule's file bundle into ``<output_directory>/<granule_id>/``.
 
-    Args:
-        download_urls: URLs of the files to download.
-        output_directory: Local directory to save files into (created if it doesn't already exist).
-        session: Authenticated ASFSession used for the HTTP requests.
+    Files are downloaded resumably, one progress bar per file.  Files already
+    present are skipped, and a granule with failed files keeps whatever was
+    downloaded so the next run resumes instead of starting over.
     """
-    os.makedirs(output_directory, exist_ok=True)  # Create the output data directory safely if it doesn't exist.
-    logging.info(f"Data download directory created at: {os.path.abspath(output_directory)}")  # Log its absolute path.
-    logging.info(f"Starting sequential download of {len(download_urls)} file(s)...")  # Log start of the batch.
+    os.makedirs(output_directory, exist_ok=True)
+    logging.info(f"Data download directory: {os.path.abspath(output_directory)}")
+    logging.info(f"Starting sequential download of {len(granule_urls)} granule(s)...")
 
-    successful_downloads = 0  # Initialize a counter for successful downloads.
-    failed_downloads = 0  # Initialize a counter for failed downloads.
+    downloaded_granules = 0
+    skipped_granules = 0
+    failed_granules = 0
 
-    for url in dict.fromkeys(download_urls):  # Preserve order while avoiding duplicate transfers.
-        filename = filename_from_url(url)  # Extract the filename for logging purposes.
-        destination_path = os.path.join(output_directory, filename)  # Full local path where this file would be saved.
+    for granule_id, urls in granule_urls.items():
+        granule_directory = to_long_path(os.path.join(output_directory, granule_id))
+        if all(os.path.isfile(os.path.join(granule_directory, filename_from_url(url))) for url in urls):
+            logging.info(f"All files already downloaded, skipping granule: {granule_id}")
+            skipped_granules += 1
+            continue
 
-        logging.info(f"Starting download for file: {filename}")  # Log the start of this file's download.
+        os.makedirs(granule_directory, exist_ok=True)
+        logging.info(f"Downloading granule {granule_id} ({len(urls)} file(s))")
 
-        # Skip the file if it already exists locally – avoids re‑downloading.
-        if os.path.isfile(destination_path):
-            logging.info(f"File already exists, skipping: {filename}")
-            successful_downloads += 1  # Count it as a successful (already‑present) download.
-            continue  # Move on to the next URL.
+        failed_files: list[str] = []
+        for url in urls:
+            filename = filename_from_url(url)
+            destination_path = os.path.join(granule_directory, filename)
 
-        try:  # Begin try block for a single file download.
-            download_with_retries(url, output_directory, session)  # Resume and retry the file when its connection fails or stays too slow.
-            successful_downloads += 1  # Increment the success counter on completion.
-            logging.info(f"Successfully finished downloading file: {filename}")  # Log successful completion.
-        except Exception as file_error:  # Intercept any error for this specific file.
-            failed_downloads += 1  # Increment the failure counter.
-            logging.error(f"Failed to download {filename}: {file_error}")  # Log the detailed error message.
+            if os.path.isfile(destination_path):
+                logging.info(f"File already exists, skipping: {filename}")
+                continue
 
-    logging.info(  # Log the overall download summary.
-        f"Download complete. Summary -> Successful: {successful_downloads}, Failed: {failed_downloads}"
+            # Reuse a loose file left in the output folder by earlier versions of this script.
+            legacy_path = to_long_path(os.path.join(output_directory, filename))
+            if os.path.isfile(legacy_path):
+                logging.info(f"Reusing previously downloaded file: {filename}")
+                os.replace(legacy_path, destination_path)
+                continue
+
+            try:
+                download_with_retries(url, granule_directory, session)
+                logging.info(f"Successfully finished downloading file: {filename}")
+            except Exception as file_error:
+                failed_files.append(filename)
+                logging.error(f"Failed to download {filename}: {file_error}")
+
+        if failed_files:
+            failed_granules += 1
+            logging.error(
+                f"Granule {granule_id} incomplete: {len(failed_files)} file(s) failed. "
+                "Downloaded files are kept for the next run."
+            )
+            continue
+
+        downloaded_granules += 1
+        logging.info(f"Granule complete: {os.path.abspath(os.path.join(output_directory, granule_id))}")
+
+    logging.info(
+        "Download complete. Summary -> "
+        f"Downloaded: {downloaded_granules}, Already complete: {skipped_granules}, Failed: {failed_granules}"
     )
 
 # --------------------------------------------------------------------------- #
@@ -671,6 +803,12 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
 
     session = authenticate_earthdata(Config.EARTHDATA_USERNAME, Config.EARTHDATA_PASSWORD)  # Log in to Earthdata.
 
+    try:
+        normalize_polarization_mode(Config.POLARIZATION_MODE)  # Fail fast on an invalid polarization mode.
+    except ValueError as mode_error:
+        logging.error("Invalid polarization configuration: %s", mode_error)
+        sys.exit(1)
+
     aoi_wkt = load_aoi_wkt_from_shapefile(Config.AOI_SHAPEFILE)  # Derive the WKT search geometry from the AOI shapefile.
     selected_track_frame_pairs, granule_patterns = prepare_track_frame_filters(
         Config.TRACK_FRAME_PAIRS
@@ -686,11 +824,18 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
         max_results=Config.MAX_RESULTS,
     )
 
-    download_urls = filter_hdf5_urls(  # Narrow results to the exact pairs and HDF5 URLs (excluding _QA_STATS.h5).
-        results, selected_track_frame_pairs
+    granule_urls = group_granule_urls(  # Every HDF5, metadata and visualization file per granule.
+        results,
+        selected_track_frame_pairs,
+        Config.POLARIZATION_MODE,
+        Config.INCLUDE_PRIVATE_FILES,
     )
 
-    download_files_sequentially(download_urls, Config.OUTPUT_DIRECTORY, session)  # Download each file in turn.
+    download_granules_sequentially(  # Download each granule's files into its own folder.
+        granule_urls,
+        Config.OUTPUT_DIRECTORY,
+        session,
+    )
 
     logging.info("NISAR search and download workflow completed successfully.")  # Log final completion message.
 

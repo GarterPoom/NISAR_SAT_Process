@@ -57,13 +57,13 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")  # NASA Earthdata login password.
 
     LOG_DIRECTORY = "NISAR_SME2_Download_logs"  # Folder where timestamped log files are written.
-    OUTPUT_DIRECTORY = "your_directory_to_save_product"  # Folder where downloaded HDF5 product files are saved.
+    OUTPUT_DIRECTORY = "soilMoisture"  # Folder where downloaded HDF5 product files are saved.
 
     # Area of interest in WGS84 (EPSG:4326) WKT format, passed directly to
     # the ASF search API.
     AOI_WKT = "POLYGON((96.8973 5.439,105.9604 5.439,105.9604 20.8004,96.8973 20.8004,96.8973 5.439))" # Thailand AOI WKT Example.
 
-    START_DATE = datetime.strptime("yyyy-mm-dd", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
+    START_DATE = datetime.strptime("2026-09-30", "%Y-%m-%d")  # Earliest acquisition date to include in the search (YYYY-MM-DD).
     END_DATE = datetime.strptime(datetime.now().strftime("%Y-%m-%d"), "%Y-%m-%d")  # Latest acquisition date – always today (YYYY-MM-DD).
 
     PRODUCT_LEVEL = "SME2"  # NISAR processing level to filter results by.
