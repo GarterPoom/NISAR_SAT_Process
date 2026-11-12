@@ -11,7 +11,8 @@ products, one output per input product:
    Those pixels remain nodata.
 4. Reproject the native-grid GeoTIFF to the configured output CRS as
    ``<HDF5 product name>_soilMoisture.tif``.
-5. Build an external ``.ovr`` pyramid for each output for ArcGIS.
+5. Build internal nearest-neighbour pyramids inside each output GeoTIFF
+   (no external ``.ovr`` file is created).
 
 Products that already have both outputs are skipped unless ``OVERWRITE`` is
 set, so new files can be added to the input folder and the script run again.
@@ -39,10 +40,8 @@ import os
 from pathlib import Path
 # Find the two standard NISAR timestamps inside each filename.
 import re
-# Locate and run gdaladdo when the GDAL Python bindings are unavailable.
+# Copy the extraction when no reprojection is needed.
 import shutil
-# Call gdaladdo without invoking a command shell.
-import subprocess
 # Run independent HDF5-to-GeoTIFF extractions concurrently.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # Hold related scene metadata in small, explicit data objects.
@@ -509,7 +508,7 @@ def extract_scene(
     """
 
     # Give each extracted raster the unique full NISAR product stem.
-    output_path = extracted_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"                                                                                                                                                                                           
+    output_path = extracted_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"
     # Preserve an existing extraction unless replacement was explicitly requested.
     if output_path.exists() and not overwrite:
         # Report reuse so the result is not mistaken for a fresh extraction.
@@ -729,6 +728,7 @@ def reproject_to_output_crs(
     os.replace(partial_path, output_path)
     print(f"Reprojected raster written: {output_path} ({target_crs})")
 
+
 def pyramid_levels(width: int, height: int) -> list[int]:
     """Return power-of-two overview factors suitable for ArcGIS display."""
 
@@ -742,112 +742,52 @@ def pyramid_levels(width: int, height: int) -> list[int]:
         levels.append(level)
         # Move to the next coarser pyramid level.
         level *= 2
-    # Ensure even a small raster receives a physical external .ovr when possible.
+    # Ensure even a small raster receives at least one overview level when possible.
     if not levels and min(width, height) >= 2:
         # A factor of 2 is the smallest useful overview.
         levels.append(2)
-    # Return the factors for GDAL BuildOverviews or gdaladdo.
+    # Return the factors for build_overviews.
     return levels
 
 
-def build_external_overviews(raster_path: Path, overwrite: bool) -> Path:
-    """Build and verify an external ``<raster>.ovr`` pyramid.
+def build_internal_overviews(raster_path: Path, overwrite: bool) -> list[int]:
+    """Build nearest-neighbour pyramids stored inside the GeoTIFF itself.
 
-    The function first uses ``osgeo.gdal`` with the source opened read-only,
-    which makes the GeoTIFF driver create external overviews. If those Python
-    bindings are unavailable, it runs ``gdaladdo -ro``. It verifies that the
-    sidecar exists instead of accepting internal overviews as success.
+    No ``.ovr`` sidecar is produced.  Existing internal overviews are kept
+    unless ``overwrite`` is set, in which case they are rebuilt.
     """
 
-    # ArcGIS and GDAL use this exact sidecar naming convention.
-    overview_path = overview_path_for(raster_path)
-    # Protect an existing overview unless the caller authorized replacement.
-    if overview_path.exists() and not overwrite:
-        # Stop because rebuilding would modify an existing deliverable.
-        raise FileExistsError(
-            f"Overview exists; set OVERWRITE = True to replace it: {overview_path}"
-        )
-    # Remove only the exact old sidecar so GDAL must create a fresh external pyramid.
-    if overwrite:
-        # Missing files are harmless during an overwrite run.
-        overview_path.unlink(missing_ok=True)
-    # Read raster dimensions without loading pixel values.
+    # Read raster dimensions and any overviews already embedded in the file.
     with rasterio.open(raster_path) as source:
         # Calculate appropriate power-of-two decimation factors.
         levels = pyramid_levels(source.width, source.height)
+        # Remember whether the file already carries internal overviews.
+        existing = source.overviews(1)
     # Reject a one-pixel raster because no reduced-resolution pyramid can exist.
     if not levels:
         # Explain the physical limitation directly.
         raise ValueError(f"Raster is too small to build an overview: {raster_path}")
-    # Prefer the GDAL Python API so the workflow remains within one Python process.
-    try:
-        # Import lazily so extraction can give a focused error on minimal environments.
-        from osgeo import gdal  # type: ignore
-    # Fall back only when the separate GDAL Python package is not installed.
-    except ImportError:
-        # Mark the binding as unavailable for the branch below.
-        gdal = None
-    # Use the Python binding when it was imported successfully.
-    if gdal is not None:
-        # Store external overviews as compact floating-point GeoTIFF data.
-        gdal.SetConfigOption("COMPRESS_OVERVIEW", "DEFLATE")
-        # Use floating-point prediction for better overview compression.
-        gdal.SetConfigOption("PREDICTOR_OVERVIEW", "3")
-        # Permit a BigTIFF .ovr only when the overview size requires it.
-        gdal.SetConfigOption("BIGTIFF_OVERVIEW", "IF_SAFER")
-        # Open read-only; this is what forces GeoTIFF overviews into a sidecar.
-        dataset = gdal.Open(str(raster_path), gdal.GA_ReadOnly)
-        # Fail clearly if GDAL cannot open the completed raster.
-        if dataset is None:
-            # Identify the exact path that GDAL rejected.
-            raise RuntimeError(f"GDAL could not open raster for pyramids: {raster_path}")
-        # Build average-resampled overviews for continuous soil moisture values.
-        error_code = dataset.BuildOverviews("AVERAGE", levels)
-        # Close the GDAL dataset so all .ovr directory entries are flushed.
-        dataset = None
-        # A nonzero GDAL code indicates that pyramid construction failed.
-        if error_code != 0:
-            # Preserve the numeric code for environment-specific diagnosis.
-            raise RuntimeError(f"GDAL BuildOverviews failed with code {error_code}.")
-    # Otherwise try the standard GDAL command-line program.
-    else:
-        # Find gdaladdo on PATH without invoking a shell.
-        gdaladdo = shutil.which("gdaladdo")
-        # Explain the required installation if neither GDAL interface exists.
-        if gdaladdo is None:
-            # The final raster remains usable, but the explicit .ovr requirement is unmet.
-            raise RuntimeError(
-                "Cannot create an external .ovr: install the GDAL Python bindings "
-                "(osgeo) or place gdaladdo on PATH."
-            )
-        # Assemble each argument separately to handle paths containing spaces safely.
-        command = [
-            gdaladdo,
-            "--config",
-            "COMPRESS_OVERVIEW",
-            "DEFLATE",
-            "--config",
-            "PREDICTOR_OVERVIEW",
-            "3",
-            "--config",
-            "BIGTIFF_OVERVIEW",
-            "IF_SAFER",
-            "-ro",
-            "-r",
-            "average",
-            str(raster_path),
-            *(str(level) for level in levels),
-        ]
-        # Run gdaladdo and convert a nonzero exit status to a Python exception.
-        subprocess.run(command, check=True)
-    # Verify the requested external sidecar instead of accepting internal overviews.
-    if not overview_path.is_file() or overview_path.stat().st_size == 0:
-        # Provide a targeted error when a GDAL build silently chose internal storage.
-        raise RuntimeError(f"External overview was not created: {overview_path}")
-    # Report the factors and sidecar location for ArcGIS users.
-    print(f"External overview written: {overview_path} (levels: {levels})")
-    # Return the verified sidecar path for the final summary.
-    return overview_path
+    # Leave an existing pyramid alone unless replacement was requested.
+    if existing and not overwrite:
+        print(f"Internal overviews already present: {raster_path} (levels: {existing})")
+        return existing
+    # Compress the embedded overview levels like the full-resolution band.
+    with rasterio.Env(COMPRESS_OVERVIEW="DEFLATE", PREDICTOR_OVERVIEW="3"):
+        # Update mode appends the overviews inside the same .tif file.
+        with rasterio.open(raster_path, "r+") as dataset:
+            # Nearest neighbour keeps original values and the -9999 nodata unaltered.
+            dataset.build_overviews(levels, Resampling.nearest)
+    # Report the factors for the user.
+    print(f"Internal overviews written: {raster_path} (levels: {levels})")
+    # Return the factors that were built.
+    return levels
+
+
+def has_internal_overviews(raster_path: Path) -> bool:
+    """Return True when the GeoTIFF already contains embedded overviews."""
+
+    with rasterio.open(raster_path) as source:
+        return bool(source.overviews(1))
 
 
 def output_path_for_scene(output_dir: Path, scene: Scene) -> Path:
@@ -855,12 +795,6 @@ def output_path_for_scene(output_dir: Path, scene: Scene) -> Path:
 
     # The full product name is unique and already records dates and orbit pass.
     return output_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"
-
-
-def overview_path_for(raster_path: Path) -> Path:
-    """Return the sidecar pathname that ArcGIS and GDAL expect for a raster."""
-
-    return Path(str(raster_path) + ".ovr")
 
 
 def main() -> None:
@@ -891,11 +825,7 @@ def main() -> None:
     pending_scenes = []
     for scene in scenes:
         output_path = output_path_for_scene(output_dir, scene)
-        if (
-            not OVERWRITE
-            and output_path.exists()
-            and overview_path_for(output_path).exists()
-        ):
+        if not OVERWRITE and output_path.exists() and has_internal_overviews(output_path):
             print(f"Skipping existing output: {output_path}")
             continue
         pending_scenes.append(scene)
@@ -914,7 +844,7 @@ def main() -> None:
         max_workers=MAX_EXTRACTION_WORKERS,
     )
     # Create one reprojected GeoTIFF and overview for each scene.
-    completed_outputs: list[tuple[Path, Path]] = []
+    completed_outputs: list[tuple[Path, list[int]]] = []
     for scene in pending_scenes:
         output_path = output_path_for_scene(output_dir, scene)
         # A raster may already exist when an earlier run stopped before its
@@ -926,13 +856,13 @@ def main() -> None:
                 output_crs=OUTPUT_CRS,
                 overwrite=OVERWRITE,
             )
-        # Build and verify a separate ArcGIS-compatible external overview.
-        overview_path = build_external_overviews(output_path, OVERWRITE)
+        # Embed nearest-neighbour pyramids inside the GeoTIFF (no .ovr sidecar).
+        levels = build_internal_overviews(output_path, OVERWRITE)
         # Preserve the generated paths for the final concise run summary.
-        completed_outputs.append((output_path, overview_path))
+        completed_outputs.append((output_path, levels))
     # Print every completed deliverable.
-    for output_path, overview_path in completed_outputs:
-        print(f"Complete. Raster: {output_path}\nComplete. Pyramid: {overview_path}")
+    for output_path, levels in completed_outputs:
+        print(f"Complete. Raster with internal pyramid {levels}: {output_path}")
 
 
 # Run the workflow only when this file is executed, not when imported for tests.
