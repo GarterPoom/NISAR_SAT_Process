@@ -1,3 +1,30 @@
+"""
+NISAR_Download.py
+
+Search NASA's ASF (Alaska Satellite Facility) catalog for NISAR granules that
+intersect the area of interest (the Thailand admin shapefile) within a date range,
+and download *every* file of each granule: the main HDF5 product plus all metadata
+(QA_STATS.h5, ISO XML, JSON/YAML, QA reports) and visualizations (PNG browse
+images, KML footprints). All files of one granule are saved together in
+``<OUTPUT_DIRECTORY>/<granule_id>/``.
+
+Unlike NISAR_Download_Track_Frame.py, no Track/Frame filter is applied: every
+granule over the AOI that matches the product level, frame coverage and
+polarization mode settings in ``Config`` is downloaded.
+
+Downloads run in a bounded thread pool, resume from ``.part`` files, retry with
+exponential back-off, and abort persistently slow transfers so they can be retried.
+
+Requirements:
+    pip install asf_search tqdm requests geopandas shapely python-dotenv
+
+Credentials:
+    Copy .env.example to .env and set EARTHDATA_USERNAME and
+    EARTHDATA_PASSWORD there before running the script. ".env" is git-ignored.
+
+Usage:
+    python NISAR_Download.py
+"""  # End of module-level docstring: describes the whole script.
 # --------------------------------------------------------------------------- #
 # Imports – each import gets a short comment describing its purpose.
 # --------------------------------------------------------------------------- #
@@ -56,6 +83,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     DATE_MODE = 1
     START_DATE = datetime.strptime("2026-09-30", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
     END_DATE = datetime.strptime("2026-10-01", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    # Number of days to look back when DATE_MODE is 2.
     DATE_LOOKBACK_DAYS = 10
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
@@ -196,11 +224,14 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
     Exits:
         If authentication fails.
     """
+    # Check that both Earthdata credentials were loaded from .env.
     if not username or not password:
+        # Log an error explaining how to supply the missing credentials.
         logging.error(
             "NASA Earthdata credentials are missing. Set EARTHDATA_USERNAME "
             "and EARTHDATA_PASSWORD in the .env file (see .env.example)."
         )
+        # Stop the script with a failure status code.
         sys.exit(1)
 
     session = asf.ASFSession()  # Create an unauthenticated ASFSession instance.
@@ -334,11 +365,14 @@ def normalize_polarization_mode(polarization_mode: str | None) -> str | None:  #
     Raises:
         ValueError: If the value is not SH, DH, ANY, or None.
     """
+    # None, empty or ANY means keep every mode.
     if polarization_mode is None or str(polarization_mode).strip().upper() in ("", "ANY"):
         return None  # No polarization filtering requested.
     mode = str(polarization_mode).strip().upper()  # Normalize case and whitespace.
+    # Only SH and DH are supported.
     if mode not in ("SH", "DH"):
         raise ValueError("POLARIZATION_MODE must be 'SH', 'DH', or None.")  # Reject unsupported modes early.
+    # Return the validated mode code.
     return mode
 
 
@@ -356,23 +390,33 @@ def polarization_mode_from_filename(filename: str) -> str | None:  # Read the mo
 PRIVATE_JPL_BUCKET = "/NISAR-JPL-PRIVATE-DATA/"
 
 
+# Collect all download URLs for one ASF product.
 def get_product_urls(product: asf.ASFProduct) -> list[str]:
     """Return every HTTPS URL ASF lists for one product.
 
     Covers the main HDF5 file plus ``additionalUrls`` (QA_STATS, ISO XML,
     KML, JSON/YAML metadata, QA reports) and browse images (PNG).
     """
+    # Newer asf_search versions provide find_urls().
     if hasattr(product, "find_urls"):
+        # Use the library helper to gather every URL.
         urls = list(product.find_urls())
     else:  # Older asf_search versions without ASFProduct.find_urls().
+        # Fall back to the raw product properties.
         properties = product.properties
+        # Start with the main product URL.
         urls = [properties.get("url")]
+        # Add metadata/QA URLs, if any.
         urls.extend(properties.get("additionalUrls") or [])
+        # Browse images may be a string or a list.
         browse = properties.get("browse") or []
+        # Normalize browse to a list and add it.
         urls.extend([browse] if isinstance(browse, str) else browse)
+    # Drop empty/None URLs.
     return [url for url in urls if url]
 
 
+# Group search results into per-granule URL lists.
 def group_granule_urls(
     results: asf.ASFSearchResults,
     polarization_mode: str | None = None,
@@ -396,62 +440,100 @@ def group_granule_urls(
         Gracefully (status 0) if no matching granules are found.
     """
     polarization_mode = normalize_polarization_mode(polarization_mode)  # Validate the requested mode.
+    # Accumulator: granule ID -> list of file URLs.
     granule_urls: dict[str, list[str]] = {}
+    # Counter of all URLs seen across all products.
     total_urls = 0
 
+    # Iterate over every product in the search results.
     for product in results:
+        # Use sceneName, falling back to fileID, as the granule ID.
         granule_id = product.properties.get("sceneName") or product.properties.get("fileID")
+        # Skip results with no usable identifier.
         if not granule_id:
+            # Warn about the unidentifiable result.
             logging.warning("Skipping a search result without a sceneName/fileID.")
+            # Move on to the next product.
             continue
+        # Strip an HDF5 extension if the ID includes one.
         if granule_id.lower().endswith((".h5", ".hdf5")):
+            # Keep only the base name without extension.
             granule_id = os.path.splitext(granule_id)[0]
+        # Apply the optional polarization filter.
         if polarization_mode and polarization_mode_from_filename(granule_id) != polarization_mode:
             continue  # Skip products acquired in a different polarization mode.
         if granule_id in granule_urls:  # Same granule returned twice – nothing new to add.
+            # Move on to the next product.
             continue
 
+        # URLs kept for this granule.
         urls: list[str] = []
+        # Filenames already kept, used for de-duplication.
         seen_filenames: set[str] = set()
+        # Iterate over every URL ASF lists for this product.
         for url in get_product_urls(product):
+            # Count every URL for the summary log.
             total_urls += 1
+            # Extract the decoded filename from the URL.
             filename = filename_from_url(url)
+            # Keep only HTTPS links whose filename belongs to this granule.
             if not url.lower().startswith("https://") or not filename.startswith(granule_id):
                 continue  # Not a granule file (e.g. the s3credentials endpoint).
+            # Skip JPL-private files unless explicitly enabled.
             if PRIVATE_JPL_BUCKET in url and not include_private_files:
+                # Move on to the next URL.
                 continue
+            # Skip duplicate filenames.
             if filename in seen_filenames:
+                # Move on to the next URL.
                 continue
+            # Remember this filename.
             seen_filenames.add(filename)
+            # Keep this URL for the granule.
             urls.append(url)
 
+        # Check that the main HDF5 product is among the URLs.
         has_main_hdf5 = any(
             filename_from_url(url).lower() in (f"{granule_id}.h5".lower(), f"{granule_id}.hdf5".lower())
             for url in urls
         )
+        # Without the main HDF5 the granule is unusable.
         if not has_main_hdf5:
+            # Warn that the granule is being skipped.
             logging.warning(f"Skipping {granule_id}: ASF lists no main HDF5 file for it.")
+            # Move on to the next product.
             continue
+        # Store the granule's URL list.
         granule_urls[granule_id] = urls
 
+    # Total number of files selected across all granules.
     file_count = sum(len(urls) for urls in granule_urls.values())
+    # Summarize how many granules and files were selected from all URLs.
     logging.info(
         f"Selected {len(granule_urls)} granule(s) with {file_count} file(s) out of {total_urls} "
         f"total URLs (polarization mode: {polarization_mode or 'ANY'})."
     )
 
+    # Nothing matched the filters.
     if not granule_urls:
+        # Warn that there is nothing to download.
         logging.warning("No matching NISAR granules found in search results. Exiting script.")
+        # Exit cleanly (status 0) since this is not an error.
         sys.exit(0)
 
+    # Cap the number of granules when MAX_DOWNLOADS is set.
     if Config.MAX_DOWNLOADS is not None and len(granule_urls) > Config.MAX_DOWNLOADS:
         logging.info(  # Announce the truncation so log readers understand why fewer granules are downloaded than were found.
             f"Limiting download list from {len(granule_urls)} to the configured maximum of {Config.MAX_DOWNLOADS} granule(s)."
         )
+        # Keep only the first MAX_DOWNLOADS granules.
         granule_urls = dict(list(granule_urls.items())[:Config.MAX_DOWNLOADS])
 
+    # Log each granule with its file count.
     for granule_id, urls in granule_urls.items():
+        # One indented line per granule.
         logging.info(f"  {granule_id}: {len(urls)} file(s)")
+    # Return the per-granule URL mapping.
     return granule_urls
 
 # --------------------------------------------------------------------------- #
@@ -493,6 +575,7 @@ def filename_from_url(url: str) -> str:
     return unquote(os.path.basename(urlparse(url).path))  # Strip URL metadata and decode escaped filename characters.
 
 
+# Parse the total size from a Content-Range header.
 def content_range_total(content_range: str | None) -> int | None:
     """Extract the total object size from an HTTP ``Content-Range`` header.
 
@@ -506,6 +589,7 @@ def content_range_total(content_range: str | None) -> int | None:
     return int(total_text) if total_text.isdigit() else None  # Convert only a valid numeric size to avoid malformed-header failures.
 
 
+# Determine the full remote file size of a response.
 def response_total_bytes(response: requests.Response) -> int | None:
     """Return the remote object's full byte count when the server exposes it.
 
@@ -518,12 +602,14 @@ def response_total_bytes(response: requests.Response) -> int | None:
     Returns:
         Full remote object size in bytes, or ``None`` when it is unavailable.
     """
+    # Partial (206) responses report the total in Content-Range.
     if response.status_code == requests.codes.partial_content:
         return content_range_total(response.headers.get("Content-Range"))  # A 206 response needs its complete size from Content-Range.
     content_length = response.headers.get("Content-Length")  # Read the full-response payload size provided by the server.
     return int(content_length) if content_length and content_length.isdigit() else None  # Accept only a numeric length.
 
 
+# Create a function that hands each download thread its own authenticated HTTP session.
 def make_worker_session_factory(authenticated_session: asf.ASFSession):
     """Build a getter that lazily creates one authenticated session per thread.
 
@@ -541,9 +627,12 @@ def make_worker_session_factory(authenticated_session: asf.ASFSession):
     cookies = copy.deepcopy(authenticated_session.cookies)  # Preserve authentication cookies without sharing a mutable cookie jar.
     thread_local = threading.local()  # Store a distinct session attribute for each download thread.
 
+    # Return this thread's session, creating it on first use.
     def get_worker_session() -> requests.Session:
         """Return the calling thread's session, creating it on first use."""
+        # Look for a session already created by this thread.
         worker_session = getattr(thread_local, "session", None)
+        # First call from this thread: build its private session.
         if worker_session is None:
             worker_session = requests.Session()  # Start an isolated connection pool for this worker.
             worker_session.headers.update(headers)  # Apply the authenticated session's request headers.
@@ -555,10 +644,12 @@ def make_worker_session_factory(authenticated_session: asf.ASFSession):
     return get_worker_session  # Provide the lazy getter to the thread-pool coordinator.
 
 
+# Custom error for persistently slow downloads (retried like a connection error).
 class SlowDownloadError(requests.ConnectionError):
     """Raised when a transfer remains below the configured useful speed."""
 
 
+# Download (or resume) one file into output_directory, verifying its final size.
 def download_single_file(url: str, output_directory: str, get_worker_session, progress_position: int) -> None:
     """Download one file, resume a valid partial transfer, and finalize safely.
 
@@ -583,46 +674,60 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
     starting_bytes = os.path.getsize(partial_path) if os.path.exists(partial_path) else 0  # Detect resumable data already written.
     headers = {"Range": f"bytes={starting_bytes}-"} if starting_bytes else {}  # Request only missing bytes when a partial file exists.
 
+    # Send the GET request with streaming so large files are not held in memory.
     with get_worker_session().get(
         url,
         headers=headers,
         stream=True,
         timeout=(Config.DOWNLOAD_CONNECT_TIMEOUT, Config.DOWNLOAD_READ_TIMEOUT),
     ) as response:
+        # 416: requested range is beyond the end of the file.
         if response.status_code == requests.codes.requested_range_not_satisfiable:
             total_bytes = content_range_total(response.headers.get("Content-Range"))  # Determine whether the local partial already has all bytes.
+            # The .part file is already complete.
             if total_bytes is not None and starting_bytes == total_bytes:
                 os.replace(partial_path, destination_path)  # Atomically finalize the already-complete partial file.
                 return  # No additional network transfer is required.
+            # Otherwise truncate the corrupt .part file.
             with open(partial_path, "wb"):
                 pass  # Reset an invalid partial so the retry starts cleanly instead of repeating the same rejected range.
+            # Raise so the retry loop starts again from byte 0.
             raise IOError(
                 f"Server rejected resume at byte {starting_bytes}; partial file was reset"
             )
         response.raise_for_status()  # Propagate non-success responses to the retry wrapper.
 
         append = starting_bytes > 0 and response.status_code == requests.codes.partial_content  # Append only when the server honored the range request.
+        # Verify the resumed range starts at the expected byte.
         if append:
             content_range = response.headers.get("Content-Range", "")  # Read the range actually returned by the server.
             match = re.match(r"bytes\s+(\d+)-", content_range, re.IGNORECASE)  # Parse the returned segment's first byte.
+            # Range is missing or does not match our offset.
             if not match or int(match.group(1)) != starting_bytes:
+                # Otherwise truncate the corrupt .part file.
                 with open(partial_path, "wb"):
                     pass  # Discard a partial that cannot be matched safely to the returned remote range.
+                # Raise so the retry loop starts again from byte 0.
                 raise IOError(
                     f"Unexpected Content-Range while resuming: {content_range!r}; partial file was reset"
                 )
+        # Server ignored the Range header and sent the full file (200).
         elif starting_bytes:
             logging.warning("%s ignored its range request; restarting its partial download.", filename)  # Record that the server sent the entire object instead.
             starting_bytes = 0  # Reset progress because the partial file will be overwritten.
 
         total_bytes = response_total_bytes(response)  # Obtain the complete expected object size when the server sends it.
+        # Local partial file larger than the remote object means corruption.
         if total_bytes is not None and starting_bytes > total_bytes:
+            # Otherwise truncate the corrupt .part file.
             with open(partial_path, "wb"):
                 pass  # Clear a corrupt or stale partial so the next attempt can fetch the current remote object.
+            # Raise so the retry loop starts again from byte 0.
             raise IOError(
                 f"Partial file is larger than server object ({starting_bytes} > {total_bytes} bytes); partial file was reset"
             )
 
+        # Open the .part file (append or overwrite) and a progress bar together.
         with open(partial_path, "ab" if append else "wb") as output_file, tqdm(
             total=total_bytes,
             initial=starting_bytes,
@@ -636,34 +741,46 @@ def download_single_file(url: str, output_directory: str, get_worker_session, pr
         ) as progress_bar:
             speed_window_started = time.monotonic()  # Start a rolling measurement for detecting a connection that only trickles data.
             speed_window_bytes = 0  # Count bytes received during the current slow-speed window.
+            # Read the response body in fixed-size chunks.
             for chunk in response.iter_content(chunk_size=Config.DOWNLOAD_CHUNK_SIZE):
+                # Skip empty keep-alive chunks.
                 if chunk:
                     output_file.write(chunk)  # Persist this non-empty streamed block to disk.
                     progress_bar.update(len(chunk))  # Advance the visual progress indicator by the written byte count.
+                    # Add the chunk size to the speed window.
                     speed_window_bytes += len(chunk)
 
+                    # Seconds elapsed in the current speed window.
                     elapsed = time.monotonic() - speed_window_started
+                    # True once all expected bytes have arrived.
                     transfer_complete = total_bytes is not None and progress_bar.n >= total_bytes
+                    # Check throughput once the speed window is long enough and the transfer is not finished.
                     if (
                         Config.DOWNLOAD_MIN_SPEED > 0
                         and elapsed >= Config.DOWNLOAD_SPEED_WINDOW
                         and not transfer_complete
                     ):
+                        # Average bytes per second over the window.
                         average_speed = speed_window_bytes / elapsed
+                        # Throughput is below the configured minimum.
                         if average_speed < Config.DOWNLOAD_MIN_SPEED:
+                            # Abort this attempt so it can be retried.
                             raise SlowDownloadError(
                                 f"Sustained speed {average_speed / 1024:.1f} KiB/s is below "
                                 f"the {Config.DOWNLOAD_MIN_SPEED / 1024:.1f} KiB/s limit"
                             )
                         speed_window_started = time.monotonic()  # Begin a fresh window after acceptable sustained throughput.
+                        # Start a new speed-measurement window.
                         speed_window_bytes = 0
 
     downloaded_bytes = os.path.getsize(partial_path)  # Inspect the complete temporary file after the response closes.
+    # Verify that the full file was received.
     if total_bytes is not None and downloaded_bytes != total_bytes:
         raise IOError(f"Incomplete download: {downloaded_bytes} of {total_bytes} bytes received")  # Keep the partial file available for a later resume.
     os.replace(partial_path, destination_path)  # Atomically expose a verified file at its final path.
 
 
+# Download one file, retrying with exponential back-off on network or I/O errors.
 def download_with_retries(url: str, output_directory: str, get_worker_session, progress_position: int) -> str:
     """Retry one resumable download with exponential backoff between attempts.
 
@@ -683,17 +800,21 @@ def download_with_retries(url: str, output_directory: str, get_worker_session, p
         RuntimeError: If every configured transfer attempt fails.
     """
     filename = filename_from_url(url)  # Retain a readable product name for return values and log messages.
+    # Loop over the allowed number of attempts.
     for attempt in range(1, Config.DOWNLOAD_MAX_ATTEMPTS + 1):
+        # Try one download attempt.
         try:
             download_single_file(url, output_directory, get_worker_session, progress_position)  # Perform or resume the transfer.
             return filename  # Report success to the future monitored by the coordinator.
         except (requests.RequestException, OSError, ValueError) as error:
+            # Last attempt failed: give up.
             if attempt == Config.DOWNLOAD_MAX_ATTEMPTS:
                 raise RuntimeError(f"{filename} failed after {attempt} attempts: {error}") from error  # Surface the final failure with its original cause.
             wait_seconds = min(
                 Config.DOWNLOAD_MAX_BACKOFF,
                 Config.DOWNLOAD_RETRY_BACKOFF * (2 ** (attempt - 1)),
             )  # Double the delay after each failure, but keep it within the configured cap.
+            # Warn about the failed attempt and how long the script will wait before retrying.
             logging.warning(
                 "%s failed on attempt %d/%d: %s. Retrying in %d seconds.",
                 filename, attempt, Config.DOWNLOAD_MAX_ATTEMPTS, error, wait_seconds,
@@ -710,9 +831,13 @@ def to_long_path(path: str) -> str:
     NISAR granule IDs are ~90 characters and appear in both the staging folder
     and the file names, so full paths easily exceed MAX_PATH on Windows.
     """
+    # Resolve the path to an absolute path.
     absolute_path = os.path.abspath(path)
+    # On Windows, add the long-path prefix if it is not already present.
     if os.name == "nt" and not absolute_path.startswith("\\\\?\\"):
+        # The prefix bypasses the 260-character MAX_PATH limit.
         return "\\\\?\\" + absolute_path
+    # Other platforms: return the absolute path unchanged.
     return absolute_path
 
 # --------------------------------------------------------------------------- #
@@ -737,35 +862,56 @@ def download_granule(
     Raises:
         RuntimeError: If any file of the granule could not be downloaded.
     """
+    # Per-granule folder path (long-path safe on Windows).
     granule_directory = to_long_path(os.path.join(output_directory, granule_id))
+    # Create the granule folder if needed.
     os.makedirs(granule_directory, exist_ok=True)
 
+    # Filenames that failed to download for this granule.
     failed_files: list[str] = []
+    # Process each file of the granule.
     for url in urls:
+        # Extract the decoded filename from the URL.
         filename = filename_from_url(url)
+        # Final path of the file in the granule folder.
         destination_path = os.path.join(granule_directory, filename)
+        # File already downloaded in a previous run.
         if os.path.isfile(destination_path):
+            # Report that this file is skipped.
             logging.info("File already exists, skipping: %s", filename)
+            # Move on to the next file.
             continue
 
         # Reuse a loose file left in the output folder by earlier versions of this script.
         legacy_path = to_long_path(os.path.join(output_directory, filename))
+        # A loose copy from an older version of this script exists in the output folder.
         if os.path.isfile(legacy_path):
+            # Report that the earlier download is reused.
             logging.info("Reusing previously downloaded file: %s", filename)
+            # Move it into the granule folder.
             os.replace(legacy_path, destination_path)
+            # Move on to the next file.
             continue
 
+        # Try to download this file.
         try:
+            # Download the file into the granule folder, retrying on failure.
             download_with_retries(url, granule_directory, get_worker_session, progress_position)
+            # Report the completed file.
             logging.info("Successfully finished downloading file: %s", filename)
         except Exception as file_error:
+            # Record the failed filename.
             failed_files.append(filename)
+            # Log the failure and continue with the granule's other files.
             logging.error("Failed to download %s: %s", filename, file_error)
 
+    # At least one file of this granule failed.
     if failed_files:
+        # Raise a final error describing the failure.
         raise RuntimeError(
             f"{len(failed_files)} file(s) failed. Downloaded files are kept for the next run."
         )
+    # Return the granule folder path (without the Windows long-path prefix).
     return os.path.abspath(os.path.join(output_directory, granule_id))
 
 
@@ -782,28 +928,42 @@ def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granul
     granule is logged without preventing unrelated granules from completing.
     """
     os.makedirs(output_directory, exist_ok=True)  # Ensure the requested local destination is ready for file output.
+    # Log the absolute download directory.
     logging.info(f"Data download directory: {os.path.abspath(output_directory)}")
+    # Log how many granules will be downloaded and with how many threads.
     logging.info(
         "Starting download of %d granule(s) with at most %d worker threads.",
         len(granule_urls), Config.DOWNLOAD_WORKERS,
     )
 
     get_worker_session = make_worker_session_factory(session)  # Create a thread-local authenticated-session provider.
+    # Granules that still have at least one file to download.
     pending_granules: list[tuple[str, list[str]]] = []
+    # Counter of granules already complete before this run.
     skipped_granules = 0
+    # Check each granule to see whether it is already complete.
     for granule_id, urls in granule_urls.items():
+        # Per-granule folder path (long-path safe on Windows).
         granule_directory = to_long_path(os.path.join(output_directory, granule_id))
+        # Check whether every file of this granule already exists.
         if all(os.path.isfile(os.path.join(granule_directory, filename_from_url(url))) for url in urls):
+            # Report that the complete granule is skipped.
             logging.info("All files already downloaded, skipping granule: %s", granule_id)
+            # Count it as skipped.
             skipped_granules += 1
         else:
+            # Queue the granule for download.
             pending_granules.append((granule_id, urls))
 
+    # Counter of granules fully downloaded in this run.
     downloaded_granules = 0
+    # Counter of granules with at least one failed file.
     failed_granules = 0
     tqdm.set_lock(threading.RLock())  # Serialize progress-bar output from simultaneous worker threads.
     worker_count = min(Config.DOWNLOAD_WORKERS, len(pending_granules))  # Do not create more workers than pending granules.
+    # Start the thread pool only when there is something to download.
     if worker_count:
+        # Run up to worker_count granule downloads in parallel.
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="nisar-download") as executor:
             futures = {
                 executor.submit(
@@ -817,15 +977,22 @@ def download_granules_with_thread_pool(  # Coordinate bounded, concurrent granul
                 for index, (granule_id, urls) in enumerate(pending_granules)
             }
             for future in as_completed(futures):  # Process granules in completion order.
+                # Look up which granule this finished job belongs to.
                 granule_id = futures[future]
+                # Collect the job result; a worker error is raised here.
                 try:
                     granule_path = future.result()  # Re-raise any worker exception in the coordinating thread.
+                    # All files succeeded: count the granule as downloaded.
                     downloaded_granules += 1
+                    # Report the finished granule folder.
                     logging.info("Granule complete: %s", granule_path)
                 except Exception as granule_error:
+                    # Count the granule as failed.
                     failed_granules += 1
+                    # Log the failed granule and continue with the others.
                     logging.error("Failed granule %s: %s", granule_id, granule_error)
 
+    # Log the final downloaded / skipped / failed granule counts.
     logging.info(
         "Download complete. Summary -> "
         f"Downloaded: {downloaded_granules}, Already complete: {skipped_granules}, Failed: {failed_granules}"
@@ -838,8 +1005,10 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
     """Run the full search-and-download workflow using Config settings."""
     setup_logging(Config.LOG_DIRECTORY)  # Set up logging before anything else runs.
 
+    # Validate the configured dates before searching.
     try:
         normalize_polarization_mode(Config.POLARIZATION_MODE)  # Fail fast on an invalid polarization mode.
+        # Compute the start/end dates from the configured mode.
         start_date, end_date = resolve_date_range(
             Config.DATE_MODE,
             Config.START_DATE,
@@ -847,7 +1016,9 @@ def main() -> None:  # Run the full search-and-download workflow using Config se
             Config.DATE_LOOKBACK_DAYS,
         )
     except ValueError as date_error:
+        # Log the configuration problem.
         logging.error("Invalid configuration: %s", date_error)
+        # Stop the script with a failure status code.
         sys.exit(1)
 
     session = authenticate_earthdata(Config.EARTHDATA_USERNAME, Config.EARTHDATA_PASSWORD)  # Log in to Earthdata.

@@ -93,8 +93,11 @@ OUTPUT_CRS = "EPSG:4326"
 
 # Optional settings. These can normally remain unchanged.
 EXTRACTED_DIR: Path | None = None
+# Source CRS to use when the HDF5 file does not state one (None = read it from the file).
 SOURCE_CRS: str | None = None
+# Search subfolders of INPUT_DIR for SME2 files as well.
 RECURSIVE = True
+# Replace existing outputs instead of skipping them.
 OVERWRITE = False
 # Limit extraction concurrency because each worker holds a complete HDF5 raster
 # plus working arrays in memory.  Two workers is deliberately conservative for
@@ -102,6 +105,7 @@ OVERWRITE = False
 MAX_EXTRACTION_WORKERS = 2
 
 
+# Immutable record describing one SME2 scene found on disk.
 @dataclass(frozen=True)
 class Scene:
     """Describe one NISAR SME2 input scene.
@@ -129,6 +133,7 @@ class Scene:
     orbit_direction: str
 
 
+# Read the acquisition start and end times from a NISAR filename.
 def parse_nisar_interval(filename: str) -> tuple[datetime, datetime]:
     """Parse the standard start/end acquisition timestamps from a filename.
 
@@ -166,6 +171,7 @@ def parse_nisar_interval(filename: str) -> tuple[datetime, datetime]:
     return acquisition_start, acquisition_end
 
 
+# Read the orbit pass direction (Ascending/Descending) from the HDF5 metadata.
 def read_orbit_direction(hdf5_path: Path) -> str:
     """Read and normalize a scene's orbit-pass direction for its output metadata."""
 
@@ -174,6 +180,7 @@ def read_orbit_direction(hdf5_path: Path) -> str:
         # Require the standard NISAR metadata path rather than inferring a pass
         # from a filename or geographic footprint.
         if ORBIT_DIRECTION_PATH not in hdf5_file:
+            # Fail clearly when the orbit direction metadata is missing.
             raise KeyError(
                 f"Missing required orbit direction metadata "
                 f"{ORBIT_DIRECTION_PATH} in {hdf5_path}."
@@ -189,6 +196,7 @@ def read_orbit_direction(hdf5_path: Path) -> str:
     }
     # Reject unexpected metadata rather than recording a wrong orbit pass.
     if normalized not in direction_by_value:
+        # Fail clearly when the orbit direction is neither Ascending nor Descending.
         raise ValueError(
             f"Unrecognized orbit pass direction {raw_direction!r} in {hdf5_path}; "
             "expected Ascending or Descending."
@@ -197,6 +205,7 @@ def read_orbit_direction(hdf5_path: Path) -> str:
     return direction_by_value[normalized]
 
 
+# Find every SME2 HDF5 file in the input folder and describe it as a Scene.
 def discover_scenes(
     input_dir: Path,
     recursive: bool,
@@ -253,6 +262,7 @@ def discover_scenes(
     return scenes
 
 
+# Convert an HDF5 attribute (bytes, arrays of one item) into a plain Python value.
 def decode_hdf5_value(value: Any) -> Any:
     """Convert common HDF5 scalar wrappers and byte strings to Python values."""
 
@@ -268,6 +278,7 @@ def decode_hdf5_value(value: Any) -> Any:
     return value
 
 
+# Try to build a CRS from one HDF5 metadata value (EPSG code, WKT or proj string).
 def crs_from_candidate(value: Any) -> CRS | None:
     """Try to construct a Rasterio CRS from one HDF5 metadata value."""
 
@@ -307,6 +318,7 @@ def crs_from_candidate(value: Any) -> CRS | None:
         return None
 
 
+# Determine the native CRS of the soil-moisture grid from the HDF5 metadata.
 def read_source_crs(
     grid_group: h5py.Group,
     soil_dataset: h5py.Dataset,
@@ -394,6 +406,7 @@ def read_source_crs(
     )
 
 
+# Read one coordinate axis (x or y) of the grid as a 1-D array.
 def read_coordinate_vector(grid_group: h5py.Group, name: str) -> np.ndarray:
     """Read and validate a finite, regular, one-dimensional coordinate vector."""
 
@@ -427,6 +440,7 @@ def read_coordinate_vector(grid_group: h5py.Group, name: str) -> np.ndarray:
     return coordinates
 
 
+# Collect every fill/NoData value that the dataset declares.
 def dataset_fill_values(dataset: h5py.Dataset) -> list[float]:
     """Collect numeric HDF5 fill-value attributes in addition to 0 and -9999."""
 
@@ -456,6 +470,7 @@ def dataset_fill_values(dataset: h5py.Dataset) -> list[float]:
     return list(dict.fromkeys(fill_values))
 
 
+# Mark pixels as valid when they are finite and not equal to any fill value.
 def make_valid_mask(values: np.ndarray, fill_values: Sequence[float]) -> np.ndarray:
     """Return True only for finite pixels unequal to every configured fill value."""
 
@@ -469,6 +484,7 @@ def make_valid_mask(values: np.ndarray, fill_values: Sequence[float]) -> np.ndar
     return valid
 
 
+# Return the GeoTIFF creation options shared by all output rasters.
 def native_tiff_profile(width: int, height: int) -> dict[str, Any]:
     """Return compression and tiling options valid for a raster of this size."""
 
@@ -494,6 +510,7 @@ def native_tiff_profile(width: int, height: int) -> dict[str, Any]:
     return profile
 
 
+# Extract one scene's soil-moisture layer into a native-grid GeoTIFF.
 def extract_scene(
     scene: Scene,
     extracted_dir: Path,
@@ -620,6 +637,7 @@ def extract_scene(
     return output_path
 
 
+# Extract several scenes at the same time with a capped thread pool.
 def extract_scenes_parallel(
     scenes: Sequence[Scene],
     extracted_dir: Path,
@@ -637,20 +655,24 @@ def extract_scenes_parallel(
 
     # Reject a nonsensical setting before creating any worker threads.
     if max_workers < 1:
+        # Explain the invalid worker setting.
         raise ValueError("MAX_EXTRACTION_WORKERS must be at least 1.")
     # Do not create surplus threads when a run has only one scene.
     worker_count = min(max_workers, len(scenes))
     # Preserve an explicit empty result for callers that happen to pass none.
     if worker_count == 0:
+        # Nothing to extract.
         return {}
     # Retain outputs by their source path; callers restore chronological order.
     extracted_by_scene: dict[Path, Path] = {}
+    # Tell the user how many scenes will be extracted and how many workers run in parallel.
     print(f"Extracting {len(scenes)} scene(s) with {worker_count} worker(s) (memory capped).")
     # Each future performs one independent HDF5 read and one unique GeoTIFF write.
     with ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="nisar-extract",
     ) as executor:
+        # Submit one extraction job per scene and remember which scene each job belongs to.
         futures = {
             executor.submit(
                 extract_scene,
@@ -663,19 +685,26 @@ def extract_scenes_parallel(
         }
         # Surface worker exceptions in the main thread with their source context.
         for future in as_completed(futures):
+            # Look up which scene this finished job belongs to.
             scene = futures[future]
+            # Collect the job result; any worker error is raised here.
             try:
+                # Store the extracted GeoTIFF path for this scene.
                 extracted_by_scene[scene.hdf5_path] = future.result()
             except Exception as error:
                 # Cancel work that has not begun; already-running writes finish
                 # safely to their per-scene partial files before this exception
                 # leaves the executor context.
                 for pending_future in futures:
+                    # Cancel jobs that have not started yet.
                     pending_future.cancel()
+                # Stop the run and name the scene that failed.
                 raise RuntimeError(f"Extraction failed for {scene.hdf5_path}") from error
+    # Return the extracted raster path for every scene.
     return extracted_by_scene
 
 
+# Reproject a native-grid raster into the output CRS and write the final GeoTIFF.
 def reproject_to_output_crs(
     source_path: Path,
     output_path: Path,
@@ -688,24 +717,38 @@ def reproject_to_output_crs(
     it only relocates them onto a regular geographic grid. Nodata remains -9999.
     """
 
+    # Parse the requested output CRS.
     target_crs = CRS.from_user_input(output_crs)
+    # Refuse to overwrite a finished output unless OVERWRITE is enabled.
     if output_path.exists() and not overwrite:
+        # Explain how to allow replacing the existing file.
         raise FileExistsError(f"Output exists; set OVERWRITE = True to replace it: {output_path}")
+    # Write to a temporary ".partial.tif" first so a crash never leaves a half-written output.
     partial_path = output_path.with_name(output_path.name + ".partial.tif")
+    # Remove a temporary file left by an earlier interrupted run.
     partial_path.unlink(missing_ok=True)
+    # Open the native-grid raster produced by the extraction step.
     with rasterio.open(source_path) as source:
+        # A raster without a CRS cannot be reprojected.
         if source.crs is None:
+            # Stop with the name of the raster that has no CRS.
             raise ValueError(f"Native raster has no CRS: {source_path}")
         if source.crs == target_crs:
             # Copy rather than move: the extraction is retained for later runs.
             shutil.copyfile(source_path, output_path)
+            # Nothing more to do because the copy is already in the output CRS.
             return
+        # Compute the output grid (transform, width, height) that covers the source in the target CRS.
         transform, width, height = calculate_default_transform(
             source.crs, target_crs, source.width, source.height, *source.bounds
         )
+        # Start from the shared GeoTIFF creation options.
         profile = native_tiff_profile(width, height)
+        # Apply the new grid size, CRS and transform to the output profile.
         profile.update(width=width, height=height, crs=target_crs, transform=transform)
+        # Create the temporary output raster.
         with rasterio.open(partial_path, "w", **profile) as destination:
+            # Resample the soil-moisture band onto the output grid with nearest neighbour.
             reproject(
                 source=rasterio.band(source, 1),
                 destination=rasterio.band(destination, 1),
@@ -718,17 +761,22 @@ def reproject_to_output_crs(
                 resampling=Resampling.nearest,
                 init_dest_nodata=True,
             )
+            # Copy the source tags and record how the raster was reprojected.
             destination.update_tags(
                 **source.tags(),
                 native_source_crs=str(source.crs),
                 output_crs=str(target_crs),
                 reprojection_method="nearest neighbor",
             )
+            # Name the band so GIS software shows "soilMoisture".
             destination.set_band_description(1, "soilMoisture")
+    # Rename the finished temporary file to its final name in one step.
     os.replace(partial_path, output_path)
+    # Report the written raster and its CRS.
     print(f"Reprojected raster written: {output_path} ({target_crs})")
 
 
+# Compute the overview (pyramid) factors 2, 4, 8 ... for a raster of this size.
 def pyramid_levels(width: int, height: int) -> list[int]:
     """Return power-of-two overview factors suitable for ArcGIS display."""
 
@@ -750,6 +798,7 @@ def pyramid_levels(width: int, height: int) -> list[int]:
     return levels
 
 
+# Embed overview levels inside the GeoTIFF so it displays quickly when zoomed out.
 def build_internal_overviews(raster_path: Path, overwrite: bool) -> list[int]:
     """Build nearest-neighbour pyramids stored inside the GeoTIFF itself.
 
@@ -769,7 +818,9 @@ def build_internal_overviews(raster_path: Path, overwrite: bool) -> list[int]:
         raise ValueError(f"Raster is too small to build an overview: {raster_path}")
     # Leave an existing pyramid alone unless replacement was requested.
     if existing and not overwrite:
+        # Report the overview levels that are already there.
         print(f"Internal overviews already present: {raster_path} (levels: {existing})")
+        # Keep the existing overviews unchanged.
         return existing
     # Compress the embedded overview levels like the full-resolution band.
     with rasterio.Env(COMPRESS_OVERVIEW="DEFLATE", PREDICTOR_OVERVIEW="3"):
@@ -783,13 +834,17 @@ def build_internal_overviews(raster_path: Path, overwrite: bool) -> list[int]:
     return levels
 
 
+# Check whether a GeoTIFF already contains internal overviews.
 def has_internal_overviews(raster_path: Path) -> bool:
     """Return True when the GeoTIFF already contains embedded overviews."""
 
+    # Open the raster read-only.
     with rasterio.open(raster_path) as source:
+        # True when band 1 has at least one overview level.
         return bool(source.overviews(1))
 
 
+# Build the output GeoTIFF path for a scene (name includes date and orbit direction).
 def output_path_for_scene(output_dir: Path, scene: Scene) -> Path:
     """Return the GeoTIFF path for one scene, named after its HDF5 product."""
 
@@ -797,6 +852,7 @@ def output_path_for_scene(output_dir: Path, scene: Scene) -> Path:
     return output_dir / f"{scene.hdf5_path.stem}_soilMoisture.tif"
 
 
+# Main workflow: find scenes, extract, reproject and add overviews.
 def main() -> None:
     """Run scene discovery, extraction, reprojection, and pyramid creation."""
 
@@ -823,11 +879,17 @@ def main() -> None:
         raise FileNotFoundError(f"No NISAR SME2 HDF5 files found in {INPUT_DIR}.")
     # Leave finished products alone unless replacement was explicitly requested.
     pending_scenes = []
+    # Check each scene to see whether its output is already finished.
     for scene in scenes:
+        # Work out where this scene's output would be written.
         output_path = output_path_for_scene(output_dir, scene)
+        # A finished output with overviews already exists and must not be replaced.
         if not OVERWRITE and output_path.exists() and has_internal_overviews(output_path):
+            # Tell the user this scene is skipped.
             print(f"Skipping existing output: {output_path}")
+            # Move on to the next scene.
             continue
+        # Queue this scene for processing.
         pending_scenes.append(scene)
     # Report the workload before lengthy extraction begins.
     print(
@@ -845,11 +907,14 @@ def main() -> None:
     )
     # Create one reprojected GeoTIFF and overview for each scene.
     completed_outputs: list[tuple[Path, list[int]]] = []
+    # Produce the final raster for each queued scene.
     for scene in pending_scenes:
+        # Work out where this scene's output is written.
         output_path = output_path_for_scene(output_dir, scene)
         # A raster may already exist when an earlier run stopped before its
         # overview was built; in that case only the overview is still missing.
         if OVERWRITE or not output_path.exists():
+            # Reproject the extracted native-grid raster to the output CRS.
             reproject_to_output_crs(
                 source_path=extracted_by_scene[scene.hdf5_path],
                 output_path=output_path,
@@ -862,6 +927,7 @@ def main() -> None:
         completed_outputs.append((output_path, levels))
     # Print every completed deliverable.
     for output_path, levels in completed_outputs:
+        # Print the output path and its overview levels.
         print(f"Complete. Raster with internal pyramid {levels}: {output_path}")
 
 
