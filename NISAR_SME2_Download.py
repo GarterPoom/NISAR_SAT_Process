@@ -256,6 +256,7 @@ def make_worker_session_factory(authenticated_session: asf.ASFSession):  # Build
     thread_local = threading.local()  # Hold one private session for each executor thread.
 
     def get_worker_session() -> requests.Session:  # Return a cached session for the calling thread.
+        """Return the calling thread's authenticated session, creating it on first use."""
         worker_session = getattr(thread_local, "session", None)  # Look up only this thread's prior session.
         if worker_session is None:  # Create a session lazily the first time this thread needs one.
             worker_session = requests.Session()  # Give the thread its own connection pool and mutable state.
