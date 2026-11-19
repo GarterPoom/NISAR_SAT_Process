@@ -276,6 +276,7 @@ def format_elapsed_time(elapsed_seconds: float) -> str:
     # Return a fixed-width duration that remains readable for batches longer than one hour.
     return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
 
+# Configure logging to both the terminal and a timestamped log file.
 def setup_logger(log_directory: Path) -> logging.Logger:
     """
     Configures and initializes the logging system.
@@ -303,15 +304,22 @@ def setup_logger(log_directory: Path) -> logging.Logger:
 
     # Add a StreamHandler (for terminal output) and a FileHandler (for file output)
     for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_path, encoding="utf-8")):
+        # Let each handler pass every message from DEBUG level upward.
         handler.setLevel(logging.DEBUG)
+        # Apply the shared timestamp format to this handler.
         handler.setFormatter(formatter)
+        # Attach the handler so messages go to the terminal and the log file.
         logger.addHandler(handler)
 
+    # Tell the user where the log file is written.
     logger.info("Log file: %s", log_path)
+    # Confirm that detailed logging is active.
     logger.info("Detailed terminal logging is enabled.")
+    # Return the configured logger to the caller.
     return logger
 
 
+# Build the GeoTIFF affine transform and CRS from the HDF5 grid coordinates.
 def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     """
     Converts HDF5 coordinate arrays into an Affine transform for GeoTIFF georeferencing.
@@ -328,18 +336,22 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     """
     # Extract coordinate arrays from the HDF5 file
     x_coordinates = grid["xCoordinates"]
+    # Northing (y) coordinate of every pixel row.
     y_coordinates = grid["yCoordinates"]
 
     # Validation: We need at least two points to calculate resolution (distance between points)
     if len(x_coordinates) < 2 or len(y_coordinates) < 2:
+        # Stop: pixel spacing cannot be computed from fewer than two coordinates.
         raise ValueError("xCoordinates and yCoordinates must each contain at least two values")
 
     # Calculate pixel resolution by finding the difference between adjacent coordinates
     x_resolution = float(x_coordinates[1] - x_coordinates[0])
+    # Pixel height (negative when rows run north to south).
     y_resolution = float(y_coordinates[1] - y_coordinates[0])
 
     # Prevent division by zero errors
     if x_resolution == 0 or y_resolution == 0:
+        # Stop: zero spacing would make an invalid transform.
         raise ValueError("Coordinate spacing cannot be zero")
 
     # Retrieve the projection information from the HDF5 attributes
@@ -353,9 +365,11 @@ def coordinate_transform(grid: h5py.Group) -> tuple[Affine, str]:
     transform = Affine(x_resolution, 0.0, float(x_coordinates[0]) - x_resolution / 2,
                        0.0, y_resolution, float(y_coordinates[0]) - y_resolution / 2)
 
+    # Return the transform and the CRS as an "EPSG:<code>" string.
     return transform, f"EPSG:{epsg_code}"
 
 
+# Check whether the grid already has TARGET_PIXEL_SIZE pixels on both axes.
 def grid_has_target_pixel_size(transform: Affine) -> bool:
     """
     Check whether a grid already has the required output pixel size.
@@ -380,6 +394,7 @@ def grid_has_target_pixel_size(transform: Affine) -> bool:
     )
 
 
+# Build the output profile that resamples the source grid to TARGET_PIXEL_SIZE square pixels.
 def target_grid_profile(profile: dict, transform: Affine, width: int, height: int) -> dict:
     """
     Create an exact 5 m square-pixel GeoTIFF profile covering the source grid.
@@ -397,6 +412,7 @@ def target_grid_profile(profile: dict, transform: Affine, width: int, height: in
     """
     # Native pixel sizes in map units (metres); abs() removes the sign of the axis direction.
     source_pixel_x = abs(transform.a)
+    # Source pixel height in metres.
     source_pixel_y = abs(transform.e)
     # Required output pixel size, held in a local name for readability in the formulas below.
     target_resolution = TARGET_PIXEL_SIZE
@@ -405,6 +421,7 @@ def target_grid_profile(profile: dict, transform: Affine, width: int, height: in
     # covers the full source footprint when it is not an exact multiple of 5 m.
     # Ground extent (pixels x native size) divided by the target size gives the new pixel count.
     target_width = math.ceil(width * source_pixel_x / target_resolution)
+    # Number of output rows needed to cover the source height.
     target_height = math.ceil(height * source_pixel_y / target_resolution)
     # Build the new transform: 5 m scale with the original sign (copysign) so north-up
     # rasters stay north-up, no shear terms (0.0), and the original origin (c, f) kept.
@@ -416,9 +433,11 @@ def target_grid_profile(profile: dict, transform: Affine, width: int, height: in
     target_profile = profile.copy()
     # Override only the geometry keys; compression, dtype, CRS and nodata carry over unchanged.
     target_profile.update({"width": target_width, "height": target_height, "transform": target_transform})
+    # Return the profile for the square-pixel output.
     return target_profile
 
 
+# Yield TILE_SIZE x TILE_SIZE windows that together cover the whole raster.
 def source_windows(height: int, width: int) -> Iterator[Window]:
     """
     A generator function that yields 'Window' objects for tiling.
@@ -444,6 +463,7 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
             yield Window(column_offset, row_offset, tile_width, tile_height)
 
 
+# Detect whether the file is GSLC or GCOV and return its grids group.
 def find_product_grids(product: h5py.File) -> tuple[str, h5py.Group]:
     """
     Detect whether an opened file is a GSLC or GCOV product and locate its grids group.
@@ -467,12 +487,15 @@ def find_product_grids(product: h5py.File) -> tuple[str, h5py.Group]:
     ]
     # A valid file contains exactly one product; zero means unsupported, several means ambiguous.
     if len(matches) != 1:
+        # Stop: the file is not a single GSLC or GCOV product.
         raise ValueError(f"Expected exactly one supported product; found {matches}")
     # Unpack the single match and return the type with the opened HDF5 group.
     product_type, path = matches[0]
+    # Return the product type and its HDF5 grids group.
     return product_type, product[path]
 
 
+# Translate a polarization (HH/HV) into the HDF5 dataset name for this product type.
 def dataset_name_for_polarization(product_type: str, polarization: str) -> str:
     """
     Map a requested channel to its product-specific HDF5 dataset name.
@@ -489,14 +512,17 @@ def dataset_name_for_polarization(product_type: str, polarization: str) -> str:
     """
     # GSLC stores each complex channel under its plain polarization name (e.g. "HH").
     if product_type == "GSLC":
+        # GSLC stores each channel under its own name, e.g. "HH".
         return polarization
     # GCOV stores diagonal covariance terms, named by repeating the channel (HH -> "HHHH").
     if product_type == "GCOV":
+        # GCOV stores diagonal covariance terms, e.g. "HHHH".
         return polarization * 2
     # Any other product type has no known naming convention.
     raise ValueError(f"Unsupported NISAR product type: {product_type}")
 
 
+# Turn an HDF5/numpy value into a plain Python value that prints cleanly.
 def to_plain_value(value):
     """
     Convert h5py/numpy values (bytes, scalars, arrays) to plain Python types for logging.
@@ -510,17 +536,21 @@ def to_plain_value(value):
     """
     # HDF5 strings often arrive as bytes; decode them, replacing undecodable bytes instead of failing.
     if isinstance(value, bytes):
+        # Decode bytes to text, replacing any invalid characters.
         return value.decode("utf-8", errors="replace")
     # Arrays become nested lists; each element is converted again (e.g. arrays of bytes).
     if isinstance(value, np.ndarray):
+        # Return a Python list of plain values.
         return [to_plain_value(item) for item in value.tolist()]
     # NumPy scalars (np.float64, np.int32, ...) are unwrapped to Python scalars via .item().
     if isinstance(value, np.generic):
+        # Convert to the equivalent Python scalar.
         return to_plain_value(value.item())
     # Anything else (str, int, float, ...) is already loggable.
     return value
 
 
+# Read a small metadata dataset and its units, skipping large raster layers.
 def read_metadata_dataset(group: h5py.Group, name: str):
     """Return ``(value, units)`` for a small dataset, or None when absent or too large.
 
@@ -536,21 +566,25 @@ def read_metadata_dataset(group: h5py.Group, name: str):
     """
     # Missing keys are normal because the layout varies by product and software version.
     if name not in group:
+        # Missing name: nothing to read.
         return None
     # Open the HDF5 object lazily; nothing is read from disk yet.
     dataset = group[name]
     # Skip sub-groups and any large array, so raster layers are never pulled into memory.
     if not isinstance(dataset, h5py.Dataset) or dataset.size > MAX_METADATA_ELEMENTS:
+        # Not metadata, so return nothing.
         return None
     # Read the optional "units" attribute (empty string when absent) as a plain string.
     units = to_plain_value(dataset.attrs.get("units", ""))
     # Dimensionless markers ("unitless", "1") add noise to the log, so they are dropped.
     if units in ("unitless", "1"):
+        # Treat the dimensionless marker as having no units.
         units = ""
     # dataset[()] reads the whole (tiny) dataset; convert it to a plain Python value.
     return to_plain_value(dataset[()]), units
 
 
+# Write one aligned "label : value [units]" line to the log.
 def log_metadata_value(logger: logging.Logger, label: str, value, units: str = "") -> None:
     """
     Write one ``label: value [units]`` line, summarising oversized strings.
@@ -563,6 +597,7 @@ def log_metadata_value(logger: logging.Logger, label: str, value, units: str = "
     """
     # Long blobs (run configuration, WKT) would flood the log; replace them with their length.
     if isinstance(value, str) and len(value) > MAX_METADATA_STRING:
+        # Replace them with a short placeholder giving their length.
         value = f"<{len(value)} characters omitted>"
     # Append " [units]" only when units are known.
     suffix = f" [{units}]" if units else ""
@@ -570,6 +605,7 @@ def log_metadata_value(logger: logging.Logger, label: str, value, units: str = "
     logger.info("  %-44s : %s%s", label, value, suffix)
 
 
+# Log the small datasets of one HDF5 group (all of them, or only the given keys).
 def log_group_metadata(
     logger: logging.Logger,
     product: h5py.File,
@@ -590,6 +626,7 @@ def log_group_metadata(
     """
     # Nothing to report when this product does not have the requested group.
     if group_path not in product:
+        # The group does not exist in this product, so there is nothing to log.
         return
     # Open the group once; its datasets are read individually below.
     group = product[group_path]
@@ -602,6 +639,7 @@ def log_group_metadata(
             log_metadata_value(logger, name, *found)
 
 
+# Log the product footprint as a longitude/latitude range.
 def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
     """
     Log the ``boundingPolygon`` WKT footprint as a longitude/latitude bounding box.
@@ -614,6 +652,7 @@ def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
     identification_path = "science/LSAR/identification"
     # Exit quietly if the group or the polygon is not present in this product.
     if identification_path not in product or "boundingPolygon" not in product[identification_path]:
+        # Nothing to log when the footprint is missing.
         return
     # Read the WKT text (stored as bytes) and convert it to a Python string.
     wkt = to_plain_value(product[identification_path]["boundingPolygon"][()])
@@ -623,15 +662,19 @@ def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
     # Need at least two vertices (6 numbers) and a count divisible by 3, otherwise the
     # string is not a well-formed triple list and the footprint is not logged.
     if numbers.size < 6 or numbers.size % 3:
+        # Malformed footprint, so skip it.
         return
     # Every third value starting at 0 is longitude; starting at 1 is latitude.
     longitudes, latitudes = numbers[0::3], numbers[1::3]
     # Report the vertex count and the min/max extent of the footprint in degrees.
     log_metadata_value(logger, "footprintVertices", len(longitudes))
+    # Log the west-to-east extent.
     log_metadata_value(logger, "footprintLongitudeRange", f"{longitudes.min():.5f} to {longitudes.max():.5f}", "degrees")
+    # Log the south-to-north extent.
     log_metadata_value(logger, "footprintLatitudeRange", f"{latitudes.min():.5f} to {latitudes.max():.5f}", "degrees")
 
 
+# Log the detailed source metadata (identification, orbit, processing, grids) of an open product.
 def log_source_metadata(
     product: h5py.File,
     source_file: Path,
@@ -656,7 +699,9 @@ def log_source_metadata(
     product_root = f"science/LSAR/{product_type}"
     # Banner lines make each product's block easy to find in a long log.
     logger.info("=" * 78)
+    # Header naming the source file.
     logger.info("SOURCE METADATA: %s", source_file.name)
+    # Draw a separator line in the log.
     logger.info("=" * 78)
     # Everything is wrapped in try/except (see below) so logging can never abort processing.
     try:
@@ -668,7 +713,9 @@ def log_source_metadata(
         log_metadata_value(logger, "sizeOnDisk", f"{source_file.stat().st_size / 1024 ** 3:.3f}", "GiB")
         # Log each root attribute that exists in this file (title, mission, contact, ...).
         for name in ROOT_ATTRIBUTES:
+            # Log only attributes that this file has.
             if name in product.attrs:
+                # Write the attribute value.
                 log_metadata_value(logger, name, to_plain_value(product.attrs[name]))
 
         # --- Identification: acquisition ID, track/frame, times, and so on ---
@@ -684,12 +731,14 @@ def log_source_metadata(
         log_group_metadata(logger, product, f"{product_root}/metadata/orbit", ("orbitType", "interpMethod"))
         # Report how many orbit state vectors are stored (first axis of the position array).
         if f"{product_root}/metadata/orbit/position" in product:
+            # Log how many orbit state vectors the product contains.
             log_metadata_value(
                 logger, "orbitStateVectors", product[f"{product_root}/metadata/orbit/position"].shape[0]
             )
 
         # --- Corrections already applied by the upstream processor ---
         logger.info("[Processing Parameters]")
+        # Log the selected datasets of this metadata group.
         log_group_metadata(
             logger, product, f"{product_root}/metadata/processingInformation/parameters",
             PROCESSING_PARAMETER_KEYS,
@@ -699,9 +748,11 @@ def log_source_metadata(
         for frequency in FREQUENCIES:
             # Skip frequencies this acquisition did not record.
             if frequency not in grids:
+                # This frequency is not in the product, so skip it.
                 continue
             # Group holding this frequency's coordinates and raster layers.
             grid = grids[frequency]
+            # Section: grid metadata for this frequency.
             logger.info("[Grid %s]", frequency)
             # grid.name is an absolute path ("/science/..."); strip the slash for the helper.
             log_group_metadata(logger, product, grid.name.lstrip("/"), GRID_FREQUENCY_KEYS)
@@ -709,12 +760,15 @@ def log_source_metadata(
             for polarization in POLARIZATIONS:
                 # GSLC uses "HH"; GCOV uses "HHHH".
                 dataset_name = dataset_name_for_polarization(product_type, polarization)
+                # Only describe layers that exist.
                 if dataset_name in grid:
+                    # Open the layer without reading its pixels.
                     layer = grid[dataset_name]
                     # Shape and dtype are available from the HDF5 header alone.
                     log_metadata_value(logger, f"layer {dataset_name}", f"shape={layer.shape} dtype={layer.dtype}")
             # Acquisition geometry (bandwidths, incidence angles, range spacing) for this frequency.
             logger.info("[Swath %s]", frequency)
+            # Log the selected datasets of this metadata group.
             log_group_metadata(
                 logger, product, f"{product_root}/metadata/sourceData/swaths/{frequency}", SWATH_FREQUENCY_KEYS
             )
@@ -727,6 +781,7 @@ def log_source_metadata(
     logger.info("=" * 78)
 
 
+# Convert complex SAR samples to intensity (|z|^2).
 def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     """
     Converts complex-valued SAR data into intensity.
@@ -747,16 +802,29 @@ def calculate_intensity(complex_data: np.ndarray) -> np.ndarray:
     return real_sq + imag_sq
 
 
+# Convert the multilook window in metres into odd pixel counts for rows and columns.
 def multilook_window_pixels(pixel_x: float, pixel_y: float) -> tuple[int, int]:
     """Convert MULTILOOK_WINDOW_METRES to odd (rows, columns) window sizes in pixels."""
+    # Helper that converts the ground window length into an odd pixel count along one axis.
     def odd_size(pixel_size: float) -> int:
+        """Return the odd number of pixels closest to MULTILOOK_WINDOW_METRES / pixel_size.
+
+        Args:
+            pixel_size (float): Pixel spacing along one axis, in metres.
+
+        Returns:
+            int: Odd window length in pixels (at least 1).
+        """
         # Round to the nearest odd pixel count; an odd window stays centred on the pixel.
         half = round((MULTILOOK_WINDOW_METRES / pixel_size - 1.0) / 2.0)
+        # Odd window size: 2 * half-width + 1, never smaller than 1.
         return 2 * max(0, int(half)) + 1
 
+    # Return (rows, columns) using the pixel height for rows and the pixel width for columns.
     return odd_size(pixel_y), odd_size(pixel_x)
 
 
+# Average intensity over a (rows x columns) window to reduce speckle, ignoring NoData.
 def apply_multilook(intensity: np.ndarray, looks: int | tuple[int, int] = 5) -> np.ndarray:
     """
     Reduces 'speckle' noise using a spatial multi-looking (averaging) filter.
@@ -774,14 +842,19 @@ def apply_multilook(intensity: np.ndarray, looks: int | tuple[int, int] = 5) -> 
     # Filter data and valid-sample weights separately so NoData never darkens the
     # neighboring valid edge pixels.
     summed = uniform_filter(np.where(valid, intensity, 0.0), size=looks, mode="reflect")
+    # Fraction of valid pixels in each averaging window.
     weights = uniform_filter(valid.astype(np.float32), size=looks, mode="reflect")
     # Preserve invalid source pixels as NaN; they become GeoTIFF NoData on export.
     multilooked = np.full(intensity.shape, np.nan, dtype=np.float32)
+    # Pixels that are valid and have at least one valid neighbour.
     output_valid = valid & (weights > 0)
+    # Mean of the valid pixels only.
     multilooked[output_valid] = summed[output_valid] / weights[output_valid]
+    # Return the speckle-reduced intensity.
     return multilooked
 
 
+# Simple slope-based radiometric terrain correction using a DEM tile.
 def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y: float) -> np.ndarray:
     """
     Performs basic Radiometric Terrain Correction (RTC).
@@ -798,6 +871,7 @@ def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y:
     """
     # Check if DEM array is valid; if not, return the original intensity
     if dem_array.shape[0] < 2 or dem_array.shape[1] < 2:
+        # DEM tile too small for a gradient, so leave intensity unchanged.
         return intensity
 
     # Calculate the gradient (rate of change) in Y and X directions
@@ -814,6 +888,7 @@ def apply_rtc(intensity: np.ndarray, dem_array: np.ndarray, res_x: float, res_y:
     return intensity / cos_i
 
 
+# Convert linear intensity to decibels, leaving invalid values as NaN.
 def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     """
     Converts linear intensity values to a logarithmic Decibel (dB) scale.
@@ -829,11 +904,15 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     # values remain NaN and are written as OUTPUT_NODATA by export_layer, rather than
     # being converted to the artificial -100 dB value produced by log10(1e-10).
     decibels = np.full(intensity.shape, np.nan, dtype=np.float32)
+    # Only positive, finite values have a dB value.
     valid = np.isfinite(intensity) & (intensity > 0)
+    # dB = 10 * log10(intensity).
     decibels[valid] = 10.0 * np.log10(intensity[valid])
+    # Return the dB array.
     return decibels
 
 
+# 2D-FFT notch filter that removes residual stripe/band RFI from one complex GSLC tile.
 def rfi_notch_filter(complex_tile: np.ndarray) -> tuple[np.ndarray, float | None]:
     """
     Suppress narrow-band / stripe RFI in one complex GSLC tile with a 2D-FFT notch.
@@ -851,12 +930,16 @@ def rfi_notch_filter(complex_tile: np.ndarray) -> tuple[np.ndarray, float | None
         (filtered tile, fraction of spectral bins notched). The fraction is None when
         the tile was skipped (too few valid samples).
     """
+    # Valid samples are finite and non-zero (zeros are swath-edge fill).
     valid = np.isfinite(complex_tile) & (complex_tile != 0)
     # Swath-edge tiles: the valid/zero boundary itself creates spectral lines.
     if valid.mean() < RFI_NOTCH_MIN_VALID_FRACTION:
+        # Return the tile unchanged and None to mark it as skipped.
         return complex_tile, None
 
+    # Zero the invalid samples so they add no energy to the FFT.
     data = np.where(valid, complex_tile, 0).astype(np.complex64)
+    # Tile size in rows and columns.
     rows, cols = data.shape
 
     # Smooth weight that ramps 0 -> 1 away from every boundary (tile edges and the
@@ -864,28 +947,43 @@ def rfi_notch_filter(complex_tile: np.ndarray) -> tuple[np.ndarray, float | None
     # spectrum where no notch can catch it; with a smooth ramp it stays compact
     # around the RFI peaks and is removed right up to the swath edge.
     padded_valid = np.pad(valid, 1, constant_values=False)
+    # Distance (in pixels) of each valid pixel to the nearest boundary or invalid pixel.
     distance = distance_transform_edt(padded_valid)[1:-1, 1:-1]
+    # Normalise the distance to 0..1 over the taper width.
     ramp = np.clip(distance / RFI_NOTCH_EDGE_TAPER_PIXELS, 0.0, 1.0)
+    # Raised-cosine taper weight from 0 at the boundary to 1 inside.
     weight = (0.5 - 0.5 * np.cos(np.pi * ramp)).astype(np.float32)
 
+    # 2D FFT of the tapered tile, shifted so zero frequency is in the centre.
     spectrum = np.fft.fftshift(np.fft.fft2(data * weight))
+    # Log magnitude of the spectrum (log1p avoids log(0)).
     log_mag = np.log1p(np.abs(spectrum))
+    # Smoothed spectral background around each bin (wraps around the spectrum edges).
     background = uniform_filter(log_mag, size=RFI_NOTCH_BACKGROUND_BINS, mode="wrap")
+    # How far each bin rises above its local background.
     excess = log_mag - background
+    # Candidate RFI bins: more than RFI_NOTCH_PEAK_RATIO times above the background.
     peaks = excess > np.log(RFI_NOTCH_PEAK_RATIO)
 
     # Never notch the low-frequency centre, where the true scene content lives.
     yy, xx = np.ogrid[:rows, :cols]
+    # Normalised distance of each bin from the spectrum centre.
     radius = np.hypot((yy - rows / 2) / rows, (xx - cols / 2) / cols)
+    # Exclude bins close to the centre (low frequencies).
     peaks &= radius > RFI_NOTCH_DC_RADIUS
 
     # Cap the notched fraction: keep only the strongest bins if too many qualify.
     max_bins = int(RFI_NOTCH_MAX_FRACTION * peaks.size)
+    # Too many candidate bins.
     if peaks.sum() > max_bins:
+        # Excess value of the max_bins-th strongest bin (infinity when no bins are allowed).
         cutoff = np.partition(excess[peaks], -max_bins)[-max_bins] if max_bins > 0 else np.inf
+        # Keep only the bins at or above that cut-off.
         peaks &= excess >= cutoff
 
+    # No RFI peaks found in this tile.
     if not peaks.any():
+        # Return the tile unchanged with 0 bins notched.
         return complex_tile, 0.0
 
     # Widen each notch to catch the peak skirts left by the tapering.
@@ -893,20 +991,26 @@ def rfi_notch_filter(complex_tile: np.ndarray) -> tuple[np.ndarray, float | None
 
     # The RFI estimate is the part of each peak bin above the spectral background.
     target = np.expm1(background)
+    # Per-bin scale factor that brings each bin down to the background level (never amplifies).
     keep = np.minimum(target / np.maximum(np.abs(spectrum), 1e-12), 1.0)
+    # Spectral energy to remove: only in peak bins, the part above the background.
     removed = np.where(peaks, spectrum * (1.0 - keep), 0)
+    # Transform the removed energy back to the image domain (still tapered).
     rfi_weighted = np.fft.ifft2(np.fft.ifftshift(removed))
 
     # Undo the weighting to get the RFI in source units, then subtract it. The floor
     # keeps the division stable in the first pixel or two next to the swath edge.
     rfi_estimate = rfi_weighted / np.maximum(weight, RFI_NOTCH_WEIGHT_FLOOR)
+    # Subtract the RFI estimate from the original samples.
     filtered = (data - rfi_estimate).astype(np.complex64)
 
     # Restore invalid samples exactly as they were in the source.
     filtered[~valid] = complex_tile[~valid]
+    # Return the filtered tile and the fraction of spectral bins notched.
     return filtered, float(peaks.mean())
 
 
+# Mask bright RFI blobs in a multilooked intensity tile using a robust local background.
 def rfi_blob_mask(
     multilooked: np.ndarray,
     looks: tuple[int, int],
@@ -928,52 +1032,87 @@ def rfi_blob_mask(
     Returns:
         Boolean mask, True where the pixel is considered RFI.
     """
+    # Valid pixels are finite and positive.
     valid = np.isfinite(multilooked) & (multilooked > 0)
+    # Too few valid pixels for reliable statistics.
     if valid.sum() < 100:
+        # Return an empty mask (nothing flagged).
         return np.zeros(multilooked.shape, dtype=bool)
 
+    # Work in dB so the background statistics are robust to the intensity range.
     decibels = convert_to_decibels(multilooked)
+    # Decimation steps equal to the multilook window (at least 1).
     step_y, step_x = max(1, looks[0]), max(1, looks[1])
 
     # Neighbouring multilooked pixels are highly correlated; decimating loses little.
     coarse = decibels[::step_y, ::step_x]
+    # Median of the decimated dB values, used to fill gaps.
     fill_value = np.nanmedian(coarse)
+    # Fill NaN gaps so the median filter does not propagate them.
     coarse = np.where(np.isfinite(coarse), coarse, fill_value)
 
+    # Helper that turns a window size into an odd number of at least 3.
     def odd(n: int) -> int:
+        """Return ``n`` rounded up to an odd integer, never smaller than 3.
+
+        Args:
+            n (int): Requested window size in pixels.
+
+        Returns:
+            int: Odd window size of at least 3 pixels, so the window stays centred on each pixel.
+        """
+        # Set the lowest bit to make the number odd, with a minimum of 3.
         return max(3, n | 1)
 
+    # Background window size on the decimated grid, in (rows, columns).
     size = (odd(background_pixels[0] // step_y), odd(background_pixels[1] // step_x))
+    # Local median of the dB values (robust background level).
     median = median_filter(coarse, size=size, mode="reflect")
+    # Local median absolute deviation, scaled by 1.4826 to match a standard deviation.
     mad = median_filter(np.abs(coarse - median), size=size, mode="reflect") * 1.4826
 
     # Upsample the background statistics back to the full tile grid.
     rows, cols = multilooked.shape
+    # Upsample the median back to the full tile size by repeating rows and columns.
     median_full = np.repeat(np.repeat(median, step_y, axis=0), step_x, axis=1)[:rows, :cols]
+    # Upsample the MAD the same way.
     mad_full = np.repeat(np.repeat(mad, step_y, axis=0), step_x, axis=1)[:rows, :cols]
+    # Floor the MAD so flat areas do not produce huge z-scores.
     mad_full = np.maximum(mad_full, RFI_BLOB_MIN_MAD_DB)
 
+    # Robust z-score of each valid pixel above its local background.
     z_score = np.where(valid, (decibels - median_full) / mad_full, 0.0)
+    # Flag pixels whose z-score is above the threshold.
     mask = z_score > RFI_BLOB_Z_THRESHOLD
+    # Optionally grow the mask to include blob fringes.
     if RFI_BLOB_DILATION_ITERATIONS > 0 and mask.any():
+        # Dilate the mask by the configured number of iterations.
         mask = binary_dilation(mask, iterations=RFI_BLOB_DILATION_ITERATIONS)
+    # Return the mask, limited to valid pixels.
     return mask & valid
 
 
+# Return which RFI steps apply: (notch on GSLC only, blob mask).
 def rfi_steps_active(product_type: str) -> tuple[bool, bool]:
     """Return (notch active, blob mask active) for a product type."""
+    # The notch applies only to complex GSLC data; the blob mask setting applies to both products.
     return (product_type == "GSLC" and RFI_NOTCH_ENABLED), RFI_BLOB_MASK_ENABLED
 
 
+# Build the filename prefix for a layer, including a tag for the active RFI steps.
 def output_prefix(source_file: Path, product_type: str, frequency: str, polarization: str) -> str:
     """Filename prefix shared by the skip check and the export, tagged when RFI is applied."""
+    # Find which RFI steps are active for this product type.
     notch, blob = rfi_steps_active(product_type)
     # Name the active steps so changing the RFI configuration never reuses an old output.
     steps = [name for name, on in (("notch", notch), ("blob", blob)) if on]
+    # Tag such as "_RFI-notch-blob", or empty when no RFI step is active.
     rfi_tag = f"_RFI-{'-'.join(steps)}" if steps else ""
+    # Return the prefix: source stem, product, frequency, polarization and RFI tag.
     return f"{source_file.stem}_{product_type}_{frequency}_{polarization}{rfi_tag}_Processed_dB_"
 
 
+# Find a finished GeoTIFF from an earlier run for this layer, if one exists.
 def completed_output_path(
     source_file: Path,
     product_type: str,
@@ -989,7 +1128,9 @@ def completed_output_path(
     statistics all succeed; ``*.part.tif`` files are therefore never treated as
     completed results.
     """
+    # Filename prefix of every export of this layer with the current RFI settings.
     prefix = output_prefix(source_file, product_type, frequency, polarization)
+    # Matching GeoTIFFs, newest first.
     candidates = sorted(
         PROCESSED_DIRECTORY.glob(f"{prefix}*.tif"),
         key=lambda path: path.stat().st_mtime,
@@ -999,10 +1140,12 @@ def completed_output_path(
     for candidate in candidates:
         # Interrupted exports retain a .part.tif suffix and must be retried.
         if candidate.name.endswith(".part.tif"):
+            # Skip interrupted outputs.
             continue
         try:
             # Confirm the final-named file can still be opened as a nonempty GeoTIFF.
             with rasterio.open(candidate) as existing_raster:
+                # Accept a non-empty single-band GeoTIFF that is already on the target grid.
                 if (
                     existing_raster.driver == "GTiff"
                     and existing_raster.count == 1
@@ -1010,13 +1153,16 @@ def completed_output_path(
                     and existing_raster.height > 0
                     and grid_has_target_pixel_size(existing_raster.transform)
                 ):
+                    # Reuse this finished GeoTIFF.
                     return candidate
         except (OSError, rasterio.errors.RasterioError) as exc:
             # A damaged result is not complete and should be regenerated.
             logger.warning("Existing GeoTIFF is unreadable and will be regenerated: %s (%s)", candidate, exc)
 
+    # No finished GeoTIFF was found.
     return None
 
+# Process one frequency/polarization layer into a dB GeoTIFF.
 def export_layer(
     source_file: Path,
     product_type: str,
@@ -1052,13 +1198,16 @@ def export_layer(
     existing_output = completed_output_path(
         source_file, product_type, frequency, polarization, logger
     )
+    # A finished GeoTIFF for this layer already exists.
     if existing_output is not None:
+        # Report that this layer is skipped and where the existing file is.
         logger.info(
             "Skipping %s/%s; completed GeoTIFF already exists: %s",
             frequency,
             polarization,
             existing_output,
         )
+        # Reuse it instead of processing again.
         return existing_output
 
     # Convert the requested channel name to the dataset name used by this product type.
@@ -1067,6 +1216,7 @@ def export_layer(
     source_dataset = grid[dataset_name]
     # Reject metadata or unsupported multidimensional datasets before creating an output file.
     if not isinstance(source_dataset, h5py.Dataset) or source_dataset.ndim != 2:
+        # Stop: this dataset is not a 2-D raster.
         raise ValueError(f"{dataset_name} is not a two-dimensional raster dataset")
 
     # Derive the source-native affine transform and CRS from grid coordinate metadata.
@@ -1078,6 +1228,7 @@ def export_layer(
     source_has_target_pixel_size = grid_has_target_pixel_size(transform)
     # Record native pixel spacing for DEM slope calculation during GSLC RTC.
     pixel_x = abs(transform.a)
+    # Native pixel height in metres.
     pixel_y = abs(transform.e)
     # Only GSLC requires complex-to-intensity conversion and optional DEM correction.
     # Both supported product types are multilooked below.
@@ -1089,11 +1240,15 @@ def export_layer(
     )
     # Write to a temporary file first so an interrupted run cannot leave a partial output.
     temp_path = out_path.with_suffix(".part.tif")
+    # Temporary native-grid file used before any resampling.
     native_temp_path = out_path.with_suffix(".native.part.tif")
     # Remove temporary files left by a previous interrupted attempt for the same output.
     if temp_path.exists():
+        # Delete the leftover temporary file.
         temp_path.unlink()
+    # A native-grid temporary file from an earlier run is present.
     if native_temp_path.exists():
+        # Delete the leftover native-grid temporary file.
         native_temp_path.unlink()
 
     # Define the native-grid staging GeoTIFF used by both square and rectangular grids.
@@ -1118,17 +1273,22 @@ def export_layer(
     dem_dataset = None
     # Open the local DEM only for a GSLC run and only when the configured file exists.
     if process_gslc and LOCAL_DEM_PATH.exists():
+        # Open the DEM for terrain correction.
         dem_dataset = rasterio.open(LOCAL_DEM_PATH)
     # Report that GSLC will continue without RTC when its DEM is unavailable.
     elif process_gslc:
+        # Warn that terrain correction is skipped.
         logger.warning("DEM not found at %s. GSLC RTC step will be skipped.", LOCAL_DEM_PATH)
 
+    # The native grid already has the target pixel size.
     if source_has_target_pixel_size:
+        # Report that the native grid is kept.
         logger.info(
             "%s/%s already has %.6g m x %.6g m pixels; retaining the native grid.",
             frequency, polarization, pixel_x, pixel_y,
         )
     else:
+        # Report that the grid will be resampled to the target pixel size.
         logger.info(
             "%s/%s has %.6g m x %.6g m pixels; resampling to %.0f m x %.0f m with nearest neighbor.",
             frequency, polarization, pixel_x, pixel_y,
@@ -1140,6 +1300,7 @@ def export_layer(
     # Each tile is read with this many extra pixels on every side so the averaging
     # window sees real neighbours across tile boundaries (no seams between tiles).
     halo_y, halo_x = looks_y // 2, looks_x // 2
+    # Log the multilook window in pixels and in metres.
     logger.info(
         "%s/%s multilook window: %d x %d pixels (%.0f m x %.0f m).",
         frequency, polarization, looks_y, looks_x, looks_y * pixel_y, looks_x * pixel_x,
@@ -1149,16 +1310,22 @@ def export_layer(
     rfi_notch_active, rfi_mask_active = rfi_steps_active(product_type)
     # The FFT notch needs extra context so its edge effects fall in the discarded halo.
     if rfi_notch_active:
+        # Add the notch halo to the row halo.
         halo_y += RFI_NOTCH_HALO_PIXELS
+        # Add the notch halo to the column halo.
         halo_x += RFI_NOTCH_HALO_PIXELS
     # The blob mask's background window must also see neighbours across tile edges.
     blob_background_pixels = (
         max(1, round(RFI_BLOB_BACKGROUND_METRES / pixel_y)),
         max(1, round(RFI_BLOB_BACKGROUND_METRES / pixel_x)),
     )
+    # The blob mask needs a halo of at least half its background window.
     if rfi_mask_active:
+        # Enlarge the row halo if needed.
         halo_y = max(halo_y, blob_background_pixels[0] // 2)
+        # Enlarge the column halo if needed.
         halo_x = max(halo_x, blob_background_pixels[1] // 2)
+    # Log which RFI steps are on and their main settings.
     logger.info(
         "%s/%s RFI suppression: notch=%s (peak ratio %.3g), blob mask=%s (z > %.3g, %.0f m background).",
         frequency, polarization,
@@ -1167,18 +1334,26 @@ def export_layer(
     )
     # Per-layer RFI statistics reported after the last tile.
     notch_tiles_filtered = 0
+    # Number of tiles skipped by the notch (too few valid samples).
     notch_tiles_skipped = 0
+    # Sum of notched bin fractions, used to compute the mean.
     notch_fraction_sum = 0.0
+    # Number of output pixels set to NoData by the blob mask.
     rfi_masked_pixels = 0
+    # Number of valid output pixels written.
     valid_output_pixels = 0
 
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
     description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
+    # Add the multilook window size to the band description.
     description = f"{description} {looks_y}x{looks_x}"
+    # Add the active RFI steps to the band description.
     if rfi_notch_active or rfi_mask_active:
+        # Names of the active RFI steps.
         rfi_parts = [name for name, on in (("Notch", rfi_notch_active), ("BlobMask", rfi_mask_active)) if on]
+        # Append them, e.g. "RFI-Notch+BlobMask".
         description = f"{description} RFI-{'+'.join(rfi_parts)}"
     try:
         # Create the native-grid staging GeoTIFF.
@@ -1189,14 +1364,21 @@ def export_layer(
             for tile_num, window in enumerate(source_windows(height, width), start=1):
                 # Convert Rasterio window offsets to integers accepted by HDF5 slicing.
                 row_start = int(window.row_off)
+                # Last row (exclusive) of the tile.
                 row_stop = row_start + int(window.height)
+                # First column of the tile.
                 col_start = int(window.col_off)
+                # Last column (exclusive) of the tile.
                 col_stop = col_start + int(window.width)
                 # Read this tile plus a halo (clamped to the raster) from the HDF5 dataset.
                 read_row_start = max(0, row_start - halo_y)
+                # Last row (exclusive) including the halo, clamped to the raster.
                 read_row_stop = min(height, row_stop + halo_y)
+                # First column including the halo, clamped to the raster.
                 read_col_start = max(0, col_start - halo_x)
+                # Last column (exclusive) including the halo, clamped to the raster.
                 read_col_stop = min(width, col_stop + halo_x)
+                # Read the tile plus its halo from the HDF5 dataset.
                 tile_data = source_dataset[read_row_start:read_row_stop, read_col_start:read_col_stop]
                 # Slices that crop the filtered halo tile back to the output window.
                 crop = (
@@ -1210,11 +1392,16 @@ def export_layer(
                     # Suppress residual stripe/band RFI on the complex samples first,
                     # while the signal is still coherent and RFI is spectrally compact.
                     if rfi_notch_active:
+                        # Apply the notch filter to the complex samples.
                         tile_data, notch_fraction = rfi_notch_filter(tile_data)
+                        # The tile was skipped by the notch filter.
                         if notch_fraction is None:
+                            # Count the skipped tile.
                             notch_tiles_skipped += 1
                         else:
+                            # Count the filtered tile.
                             notch_tiles_filtered += 1
+                            # Add its notched fraction for the mean.
                             notch_fraction_sum += notch_fraction
                     # Convert complex GSLC samples to intensity before multilooking.
                     processed_tile = calculate_intensity(tile_data)
@@ -1228,8 +1415,11 @@ def export_layer(
                 # Mask bright RFI blobs on the full halo tile so the background window
                 # sees real neighbours; masked pixels become NoData on export.
                 if rfi_mask_active:
+                    # Compute the blob mask for the whole halo tile.
                     blob_mask = rfi_blob_mask(processed_tile, (looks_y, looks_x), blob_background_pixels)
+                    # Set flagged pixels to NaN so they become NoData.
                     processed_tile[blob_mask] = np.nan
+                    # Count only flagged pixels inside the output window.
                     rfi_masked_pixels += int(blob_mask[crop].sum())
 
                 # Drop the halo so the tile matches the output window exactly.
@@ -1266,7 +1456,9 @@ def export_layer(
                 # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
                 # dB value.  GIS renderers therefore leave the outside-swath edge blank.
                 valid_db = np.isfinite(db_tile)
+                # Count valid output pixels for the RFI statistics.
                 valid_output_pixels += int(valid_db.sum())
+                # Replace invalid pixels with the NoData value.
                 db_tile = np.where(valid_db, db_tile, OUTPUT_NODATA)
                 # Write this completed native-grid tile into the temporary GeoTIFF.
                 dst.write(db_tile.astype(np.float32), 1, window=window)
@@ -1276,6 +1468,7 @@ def export_layer(
 
                 # Log progress approximately ten times per layer and always after the final tile.
                 if tile_num == total_tiles or tile_num % max(1, total_tiles // 10) == 0:
+                    # Report the percentage of tiles processed.
                     logger.info(
                         "%s/%s progress: %.0f%% (%d/%d tiles)",
                         frequency,
@@ -1288,31 +1481,43 @@ def export_layer(
     finally:
         # Close the DEM even if processing fails while writing a tile.
         if dem_dataset is not None:
+            # Release the DEM file handle.
             dem_dataset.close()
 
     # Summarise what the RFI steps did, so over- or under-filtering is visible in the log.
     rfi_tags = {"RFI_NOTCH": str(rfi_notch_active), "RFI_BLOB_MASK": str(rfi_mask_active)}
+    # Report the notch statistics and record them as tags.
     if rfi_notch_active:
+        # Mean fraction of spectral bins notched per filtered tile.
         mean_fraction = notch_fraction_sum / notch_tiles_filtered if notch_tiles_filtered else 0.0
+        # Log the notch statistics.
         logger.info(
             "%s/%s RFI notch: %d tiles filtered, %d edge tiles skipped, mean %.4f%% of spectral bins notched.",
             frequency, polarization, notch_tiles_filtered, notch_tiles_skipped, 100 * mean_fraction,
         )
+        # Store the notch settings and result in the GeoTIFF tags.
         rfi_tags.update(RFI_NOTCH_PEAK_RATIO=str(RFI_NOTCH_PEAK_RATIO),
                         RFI_NOTCH_MEAN_BIN_FRACTION=f"{mean_fraction:.6f}")
+    # Report the blob mask statistics and record them as tags.
     if rfi_mask_active:
+        # All valid swath pixels, counting the masked ones.
         total_pixels = valid_output_pixels + rfi_masked_pixels
+        # Percentage of the swath removed by the blob mask.
         masked_percent = 100 * rfi_masked_pixels / total_pixels if total_pixels else 0.0
+        # Log the blob mask statistics.
         logger.info(
             "%s/%s RFI blob mask: %d pixels set to NoData (%.3f%% of valid swath).",
             frequency, polarization, rfi_masked_pixels, masked_percent,
         )
+        # More than 5% masked usually means real bright targets are being removed.
         if masked_percent > 5.0:
+            # Warn and suggest raising the threshold or disabling the mask.
             logger.warning(
                 "%s/%s blob mask removed more than 5%% of the swath; real bright targets are probably "
                 "being masked. Raise RFI_BLOB_Z_THRESHOLD or disable the mask for this scene.",
                 frequency, polarization,
             )
+        # Store the blob mask settings and result in the GeoTIFF tags.
         rfi_tags.update(RFI_BLOB_Z_THRESHOLD=str(RFI_BLOB_Z_THRESHOLD),
                         RFI_BLOB_MASKED_PIXELS=str(rfi_masked_pixels))
 
@@ -1323,11 +1528,15 @@ def export_layer(
         # Resample to the required 5 m grid after the scientific processing steps and
         # before publishing the final GeoTIFF. Nearest neighbour preserves source dB samples.
         target_profile = target_grid_profile(profile, transform, width, height)
+        # Open the native-grid temporary GeoTIFF.
         with rasterio.open(native_temp_path) as source_raster:
+            # Create the square-pixel output GeoTIFF.
             with rasterio.open(temp_path, "w", **target_profile) as destination_raster:
+                # Give the output band the same description as the native band.
                 destination_raster.set_band_description(
                     1, f"{product_type} {frequency} {polarization} {description} dB"
                 )
+                # Resample onto the output grid.
                 reproject(
                     source=rasterio.band(source_raster, 1),
                     destination=rasterio.band(destination_raster, 1),
@@ -1340,6 +1549,7 @@ def export_layer(
                     resampling=Resampling.nearest,
                     init_dest_nodata=True,
                 )
+        # Delete the leftover native-grid temporary file.
         native_temp_path.unlink()
 
     # Build overviews on the actual exported grid and calculate its final statistics.
@@ -1348,9 +1558,12 @@ def export_layer(
         # image look far noisier when zoomed out in GIS software.  Overviews are only
         # used for display; full-resolution dB values are unchanged.
         output_raster.build_overviews(OVERVIEW_FACTORS, Resampling.average)
+        # Record the overview resampling method.
         output_raster.update_tags(ns="rio_overview", resampling="average")
+        # Record the multilook window used, in pixels and metres.
         output_raster.update_tags(MULTILOOK_WINDOW_PIXELS=f"{looks_y}x{looks_x}",
                                   MULTILOOK_WINDOW_METRES=str(MULTILOOK_WINDOW_METRES))
+        # Record the RFI settings and statistics.
         output_raster.update_tags(**rfi_tags)
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
@@ -1361,6 +1574,7 @@ def export_layer(
     # Return the final GeoTIFF path to the caller.
     return out_path
 
+# Read a small metadata dataset and return it as printable text (None when missing).
 def read_metadata_value(group: h5py.Group, name: str) -> str | None:
     """
     Read one scalar or array metadata dataset and return it as printable text.
@@ -1380,6 +1594,7 @@ def read_metadata_value(group: h5py.Group, name: str) -> str | None:
     """
     # Skip names that are missing, or that point to a sub-group rather than a dataset.
     if name not in group or not isinstance(group[name], h5py.Dataset):
+        # Missing or not a dataset.
         return None
     try:
         # Read the entire (small) dataset into memory; [()] returns scalars and arrays alike.
@@ -1389,6 +1604,7 @@ def read_metadata_value(group: h5py.Group, name: str) -> str | None:
         return None
     # Decode a scalar byte string (the usual HDF5 string form) into text.
     if isinstance(value, bytes):
+        # Decode bytes to text, replacing any invalid characters.
         return value.decode("utf-8", errors="replace")
     # Handle array values such as lists of polarizations or frequencies.
     if isinstance(value, np.ndarray):
@@ -1400,6 +1616,7 @@ def read_metadata_value(group: h5py.Group, name: str) -> str | None:
     return str(value)
 
 
+# Log a short metadata summary of one product before the batch starts processing.
 def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
     """
     Log the identification and grid metadata of one NISAR product.
@@ -1466,6 +1683,7 @@ def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
                     value = read_metadata_value(identification, dataset_name)
                     # Log only fields that exist, so missing ones leave no empty lines.
                     if value is not None:
+                        # Write the label and value.
                         logger.info("  %-20s: %s", label, value)
             else:
                 # Tell the operator the file has no identification block at all.
@@ -1475,7 +1693,9 @@ def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
             for frequency in FREQUENCIES:
                 # Note a configured frequency that this product does not contain.
                 if frequency not in grids:
+                    # Report the missing frequency.
                     logger.info("  %s: not present in this product", frequency)
+                    # Skip to the next frequency.
                     continue
                 # Select the group holding this frequency's coordinates and layers.
                 grid = grids[frequency]
@@ -1501,7 +1721,9 @@ def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
 
                 # List the polarizations the product itself declares for this frequency.
                 polarizations = read_metadata_value(grid, "listOfPolarizations")
+                # The product lists its polarizations.
                 if polarizations is not None:
+                    # Log them.
                     logger.info("    Polarizations     : %s", polarizations)
                 # Check each polarization this script is configured to process.
                 for polarization in POLARIZATIONS:
@@ -1527,6 +1749,7 @@ def log_product_metadata(source_file: Path, logger: logging.Logger) -> None:
         logger.debug("Metadata read failure:", exc_info=True)
 
 
+# Batch entry point: process every product found below ROOT_DIRECTORY.
 def main() -> None:
     """
     Discover and process every supported NISAR product below ROOT_DIRECTORY.
@@ -1544,7 +1767,9 @@ def main() -> None:
 
     # Fail early when the configured input-product directory does not exist.
     if not ROOT_DIRECTORY.is_dir():
+        # Report the missing input folder.
         logger.error("Input directory does not exist: %s", ROOT_DIRECTORY)
+        # Exit with a failure status.
         raise SystemExit(1)
 
     # Create the output directory now so every successful layer has a destination.
@@ -1561,7 +1786,9 @@ def main() -> None:
 
     # End successfully when there are no products to process in the input directory.
     if not source_files:
+        # Warn that there is nothing to process.
         logger.warning("No supported products found.")
+        # Stop without error.
         return
 
     # Use one timestamp for every output generated during this batch execution.
@@ -1572,13 +1799,17 @@ def main() -> None:
     # Show every product's metadata up front so the batch can be reviewed before processing begins.
     # Open the report with a banner so it stands out from the surrounding log lines.
     logger.info("=" * 70)
+    # Title of the metadata report.
     logger.info("PRODUCT METADATA")
+    # Draw a separator line.
     logger.info("=" * 70)
     # Describe each product in turn; unreadable files only produce a warning here.
     for source_file in source_files:
+        # Log this product's metadata summary.
         log_product_metadata(source_file, logger)
     # Close the report and mark the point where actual processing begins.
     logger.info("=" * 70)
+    # Mark the start of processing in the log.
     logger.info("Starting processing...")
     # Capture a monotonic start time for the complete multi-file processing batch.
     batch_start_time = perf_counter()
@@ -1603,7 +1834,9 @@ def main() -> None:
                 for frequency in FREQUENCIES:
                     # Skip a requested frequency that is absent from this product.
                     if frequency not in grids:
+                        # Warn that this frequency is missing.
                         logger.warning("%s does not contain requested frequency %s.", source_file.name, frequency)
+                        # Skip to the next frequency.
                         continue
 
                     # Select the grid group holding this frequency's metadata and layers.
@@ -1614,6 +1847,7 @@ def main() -> None:
                         dataset_name = dataset_name_for_polarization(product_type, polarization)
                         # Skip a requested layer that is unavailable in this product acquisition mode.
                         if dataset_name not in grid:
+                            # Warn that this polarization is missing.
                             logger.warning(
                                 "%s %s does not contain requested polarization %s (%s).",
                                 source_file.name,
@@ -1621,6 +1855,7 @@ def main() -> None:
                                 polarization,
                                 dataset_name,
                             )
+                            # Skip to the next polarization.
                             continue
 
                         # Process and export the layer on the required 5 m x 5 m output grid.
@@ -1635,11 +1870,15 @@ def main() -> None:
                         )
         # Handle unreadable or incomplete HDF5 files without stopping the remaining batch.
         except OSError as exc:
+            # Tell the user to download the file again.
             logger.error("File appears incomplete or corrupted. Please re-download: %s", source_file.name)
+            # Keep the low-level error in the debug log.
             logger.debug("Truncated file details: %s", exc)
         # Log all other per-product failures with a traceback for later diagnosis.
         except Exception as exc:
+            # Log the product that failed and why.
             logger.error("Failed to process product %s: %s", source_file.name, exc)
+            # Keep the full traceback in the debug log.
             logger.debug("Detailed traceback:", exc_info=True)
         finally:
             # Calculate this file's elapsed time even when processing raised an error.
@@ -1664,4 +1903,5 @@ def main() -> None:
 
 # --- EXECUTION START ---
 if __name__ == "__main__":
+    # Run the batch workflow.
     main()
