@@ -632,7 +632,7 @@ def log_bounding_polygon(logger: logging.Logger, product: h5py.File) -> None:
     log_metadata_value(logger, "footprintLatitudeRange", f"{latitudes.min():.5f} to {latitudes.max():.5f}", "degrees")
 
 
-def log_product_metadata(
+def log_source_metadata(
     product: h5py.File,
     source_file: Path,
     product_type: str,
@@ -1597,7 +1597,7 @@ def main() -> None:
                 # Record which product type is being processed for operational traceability.
                 logger.info("Processing %s product: %s", product_type, source_file.name)
                 # Record the original file's metadata before any layer is processed.
-                log_product_metadata(product, source_file, product_type, grids, logger)
+                log_source_metadata(product, source_file, product_type, grids, logger)
 
                 # Consider each frequency configured at the top of this module.
                 for frequency in FREQUENCIES:
