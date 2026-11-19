@@ -125,11 +125,14 @@ def authenticate_earthdata(username: str, password: str) -> asf.ASFSession:  # A
     Exits:
         If authentication fails.
     """
+    # Stop early when either Earthdata credential is missing from the environment.
     if not username or not password:
+        # Tell the user exactly which .env variables must be set.
         logging.error(
             "NASA Earthdata credentials are missing. Set EARTHDATA_USERNAME "
             "and EARTHDATA_PASSWORD in the .env file (see .env.example)."
         )
+        # Exit with a failure status because nothing can be downloaded without a login.
         sys.exit(1)
 
     session = asf.ASFSession()  # Create an unauthenticated ASFSession instance.
@@ -209,6 +212,7 @@ def filter_hdf5_urls(results: asf.ASFSearchResults) -> list[str]:  # Filter sear
 
     # Build a list of URLs that meet both criteria: file extension is .h5/.hdf5 **and** filename does NOT end with _QA_STATS.h5.
     download_urls = []
+    # Check every candidate URL and keep only the science HDF5 files.
     for url in all_urls:
         filename = url.split("/")[-1]  # Extract the filename from the URL.
         if (filename.lower().endswith(('.h5', '.hdf5')) and   # Keep only HDF5 files.

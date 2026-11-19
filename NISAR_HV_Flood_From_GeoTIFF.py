@@ -60,6 +60,7 @@ TILE_SIZE = 512
 OVERVIEW_FACTORS = (2, 4, 8, 16, 32)
 
 
+# Define and parse the command-line options for this script.
 def parse_arguments() -> argparse.Namespace:
     """Return user-supplied or default input, output, threshold, and overwrite options."""
     # Create the command-line parser and its one-sentence help description.
@@ -105,6 +106,7 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Configure logging to both the terminal and a timestamped log file.
 def setup_logger(log_directory: Path) -> logging.Logger:
     """Configure and return a logger that writes to both a dated file and the terminal."""
     # Create the log directory and any missing parent directories.
@@ -146,6 +148,7 @@ def setup_logger(log_directory: Path) -> logging.Logger:
     return logger
 
 
+# Yield the raster tiles (windows) that cover the full image, row by row.
 def source_windows(height: int, width: int) -> Iterator[Window]:
     """Yield windows that cover a raster in fixed-size tiles without loading it all at once."""
     # Step down the raster rows in TILE_SIZE-pixel increments.
@@ -160,18 +163,21 @@ def source_windows(height: int, width: int) -> Iterator[Window]:
             yield Window(column_offset, row_offset, tile_width, tile_height)
 
 
+# Collect the GeoTIFF inputs from a single file path or a directory tree.
 def discover_geotiffs(input_path: Path) -> list[Path]:
     """Return a single valid GeoTIFF or every eligible GeoTIFF below a directory."""
     # Handle an explicitly supplied file without scanning a directory.
     if input_path.is_file():
         # Reject files whose extension is not one of the supported GeoTIFF extensions.
         if input_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            # Refuse a file that is not a GeoTIFF.
             raise ValueError(f"Input file is not a .tif or .tiff file: {input_path}")
         # Return the requested file in a list so callers use one input interface.
         return [input_path]
 
     # Stop with a clear error if the path is neither a file nor a directory.
     if not input_path.is_dir():
+        # Refuse a path that does not exist.
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     # Recursively find eligible GeoTIFFs and sort them for deterministic processing.
@@ -190,12 +196,14 @@ def discover_geotiffs(input_path: Path) -> list[Path]:
     )
 
 
+# Turn the dB threshold into a filename-safe text label.
 def threshold_label(threshold_db: float) -> str:
     """Return a compact, filesystem-friendly string representation of the threshold."""
     # Use general numeric formatting to remove unnecessary trailing zeroes.
     return f"{threshold_db:g}"
 
 
+# Build the output path of the flood raster for a processed input.
 def flood_raster_path(
     processed_path: Path,
     output_directory: Path,
@@ -208,10 +216,12 @@ def flood_raster_path(
     )
 
 
+# Check whether an existing flood raster is complete and can be reused.
 def valid_existing_output(output_path: Path) -> bool:
     """Return True only for a readable, nonempty, binary GeoTIFF without NoData."""
     # A missing path cannot be reused as an existing output.
     if not output_path.is_file():
+        # Nothing exists at this path, so there is nothing to reuse.
         return False
     try:
         # Open the candidate output only long enough to inspect its metadata.
@@ -227,9 +237,11 @@ def valid_existing_output(output_path: Path) -> bool:
             )
     # Treat unreadable or malformed rasters as invalid rather than aborting the run.
     except (OSError, rasterio.errors.RasterioError):
+        # The file is unreadable or corrupt, so it must be regenerated.
         return False
 
 
+# Threshold one processed dB GeoTIFF into a binary flood mask GeoTIFF.
 def export_flood_raster(
     processed_path: Path,
     output_directory: Path,
@@ -242,7 +254,9 @@ def export_flood_raster(
     output_path = flood_raster_path(processed_path, output_directory, threshold_db)
     # Reuse a complete existing file unless the caller explicitly requests replacement.
     if not overwrite and valid_existing_output(output_path):
+        # Report that the existing output is reused.
         logger.info("Skipping; flood raster already exists: %s", output_path)
+        # Return the existing path and False because nothing new was written.
         return output_path, False
 
     # Ensure the selected output directory exists before creating a raster inside it.
@@ -251,6 +265,7 @@ def export_flood_raster(
     temp_path = output_path.with_suffix(".part.tif")
     # Remove a stale temporary file left behind by an interrupted earlier attempt.
     if temp_path.exists():
+        # Delete the leftover temporary file.
         temp_path.unlink()
 
     try:
@@ -258,6 +273,7 @@ def export_flood_raster(
         with rasterio.open(processed_path) as source_raster:
             # Require a nonempty first band before creating an output.
             if source_raster.count < 1 or source_raster.width < 1 or source_raster.height < 1:
+                # Stop: there is no raster data to threshold.
                 raise ValueError("input does not contain a nonempty raster band")
 
             # Start with the source spatial metadata so output pixels remain aligned.
@@ -345,17 +361,22 @@ def export_flood_raster(
         os.replace(temp_path, output_path)
     # Clean up a partial temporary file if opening, reading, or writing failed.
     except Exception:
+        # Remove the incomplete temporary file if one was created.
         if temp_path.exists():
+            # Delete it so a later run starts clean.
             temp_path.unlink()
+        # Re-raise the original error so the caller sees the failure.
         raise
 
     # Record successful output creation with the applied threshold.
     logger.info(
         "Created binary flood raster (dB < %g): %s", threshold_db, output_path
     )
+    # Return the new path and True because a raster was written.
     return output_path, True
 
 
+# Command-line entry point for flood raster creation.
 def main() -> None:
     """Run the command-line workflow for one input file or an input directory."""
     # Read command-line options once at startup.
@@ -368,12 +389,16 @@ def main() -> None:
         source_files = discover_geotiffs(arguments.input_path.resolve())
     # Turn user-correctable path and extension errors into a nonzero command exit.
     except (FileNotFoundError, ValueError) as exc:
+        # Log the problem with the input path.
         logger.error("%s", exc)
+        # Exit with status 1 so scripts calling this tool can detect the error.
         raise SystemExit(1) from exc
 
     # Finish successfully when the input directory contains no eligible GeoTIFFs.
     if not source_files:
+        # Warn that the input location contained nothing to process.
         logger.warning("No GeoTIFF inputs found below: %s", arguments.input_path)
+        # Stop without error because there is no work to do.
         return
 
     # Resolve the output location once before it is passed to every export operation.
@@ -404,13 +429,18 @@ def main() -> None:
             )
             # Update the appropriate result count according to the export status.
             if created:
+                # A new flood raster was written.
                 created_count += 1
             else:
+                # An existing flood raster was reused.
                 skipped_count += 1
         # Log an expected per-file processing failure and continue with the next input.
         except (OSError, ValueError, rasterio.errors.RasterioError) as exc:
+            # Count this input as failed.
             failed_count += 1
+            # Log the failing file and the error message.
             logger.error("Failed to process %s: %s", source_file, exc)
+            # Keep the full traceback in the debug log for troubleshooting.
             logger.debug("Detailed traceback:", exc_info=True)
 
     # Write a complete created/skipped/failed summary after all inputs are attempted.
@@ -422,6 +452,7 @@ def main() -> None:
     )
     # Return a nonzero status when any source file failed, enabling automation to detect it.
     if failed_count:
+        # Exit with status 1 because at least one input failed.
         raise SystemExit(1)
 
 

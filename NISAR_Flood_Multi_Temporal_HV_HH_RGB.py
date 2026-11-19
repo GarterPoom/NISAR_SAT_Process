@@ -138,6 +138,7 @@ class Composite:
     high_hh: SceneInfo  # Supply green source data.
 
 
+# Convert a YYYY-MM-DD command-line value into a date object.
 def parse_date_argument(value: str) -> date:
     """Convert a strict ``YYYYMMDD`` command-line value to ``date``.
 
@@ -154,6 +155,7 @@ def parse_date_argument(value: str) -> date:
         raise argparse.ArgumentTypeError("date must be a valid YYYYMMDD value") from exc  # Explain required format.
 
 
+# Parse a GeoTIFF filename into a SceneInfo record, or None if it does not match.
 def filename_info(path: Path) -> SceneInfo | None:
     """Parse a final processed NISAR raster filename into validated metadata.
 
@@ -209,6 +211,7 @@ def filename_info(path: Path) -> SceneInfo | None:
     )  # Finish the parsed scene record.
 
 
+# Build the key that groups scenes of the same track, frame and product together.
 def group_key(info: SceneInfo) -> tuple[str, ...]:
     """Return the non-temporal metadata that must match across input channels.
 
@@ -229,6 +232,7 @@ def group_key(info: SceneInfo) -> tuple[str, ...]:
     )  # Finish the compatibility key.
 
 
+# Pick the single scene for a date and polarization from the candidate list.
 def choose_scene(candidates: list[SceneInfo], acquisition_date: date, polarization: str) -> SceneInfo:
     """Choose the newest export for exactly one date and polarization.
 
@@ -263,6 +267,7 @@ def choose_scene(candidates: list[SceneInfo], acquisition_date: date, polarizati
     return selected  # Return the one safe raster for the channel.
 
 
+# Find the before/after input GeoTIFFs that make up each temporal composite.
 def discover_composites(
     input_dir: Path,
     low_date: date | None = None,
@@ -349,6 +354,7 @@ def discover_composites(
     return composites, incomplete  # Return all plans and skipped-group count.
 
 
+# Check that the two inputs cover the same grid and are in the expected date order.
 def validate_temporal_pair(low_hv_path: Path, high_hh_path: Path) -> tuple[SceneInfo, SceneInfo]:
     """Verify HV-low and HH-high filenames are compatible before raster I/O.
 
@@ -379,6 +385,7 @@ def validate_temporal_pair(low_hv_path: Path, high_hh_path: Path) -> tuple[Scene
     return low_hv, high_hh  # Supply verified source metadata to the writer.
 
 
+# Stack the low-date HV and high-date HH rasters into one multi-band GeoTIFF.
 def stack_temporal_pair(low_hv_path: Path, high_hh_path: Path, output_path: Path) -> None:
     """Write one aligned float32 RGB GeoTIFF with HV, HH, HV channel mapping.
 
@@ -499,6 +506,7 @@ def stack_temporal_pair(low_hv_path: Path, high_hh_path: Path, output_path: Path
             temporary.unlink()  # Remove only the unique temporary file for this call.
 
 
+# Command-line entry point: discover inputs, build composites and report results.
 def main() -> int:
     """Run the documented command-line batch workflow.
 

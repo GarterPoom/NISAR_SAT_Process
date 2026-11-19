@@ -84,7 +84,9 @@ import uuid  # Give each temporary raster a unique filename.
 import numpy as np  # Calculate the difference band and pixel validity arrays.
 import rasterio  # Read and write georeferenced raster datasets.
 from rasterio.enums import ColorInterp, Resampling  # Label RGB channels and build overviews.
+# Base class for Rasterio I/O errors; subclassed so read failures can be caught separately.
 from rasterio.errors import RasterioIOError
+# Window describes the row/column block of a raster to read or write.
 from rasterio.windows import Window
 
 DEFAULT_INPUT_DIRECTORY = Path(r"GeoTIFF_Processed")  # Locate final rasters.
@@ -99,10 +101,12 @@ IDENTITY_FIELDS = ("scene", "product", "frequency")  # Required pair matches (ex
 LOG = logging.getLogger("NISAR_Band_Stack")  # Use one logger for all script functions.
 
 
+# Raised when a source tile still cannot be read after the dataset is reopened.
 class SourceReadError(RasterioIOError):
     """A source window remained unreadable after reopening the dataset."""
 
 
+# Read one tile of a source raster, reopening the file once if the first read fails.
 def read_source_window(source: rasterio.io.DatasetReader, window: Window) -> np.ma.MaskedArray:
     """Read a source tile, retrying once with a fresh handle after an I/O error.
 
@@ -137,6 +141,7 @@ def read_source_window(source: rasterio.io.DatasetReader, window: Window) -> np.
     return data  # Return the window data obtained from the fresh handle.
 
 
+# Write the CRS, size, data type and NoData of a source raster to the log.
 def log_source_metadata(label: str, source: rasterio.io.DatasetReader) -> None:
     """Log the metadata of one original input raster before it is stacked.
 
@@ -247,8 +252,10 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
         hv_runs = channels.get("HV", {})  # HV exports by timestamp.
 
         if len(hh_runs) == 1 and len(hv_runs) == 1:  # Unambiguous: pair regardless of export time.
+            # Exactly one HH and one HV export exist, so pair them even if their timestamps differ.
             matches = [(next(iter(hh_runs)), next(iter(hv_runs)))]
         else:  # Missing or multiple runs: require identical export timestamps.
+            # Pair only the HH and HV exports that share an identical export timestamp.
             matches = [(stamp, stamp) for stamp in sorted(hh_runs.keys() & hv_runs.keys())]
             unmatched = [("HV", stamp) for stamp in sorted(hh_runs.keys() - hv_runs.keys())]  # HH without HV.
             unmatched += [("HH", stamp) for stamp in sorted(hv_runs.keys() - hh_runs.keys())]  # HV without HH.
@@ -262,6 +269,7 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
             name = f"{label}_Flood_Bandstack_{stamp}"  # Name the output.
 
             if hh_stamp != hv_stamp:  # Make the differing run times visible.
+                # Warn that the paired HH and HV files come from different export runs.
                 LOG.warning("HH (%s) and HV (%s) export timestamps differ for %s; pairing them "
                             "because they are the only HH/HV files for this source",
                             hh_stamp, hv_stamp, label)
@@ -484,7 +492,9 @@ def main() -> int:  # Define the command-line batch workflow.
             created += 1  # Count the newly completed stack.
             LOG.info("Created: %s", output_path)  # Report the final output path.
         except SourceReadError as exc:
+            # Count this pair as failed because a source tile was unreadable.
             failed += 1
+            # Log which pair failed and why, then continue with the next pair.
             LOG.error("Failed pair: %s. %s", name, exc)
         except Exception:  # Continue the batch when an individual pair cannot be processed.
             failed += 1  # Count the unsuccessful pair.
