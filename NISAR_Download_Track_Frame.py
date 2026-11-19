@@ -88,7 +88,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     # Leave no pairs configured only if you want the script to stop before
     # searching, rather than accidentally downloading every AOI result.
     TRACK_FRAME_PAIRS: list[tuple[int, int]] = [  # List of (track, frame) integer pairs to search for.
-        (4, 81), (4, 82), (40, 6), (112, 5)# Configured Track/Frame pairs for the Thailand AOI.
+        (4, 81), (4, 82), (40, 6), (112, 5)  # Configured Track/Frame pairs for the Thailand AOI.
     ]  # End of TRACK_FRAME_PAIRS list.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.
