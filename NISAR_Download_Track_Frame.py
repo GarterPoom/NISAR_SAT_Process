@@ -68,13 +68,13 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
                              "Thailand_Admin",  # Subfolder holding the Thailand admin boundary shapefile.
-                             "tha_admbnda_adm1_rtsd_20190221.shp")  # Path to the shapefile defining the area of interest (AOI).
+                             "L05_Province_ESRI_2559.shp")  # Path to the shapefile defining the area of interest (AOI).
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
     DATE_MODE = 1  # Select date mode: 1 = manual START/END_DATE, 2 = rolling lookback window.
-    START_DATE = datetime.strptime("2026-11-05", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
-    END_DATE = datetime.strptime("2026-11-06", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    START_DATE = datetime.strptime("2026-11-12", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
+    END_DATE = datetime.strptime("2026-11-12", "%Y-%m-%d")  # Used only when DATE_MODE is 1.
     DATE_LOOKBACK_DAYS = 10  # Number of days to look back when DATE_MODE is 2.
 
     PRODUCT_LEVEL = "GSLC"  # NISAR processing level to filter results by.
@@ -88,7 +88,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     # Leave no pairs configured only if you want the script to stop before
     # searching, rather than accidentally downloading every AOI result.
     TRACK_FRAME_PAIRS: list[tuple[int, int]] = [  # List of (track, frame) integer pairs to search for.
-        (4, 81), (4, 82), (11, 8), (11, 9), (11, 10)  # Configured Track/Frame pairs for the Thailand AOI.
+        (4, 81), (4, 82), (40, 6), (112, 5)# Configured Track/Frame pairs for the Thailand AOI.
     ]  # End of TRACK_FRAME_PAIRS list.
 
     MAX_RESULTS = 100  # Maximum number of granules the search will return.

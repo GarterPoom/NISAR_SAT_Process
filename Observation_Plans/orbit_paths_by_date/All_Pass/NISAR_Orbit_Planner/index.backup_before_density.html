@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NISAR Orbit Planner</title>
+<link rel="stylesheet" href="lib/leaflet.css">
+<style>
+:root{
+  --bg:#0f1419; --panel:#161c23; --panel2:#1d252e; --line:#2a3440; --text:#e6edf3; --muted:#8b98a5;
+  --asc:#38bdf8; --desc:#f59e0b; --accent:#22c55e; --warn:#f87171; --sel:#facc15;
+  --sea:#0b1d2c; --land:#1c2530; --th:#22303b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+#app{display:grid;grid-template-columns:400px 1fr;height:100vh}
+#side{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;display:flex;flex-direction:column}
+#mapwrap{position:relative}
+#map{position:absolute;inset:0;background:var(--sea)}
+header{padding:14px 16px 10px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:16px;letter-spacing:.3px}
+header .sub{color:var(--muted);font-size:12px}
+section{padding:12px 16px;border-bottom:1px solid var(--line)}
+section h2{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.row{display:flex;gap:6px;align-items:center}
+select,input,button{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+button{cursor:pointer}
+button:hover{border-color:#4b5a6a}
+select{flex:1}
+.seg{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;flex:1}
+.seg button{flex:1;border:0;border-radius:0;background:var(--panel2);padding:7px 4px}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button.on{background:#2b3a49;color:#fff;font-weight:600}
+.seg button.on.A{box-shadow:inset 0 -3px 0 var(--asc)}
+.seg button.on.D{box-shadow:inset 0 -3px 0 var(--desc)}
+.seg button.on.AD{box-shadow:inset 0 -3px 0 #a3e635}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.kpi{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px}
+.kpi b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+.kpi span{color:var(--muted);font-size:11px}
+.info{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;margin-top:8px;font-size:12px}
+.info dt{color:var(--muted)}
+.info dd{margin:0}
+.badge{display:inline-block;padding:1px 6px;border-radius:10px;font-size:11px;font-weight:600}
+.bA{background:rgba(56,189,248,.18);color:var(--asc)}
+.bD{background:rgba(245,158,11,.18);color:var(--desc)}
+.bPast{background:#2a3036;color:var(--muted)}
+.bNext{background:rgba(34,197,94,.18);color:var(--accent)}
+.bWarn{background:rgba(248,113,113,.18);color:var(--warn)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:4px 5px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel)}
+td.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.scene{cursor:pointer}
+tr.scene:hover td{background:#1f2933}
+tr.scene.sel td{background:#2a3320}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.scroll{max-height:300px;overflow:auto}
+.muted{color:var(--muted)}
+.small{font-size:11px}
+/* calendar */
+#cal{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.mon{font-size:10px}
+.mon .mt{color:var(--muted);margin-bottom:2px;font-weight:600}
+.mon .g{display:grid;grid-template-columns:repeat(7,1fr);gap:1px}
+.mon .d{aspect-ratio:1;border-radius:2px;background:#1a2129;font-size:8px;display:flex;align-items:center;justify-content:center;color:#5a6672}
+.mon .d.has{cursor:pointer;color:#0f1419;font-weight:700}
+.mon .d.today{outline:1px solid #fff}
+.mon .d.sel{outline:2px solid var(--sel);outline-offset:0}
+.legend{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--muted);margin-top:6px}
+.ramp{width:80px;height:8px;border-radius:2px}
+/* detail panel on map */
+#detail{position:absolute;right:12px;top:12px;width:380px;max-height:calc(100% - 24px);overflow:auto;background:rgba(22,28,35,.96);border:1px solid var(--line);border-radius:10px;z-index:500;display:none;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+#detail .hd{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#161c23}
+#detail .hd b{font-size:14px}
+#detail .bd{padding:10px 12px}
+#detail .x{background:none;border:0;font-size:18px;color:var(--muted);padding:0 4px}
+.mode{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin:4px 0;font-size:12px}
+.mode code{color:#cbd5e1;font-size:11px;word-break:break-all}
+#hint{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(22,28,35,.92);border:1px solid var(--line);border-radius:20px;padding:5px 14px;z-index:450;color:var(--muted);font-size:12px;pointer-events:none}
+#detail a,#side a{color:#93c5fd}
+.leaflet-control-layers-toggle{filter:invert(1) brightness(1.4)}
+#coord{position:absolute;right:10px;bottom:24px;background:rgba(22,28,35,.85);border-radius:6px;padding:3px 8px;z-index:450;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.leaflet-container{background:var(--sea);font:inherit}
+.leaflet-control-layers,.leaflet-bar a{background:#1d252e!important;color:var(--text)!important;border-color:var(--line)!important}
+.leaflet-control-layers{border:1px solid var(--line)!important}
+.leaflet-control-layers-separator{border-top-color:var(--line)!important}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#1d252e;color:var(--text)}
+.leaflet-tooltip{background:#1d252e;color:var(--text);border-color:var(--line)}
+.leaflet-tooltip:before{display:none}
+.lbl{color:#9fb0bf;font-size:10px;white-space:nowrap;text-shadow:0 0 3px #000,0 0 3px #000;pointer-events:none;transform:translate(-50%,-50%)}
+.lbl.city{color:#e6edf3;font-size:11px}
+.lbl.city:before{content:"";display:inline-block;width:4px;height:4px;background:#e6edf3;border-radius:50%;margin-right:3px;vertical-align:2px}
+.lbl.country{color:#6b7c8c;font-size:12px;letter-spacing:2px;text-transform:uppercase}
+.lbl.scn{color:#fff;font-size:10px;font-weight:700}
+.chk{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:12px}
+.chk label{display:flex;align-items:center;gap:4px;cursor:pointer}
+input[type=checkbox]{accent-color:var(--accent);padding:0}
+.btns{display:flex;gap:6px;flex-wrap:wrap}
+.btns button{font-size:12px;padding:5px 8px}
+#provSearch{width:100%}
+footer{padding:10px 16px;color:var(--muted);font-size:11px;margin-top:auto}
+@media (max-width:900px){#app{grid-template-columns:1fr;grid-template-rows:55vh auto}#side{order:2}#mapwrap{order:1}#detail{width:calc(100% - 24px)}}
+</style>
+</head>
+<body>
+<div id="app">
+<aside id="side">
+  <header>
+    <h1>NISAR Orbit Planner — Thailand</h1>
+    <div class="sub" id="subtitle">Observation plan footprints from KMZ files</div>
+  </header>
+
+  <section>
+    <h2>Acquisition date</h2>
+    <div class="row">
+      <button id="prev" title="Previous acquisition date">◀</button>
+      <select id="date"></select>
+      <button id="next" title="Next acquisition date">▶</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button id="gotoNext" style="flex:1">Jump to next upcoming pass</button>
+    </div>
+    <h2 style="margin-top:12px">Orbit direction</h2>
+    <div class="seg" id="dirSeg">
+      <button data-d="A" class="A">Ascending</button>
+      <button data-d="D" class="D">Descending</button>
+      <button data-d="AD" class="AD">Both</button>
+    </div>
+    <h2 style="margin-top:12px">Display</h2>
+    <div class="chk">
+      <label><input type="checkbox" id="optFull" checked>Full scene footprint</label>
+      <label><input type="checkbox" id="optClip" checked>Clipped to Thailand</label>
+      <label><input type="checkbox" id="optLbl" checked>Track/frame labels</label>
+      <label><input type="checkbox" id="optNoMode">Show scenes w/o radar mode</label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="muted small" style="white-space:nowrap">Track</span>
+      <select id="trackSel"><option value="">All tracks</option></select>
+    </div>
+  </section>
+
+  <section>
+    <h2>Pass summary <span id="dayBadge"></span></h2>
+    <div class="kpis">
+      <div class="kpi"><b id="kScenes">–</b><span>frames</span></div>
+      <div class="kpi"><b id="kCov">–</b><span>of Thailand covered</span></div>
+      <div class="kpi"><b id="kKm2">–</b><span>km² over Thailand</span></div>
+    </div>
+    <dl class="info" id="passInfo"></dl>
+  </section>
+
+  <section>
+    <h2>Scenes on this date <span class="muted small">click to zoom &amp; details</span></h2>
+    <div class="scroll"><table id="sceneTbl"><thead><tr><th></th><th>Scene</th><th>Dir</th><th class="n">TH km²</th><th>Pol</th><th>Next repeat</th></tr></thead><tbody></tbody></table></div>
+    <div class="btns" style="margin-top:8px">
+      <button id="expCsv">Export CSV</button>
+      <button id="expGeo">Export GeoJSON</button>
+      <button id="expKml">Export KML</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Provinces covered</h2>
+    <div class="scroll" style="max-height:220px"><table id="provTbl"><thead><tr><th>Province</th><th>Region</th><th class="n">% covered</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>Find passes for a province</h2>
+    <input id="provSearch" list="provList" placeholder="Type a province, e.g. Bangkok, Chiang Mai…">
+    <datalist id="provList"></datalist>
+    <div class="muted small" style="margin-top:6px">Or click anywhere on the map to list every pass covering that point.</div>
+  </section>
+
+  <section>
+    <h2>2026 calendar <span class="muted small">colour = Thailand coverage</span></h2>
+    <div id="cal"></div>
+    <div class="legend"><span>0%</span><div class="ramp" id="ramp"></div><span id="rampMax">100%</span><span>□ today ▣ selected</span></div>
+  </section>
+
+  <footer>
+    Offline basemap: Natural Earth 1:10m (public domain). Footprints &amp; radar modes come from the NISAR observation-plan KMZs.
+    Overpass times are nominal estimates for a 6 AM/6 PM sun-synchronous orbit — confirm exact UTC times with the official plan / ASF before tasking field work.
+  </footer>
+</aside>
+
+<div id="mapwrap">
+  <div id="map"></div>
+  <div id="detail"><div class="hd"><b id="dTitle"></b><button class="x" id="dClose">×</button></div><div class="bd" id="dBody"></div></div>
+  <div id="hint">Click anywhere on the map to list every pass over that point · click a row for scene details</div>
+  <div id="coord"></div>
+</div>
+</div>
+
+<script src="lib/leaflet.js"></script>
+<script src="data/basemap.js"></script>
+<script src="data/data.js"></script>
+<script>
+(function(){
+const D = window.NISAR, B = window.BASEMAP;
+const TODAY = new Date(); TODAY.setHours(0,0,0,0);
+const fmt = n => n.toLocaleString('en-US',{maximumFractionDigits:0});
+const fmt1 = n => n.toLocaleString('en-US',{maximumFractionDigits:1});
+const $ = id => document.getElementById(id);
+const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const parseD = s => { const [y,m,d]=s.split('-').map(Number); return new Date(y,m-1,d); };
+const dayDiff = s => Math.round((parseD(s)-TODAY)/864e5);
+const esc = s => String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- index data
+const scenes = D.scenes;
+scenes.forEach((s,i)=>{ s.i=i; s.noMode = !s.mode; });
+const dates = [...new Set(scenes.map(s=>s.date))].sort();
+const byDate = {}; scenes.forEach(s=>(byDate[s.date]=byDate[s.date]||[]).push(s));
+const byKey = {}; // track/frame/dir -> sorted list
+scenes.forEach(s=>{const k=s.dir+s.track+'_'+s.frame;(byKey[k]=byKey[k]||[]).push(s);});
+Object.values(byKey).forEach(a=>a.sort((x,y)=>x.date<y.date?-1:1));
+const tracks = [...new Set(scenes.map(s=>s.dir+'|'+s.track))].sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:(+a.slice(2))-(+b.slice(2)));
+const TRACK_COL = {};
+const warm=['#f97316','#fdba74','#ea580c','#fb923c','#f59e0b'], cool=['#3b82f6','#7dd3fc','#2563eb','#38bdf8','#60a5fa']; // D = orange shades, A = blue shades
+let wa=0,co=0; tracks.forEach(t=>{TRACK_COL[t]= t[0]==='A'?cool[co++%5]:warm[wa++%5];});
+const colOf = s => TRACK_COL[s.dir+'|'+s.track];
+$('subtitle').textContent = `${dates.length} acquisition dates · ${dates[0]} → ${dates[dates.length-1]} · ${scenes.length} scenes · ${tracks.length} tracks`;
+
+// ---------- radar mode decoding
+const POL = {SH:'Single-pol HH',SV:'Single-pol VV',DH:'Dual-pol HH + HV',DV:'Dual-pol VV + VH',QP:'Quad-pol (HH,HV,VH,VV)',QQ:'Quasi-quad pol',QD:'Quasi-quad pol',CP:'Compact pol (RH,RV)',DB:'Dual-band'};
+function decodeToken(t){
+  const p=t.split(':'); const band=p[0];
+  const r={raw:t, band: band==='L'?'L-band (24 cm)':band==='S'?'S-band (10 cm, ISRO)':band};
+  const pol=p.find(x=>/^(SH|SV|DH|DV|QP|QQ|QD|CP)$/.test(x)); r.pol=pol; r.polTxt=POL[pol]||pol||'?';
+  const bw=p.find(x=>/^\d+(\.\d+)?[MW]/.test(x));
+  if(bw){
+    const m=bw.match(/^(\d+(?:\.\d+)?)[MW](?:\+(\d+(?:\.\d+)?)[A-Z])?/);
+    const main=+m[1]; r.bw=main; r.aux=m[2]?+m[2]:null;
+    const slant=3e8/(2*main*1e6);
+    r.res=`${fmt1(main)} MHz${r.aux?` + ${r.aux} MHz aux. band`:''} → ≈${slant.toFixed(1)} m slant-range (≈${(slant/Math.sin(47*Math.PI/180)).toFixed(0)}–${(slant/Math.sin(33*Math.PI/180)).toFixed(0)} m ground-range)`;
+  }
+  if(p.includes('FS')) r.swath='FS (likely full ~240 km swath)';
+  if(p.includes('SCI')) r.purpose='Science observation';
+  return r;
+}
+function decodeMode(mode){
+  if(!mode) return [];
+  const segs=[];
+  mode.split(/\s*\|\s*|\s*,\s*/).forEach(seg=>{
+    seg.split(/\s+(?=[LS]:)/).forEach(t=>{ if(t && !segs.some(x=>x.raw===t)) segs.push(decodeToken(t)); });
+  });
+  return segs;
+}
+function polSummary(s){
+  if(!s.mode) return '<span class="badge bWarn">none</span>';
+  const d=decodeMode(s.mode); const pols=[...new Set(d.filter(x=>x.band.startsWith('L')).map(x=>x.pol))];
+  const hasS=d.some(x=>x.band.startsWith('S'));
+  return pols.join('/')+(hasS?' +S':'');
+}
+
+// ---------- map
+const map = L.map('map',{preferCanvas:true,zoomControl:true,minZoom:4,maxZoom:14,worldCopyJump:false}).setView([13.2,101],6);
+map.createPane('base'); map.getPane('base').style.zIndex=200;
+map.createPane('foot'); map.getPane('foot').style.zIndex=420;
+map.createPane('labels'); map.getPane('labels').style.zIndex=640; map.getPane('labels').style.pointerEvents='none';
+const rBase = L.canvas({pane:'base'}), rFoot = L.canvas({pane:'foot',tolerance:3});
+
+const offline = L.layerGroup();
+L.geoJSON(B.countries,{renderer:rBase,pane:'base',style:f=>({color:'#3a4856',weight:1,fillColor:f.properties.a3==='THA'?'#212d38':'#1a222b',fillOpacity:1}),interactive:false}).addTo(offline);
+L.geoJSON(B.lakes,{renderer:rBase,pane:'base',style:{color:'#1b3a55',weight:.5,fillColor:'#0e2638',fillOpacity:1},interactive:false}).addTo(offline);
+const provLayer = L.geoJSON(B.provinces,{renderer:rBase,pane:'base',style:{color:'#3b4c5c',weight:.6,fill:false},interactive:false});
+const riverLayer = L.geoJSON(B.rivers,{renderer:rBase,pane:'base',style:{color:'#1f4f73',weight:1.1},interactive:false});
+const roadLayer = L.geoJSON(B.roads,{renderer:rBase,pane:'base',style:{color:'#5b4b3a',weight:.8,opacity:.8},interactive:false});
+const thBorder = L.geoJSON(D.border,{renderer:rBase,pane:'base',style:{color:'#4ade80',weight:1.4,fill:false,opacity:.8},interactive:false});
+offline.addLayer(provLayer); offline.addLayer(riverLayer); offline.addLayer(thBorder); offline.addTo(map);
+
+// labels (zoom-dependent)
+const lblCountry=L.layerGroup(), lblProv=L.layerGroup(), lblCity=L.layerGroup();
+const CPOS={THA:[15.6,101.3],MMR:[20.5,96.5],LAO:[19.2,102.8],KHM:[12.6,104.9],VNM:[15.5,107.8],MYS:[4.5,102],CHN:[25,104]};
+B.countries.features.forEach(f=>{const p=CPOS[f.properties.a3]; if(p&&f.properties.a3!=='THA') L.marker(p,{pane:'labels',interactive:false,icon:L.divIcon({className:'',html:`<div class="lbl country">${esc({CHN:'China',LAO:'Laos',VNM:'Vietnam'}[f.properties.a3]||f.properties.n)}</div>`,iconSize:[0,0]})}).addTo(lblCountry);});
+B.provinces.features.forEach(f=>{const p=f.properties; L.marker([p.lat,p.lon],{pane:'labels',interactive:false,icon:L.divIcon({className:'',html:`<div class="lbl">${esc(p.n)}</div>`,iconSize:[0,0]})}).addTo(lblProv);});
+B.places.features.forEach(f=>{const p=f.properties,c=f.geometry.coordinates; if(p.r>6 && !p.cap) return; L.marker([c[1],c[0]],{pane:'labels',interactive:false,icon:L.divIcon({className:'',html:`<div class="lbl city">${esc(p.n)}</div>`,iconSize:[0,0]})}).addTo(lblCity);});
+function zoomLabels(){const z=map.getZoom();
+  z<=7?lblCountry.addTo(map):lblCountry.remove();
+  z>=8?lblProv.addTo(map):lblProv.remove();
+  z>=6?lblCity.addTo(map):lblCity.remove();}
+map.on('zoomend',zoomLabels); zoomLabels();
+
+// optional online layers (only work with internet)
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
+const esri = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Esri World Imagery'});
+L.control.layers(
+  {'Offline vector (Natural Earth)':L.layerGroup(),'OpenStreetMap (online)':osm,'Esri satellite (online)':esri},
+  {'Province boundaries':provLayer,'Rivers':riverLayer,'Major roads':roadLayer,'Thailand border':thBorder},
+  {collapsed:true,position:'topleft'}).addTo(map);
+L.control.scale({imperial:false}).addTo(map);
+map.on('baselayerchange',e=>{ if(e.layer===osm||e.layer===esri){ offline.eachLayer(l=>{if(l!==provLayer&&l!==riverLayer&&l!==thBorder&&l!==roadLayer) l.setStyle&&l.setStyle({fillOpacity:0,opacity:.4});}); } else { offline.eachLayer(l=>l.resetStyle&&l.resetStyle()); }});
+map.on('mousemove',e=>$('coord').textContent=`${e.latlng.lat.toFixed(4)}°N, ${e.latlng.lng.toFixed(4)}°E`);
+
+// ---------- state
+const st = {date:null, dir:'AD', track:'', full:true, clip:true, lbl:true, noMode:false, selScene:null};
+try{ const sv=JSON.parse(localStorage.getItem('nisarPlanner')||'{}'); if(sv.dir) st.dir=sv.dir; }catch(e){}
+const save=()=>{try{localStorage.setItem('nisarPlanner',JSON.stringify({dir:st.dir}));}catch(e){}};
+
+const footLayer = L.layerGroup().addTo(map), lblLayer=L.layerGroup().addTo(map), hiLayer=L.layerGroup().addTo(map), qLayer=L.layerGroup().addTo(map);
+
+function visible(){
+  return (byDate[st.date]||[]).filter(s=>(st.dir==='AD'||s.dir===st.dir)&&(!st.track||s.dir+'|'+s.track===st.track)&&(st.noMode||!s.noMode));
+}
+function nextRepeat(s){ const a=byKey[s.dir+s.track+'_'+s.frame]; const i=a.indexOf(s); return a[i+1]||null; }
+function prevRepeat(s){ const a=byKey[s.dir+s.track+'_'+s.frame]; const i=a.indexOf(s); return a[i-1]||null; }
+
+// ---------- controls
+const dsel=$('date');
+dates.forEach(d=>{const o=document.createElement('option');o.value=d;const dd=dayDiff(d);o.textContent=`${d} (${DOW[parseD(d).getDay()]})${dd===0?' · today':''}`;dsel.appendChild(o);});
+tracks.forEach(t=>{const o=document.createElement('option');o.value=t;o.textContent=`Track ${t.slice(2)} — ${t[0]==='A'?'Ascending':'Descending'}`;$('trackSel').appendChild(o);});
+B.provinces.features.map(f=>f.properties.n).sort().forEach(n=>{const o=document.createElement('option');o.value=n;$('provList').appendChild(o);});
+const upcoming = dates.find(d=>dayDiff(d)>=0) || dates[dates.length-1];
+st.date = upcoming;
+
+dsel.onchange=()=>{st.date=dsel.value;st.selScene=null;render(true);};
+$('prev').onclick=()=>step(-1); $('next').onclick=()=>step(1);
+$('gotoNext').onclick=()=>{st.date=upcoming;st.selScene=null;render(true);};
+function step(k){const i=dates.indexOf(st.date)+k; if(i>=0&&i<dates.length){st.date=dates[i];st.selScene=null;render(true);}}
+document.querySelectorAll('#dirSeg button').forEach(b=>b.onclick=()=>{st.dir=b.dataset.d;st.selScene=null;save();render(true);});
+$('trackSel').onchange=e=>{st.track=e.target.value;render(true);};
+$('optFull').onchange=e=>{st.full=e.target.checked;render();};
+$('optClip').onchange=e=>{st.clip=e.target.checked;render();};
+$('optLbl').onchange=e=>{st.lbl=e.target.checked;render();};
+$('optNoMode').onchange=e=>{st.noMode=e.target.checked;render();};
+$('dClose').onclick=()=>{lastQuery=null;$('detail').style.display='none';st.selScene=null;hiLayer.clearLayers();qLayer.clearLayers();highlightRow();};
+document.addEventListener('keydown',e=>{ if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return; if(e.key==='ArrowLeft')step(-1); if(e.key==='ArrowRight')step(1); if(e.key==='Escape')$('dClose').click();});
+
+// ---------- render
+function render(fit){
+  dsel.value=st.date;
+  document.querySelectorAll('#dirSeg button').forEach(b=>b.classList.toggle('on',b.dataset.d===st.dir));
+  const vis=visible();
+  footLayer.clearLayers(); lblLayer.clearLayers();
+  const bounds=L.latLngBounds([]);
+  vis.forEach(s=>{
+    const c=colOf(s);
+    if(st.full){ const g=L.geoJSON(s.full,{renderer:rFoot,pane:'foot',style:{color:c,weight:1.6,dashArray:s.dir==='D'?'6 4':null,fillColor:c,fillOpacity:st.clip?0.04:0.15,opacity:s.noMode?.45:.95}});
+      g.bindTooltip(`${s.scene} · ${s.dir==='A'?'Asc':'Desc'} · ${fmt(s.km2)} km² over TH`,{sticky:true}); g.addTo(footLayer); bounds.extend(g.getBounds()); }
+    if(st.clip && s.clip){ const g=L.geoJSON(s.clip,{renderer:rFoot,pane:'foot',style:{color:c,weight:.6,fillColor:c,fillOpacity:s.noMode?.12:.32}});
+      if(!st.full) g.bindTooltip(`${s.scene} · ${fmt(s.km2)} km²`,{sticky:true}); g.addTo(footLayer); if(!st.full) bounds.extend(g.getBounds()); }
+    if(st.lbl){ L.marker([s.c[1],s.c[0]],{pane:'labels',interactive:false,icon:L.divIcon({className:'',html:`<div class="lbl scn" style="color:${c}">T${s.track}·F${s.frame}</div>`,iconSize:[0,0]})}).addTo(lblLayer); }
+  });
+  if(fit && bounds.isValid()) map.fitBounds(bounds.pad(0.05),{maxZoom:7});
+  renderSummary(vis); renderTable(vis); renderProv(vis); renderCal();
+  if(st.selScene && !vis.includes(st.selScene)){ $('detail').style.display='none'; st.selScene=null; hiLayer.clearLayers(); }
+}
+
+function overpass(dir){ return dir==='A' ? '≈ 18:00 local (≈ 11:00 UTC), evening' : '≈ 06:00 local (≈ 23:00 UTC prev. day), dawn'; }
+function renderSummary(vis){
+  const dd=dayDiff(st.date);
+  $('dayBadge').innerHTML = dd<0?`<span class="badge bPast">${-dd} days ago</span>`: dd===0?`<span class="badge bNext">TODAY</span>`:`<span class="badge bNext">in ${dd} day${dd>1?'s':''}</span>`;
+  $('kScenes').textContent=vis.length;
+  const dirs = st.dir==='AD'?['A','D']:[st.dir];
+  let cov = (st.track||st.noMode) ? null : (D.cov[st.date+'_'+st.dir] ?? 0);
+  const km=vis.reduce((a,s)=>a+s.km2,0);
+  if(cov==null){ // approximate union by province areas for "both"/track filters
+    const pc={}; vis.forEach(s=>s.prov.forEach(p=>{pc[p[0]]=Math.min(100,Math.max(pc[p[0]]||0,p[2]));}));
+    const provArea = provAreas();
+    let a=0; for(const k in pc) a+=provArea[k]*pc[k]/100; cov=100*a/D.thKm2; $('kCov').textContent='≥'+fmt1(cov)+'%';
+  } else $('kCov').textContent=fmt1(cov)+'%';
+  $('kKm2').textContent=fmt(km);
+  const d=parseD(st.date);
+  const trk=[...new Set(vis.map(s=>s.dir+s.track))];
+  const modes={}; vis.forEach(s=>decodeMode(s.mode).forEach(m=>modes[m.band.split(' ')[0]+' '+m.pol]=(modes[m.band.split(' ')[0]+' '+m.pol]||0)+1));
+  const nomode=vis.filter(s=>s.noMode).length;
+  const hasSBand = vis.some(s=>decodeMode(s.mode).some(m=>m.band.startsWith('S')));
+  const ni=dates.indexOf(st.date);
+  let html=`<dt>Date</dt><dd>${d.getDate()} ${MON[d.getMonth()]} ${d.getFullYear()} (${DOW[d.getDay()]}) · DOY ${Math.round((d-new Date(d.getFullYear(),0,0))/864e5)}</dd>`;
+  dirs.forEach(x=>{ if(vis.some(s=>s.dir===x)) html+=`<dt>${x==='A'?'Ascending':'Descending'}</dt><dd><span class="badge b${x}">${x==='A'?'S→N':'N→S'}</span> overpass ${overpass(x)}</dd>`; });
+  html+=`<dt>Tracks</dt><dd>${trk.map(t=>`<span class="sw" style="background:${TRACK_COL[t[0]+'|'+t.slice(1)]}"></span>${t[0]} ${t.slice(1)}`).join(' &nbsp;')||'–'}</dd>`;
+  html+=`<dt>Radar modes</dt><dd>${Object.entries(modes).map(([k,v])=>`${k} ×${v}`).join(', ')||'–'}</dd>`;
+  html+=`<dt>S-band</dt><dd>${hasSBand?'<span class="badge bNext">yes</span> S-SAR also planned on some frames':'L-band only'}</dd>`;
+  if(nomode) html+=`<dt>Note</dt><dd><span class="badge bWarn">${nomode} frame${nomode>1?'s':''}</span> without radar mode in plan</dd>`;
+  html+=`<dt>Repeat cycle</dt><dd>12 days (same track/frame). Next date of this geometry: ${vis.length?(nextRepeat(vis[0])?nextRepeat(vis[0]).date:'beyond plan'):'–'}</dd>`;
+  html+=`<dt>Adjacent dates</dt><dd>${ni>0?dates[ni-1]:'–'} ◂ ▸ ${ni<dates.length-1?dates[ni+1]:'–'}</dd>`;
+  $('passInfo').innerHTML=html;
+}
+let _pa=null; function provAreas(){ if(_pa) return _pa; _pa={}; scenes.forEach(s=>s.prov.forEach(p=>{ if(p[2]>0) { const a=p[1]*100/p[2]; if(!_pa[p[0]]||p[2]>50) _pa[p[0]]=a; } })); return _pa; }
+
+function renderTable(vis){
+
+  const tb=$('sceneTbl').querySelector('tbody'); tb.innerHTML='';
+  vis.slice().sort((a,b)=>a.dir.localeCompare(b.dir)||a.track-b.track||a.frame-b.frame).forEach(s=>{
+    const nr=nextRepeat(s); const tr=document.createElement('tr'); tr.className='scene'; tr.dataset.i=s.i;
+    tr.innerHTML=`<td><span class="sw" style="background:${colOf(s)}"></span></td><td>${s.scene}</td><td><span class="badge b${s.dir}">${s.dir}</span></td><td class="n">${fmt(s.km2)}</td><td>${polSummary(s)}</td><td>${nr?nr.date.slice(5):'—'}</td>`;
+    tr.onclick=()=>{lastQuery=null;qLayer.clearLayers();selectScene(s,true);}; tb.appendChild(tr);
+  });
+  if(!vis.length) tb.innerHTML='<tr><td colspan="6" class="muted">No scenes for this filter.</td></tr>';
+  highlightRow();
+}
+function highlightRow(){ document.querySelectorAll('tr.scene').forEach(r=>r.classList.toggle('sel',st.selScene&&+r.dataset.i===st.selScene.i)); }
+
+function renderProv(vis){
+  const pc={}; const reg={};
+  B.provinces.features.forEach(f=>reg[f.properties.n]=f.properties.rg);
+  vis.forEach(s=>s.prov.forEach(p=>{ if(p[2]<0.05) return; const o=pc[p[0]]||(pc[p[0]]={pct:0,sc:new Set()}); o.pct=Math.max(o.pct,p[2]); o.sc.add(s.scene+s.dir); }));
+  const rows=Object.entries(pc).sort((a,b)=>b[1].pct-a[1].pct);
+  $('provTbl').querySelector('tbody').innerHTML = rows.map(([n,o])=>`<tr><td>${esc(n)}</td><td class="muted">${esc(reg[n]||'')}</td><td class="n">${o.pct>=99.5?'100':fmt1(o.pct)}${o.sc.size>1?` <span class="muted small">(${o.sc.size} fr.)</span>`:''}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">None</td></tr>';
+}
+
+// ---------- calendar
+function covColor(v){ // 0..60 -> dark to green
+  const t=Math.max(0,Math.min(1,v/60)); const a=[30,45,55], b=[163,230,53];
+  return `rgb(${a.map((x,i)=>Math.round(x+(b[i]-x)*t)).join(',')})`;
+}
+$('ramp').style.background=`linear-gradient(90deg,${covColor(0)},${covColor(30)},${covColor(60)})`; $('rampMax').textContent='≥60%';
+function dateCov(d){ return D.cov[d+'_'+st.dir]||0; }
+function renderCal(){
+  const y=parseD(dates[0]).getFullYear(); const set=new Set(dates); let h='';
+  for(let m=0;m<12;m++){
+    h+=`<div class="mon"><div class="mt">${MON[m]}</div><div class="g">`;
+    const first=new Date(y,m,1).getDay(), n=new Date(y,m+1,0).getDate();
+    for(let i=0;i<first;i++) h+='<div></div>';
+    for(let d=1;d<=n;d++){
+      const ds=`${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const has=set.has(ds); const cls=['d']; if(has)cls.push('has'); if(ds===st.date)cls.push('sel');
+      if(+new Date(y,m,d)===+TODAY) cls.push('today');
+      const cv=has?dateCov(ds):0;
+      h+=`<div class="${cls.join(' ')}" ${has?`data-d="${ds}" title="${ds} · ${st.dir==='AD'?'A+D':st.dir} ≈${fmt1(cv)}% of Thailand" style="background:${covColor(cv)}"`:''}>${d}</div>`;
+    }
+    h+='</div></div>';
+  }
+  $('cal').innerHTML=h;
+  $('cal').querySelectorAll('.d.has').forEach(e=>e.onclick=()=>{st.date=e.dataset.d;st.selScene=null;render(true);});
+}
+
+// ---------- scene details
+function selectScene(s,zoom){
+  st.selScene=s; hiLayer.clearLayers(); if(!lastQuery) qLayer.clearLayers();
+  const g=L.geoJSON(s.full,{renderer:rFoot,pane:'foot',style:{color:'#facc15',weight:3,fill:false},interactive:false}).addTo(hiLayer);
+  if(zoom) map.fitBounds(g.getBounds().pad(0.15));
+  const nr=nextRepeat(s), pr=prevRepeat(s), all=byKey[s.dir+s.track+'_'+s.frame];
+  const modes=decodeMode(s.mode);
+  const fut=all.filter(x=>dayDiff(x.date)>=0);
+  let h=(lastQuery?`<div style="margin-bottom:8px"><a href="#" id="backQ">◂ Back to pass list</a></div>`:'')+`<div class="row" style="gap:6px;margin-bottom:6px"><span class="badge b${s.dir}">${s.dir==='A'?'Ascending · S→N':'Descending · N→S'}</span><span class="sw" style="background:${colOf(s)}"></span><span class="muted">Track ${s.track} · Frame ${s.frame}</span></div>
+  <dl class="info">
+  <dt>Scene ID</dt><dd>${esc(s.id)}</dd>
+  <dt>Plan source ID</dt><dd>${esc(s.src)}</dd>
+  <dt>Acquisition</dt><dd>${s.date} (${DOW[parseD(s.date).getDay()]}) · ${overpass(s.dir)}</dd>
+  <dt>Look side</dt><dd>Left-looking (NISAR nominal); incidence ≈33–47° across swath</dd>
+  <dt>Scene area</dt><dd>${fmt(s.sceneKm2)} km²</dd>
+  <dt>Over Thailand</dt><dd>${fmt(s.km2)} km² (${fmt1(s.pct)}% of scene)</dd>
+  <dt>Scene centre</dt><dd>${s.c[1].toFixed(3)}°N, ${s.c[0].toFixed(3)}°E</dd>
+  <dt>Prev. repeat</dt><dd>${pr?`<a href="#" data-go="${pr.date}">${pr.date}</a> (${Math.round((parseD(s.date)-parseD(pr.date))/864e5)} d before)`:'—'}</dd>
+  <dt>Next repeat</dt><dd>${nr?`<a href="#" data-go="${nr.date}">${nr.date}</a> (+${Math.round((parseD(nr.date)-parseD(s.date))/864e5)} d) — InSAR pair`:'— (end of plan)'}</dd>
+  </dl>
+  <h2 style="margin:12px 0 4px;font-size:11px;text-transform:uppercase;color:var(--muted)">Radar mode</h2>`;
+  if(!modes.length) h+=`<div class="mode"><span class="badge bWarn">No radar mode in plan</span><div class="small muted" style="margin-top:4px">The footprint is in the plan file but no mode mnemonic is listed — the instrument may not be collecting here. Verify before relying on it.</div></div>`;
+  modes.forEach(m=>{ h+=`<div class="mode"><b>${m.band}</b> · ${m.polTxt}${m.purpose?` · ${m.purpose}`:''}<br>${m.res?`<span class="small">${m.res}</span><br>`:''}${m.swath?`<span class="small muted">${m.swath}</span><br>`:''}<code>${esc(m.raw)}</code></div>`; });
+  if(modes.length>1) h+=`<div class="small muted">Multiple mnemonics = the mode changes along the frame (different segments of the datatake).</div>`;
+  h+=`<h2 style="margin:12px 0 4px;font-size:11px;text-transform:uppercase;color:var(--muted)">Provinces in this frame</h2><table><tr><th>Province</th><th class="n">km²</th><th class="n">% of prov.</th></tr>${s.prov.map(p=>`<tr><td>${esc(p[0])}</td><td class="n">${fmt(p[1])}</td><td class="n">${fmt1(p[2])}</td></tr>`).join('')||'<tr><td colspan=3 class="muted">–</td></tr>'}</table>`;
+  h+=`<h2 style="margin:12px 0 4px;font-size:11px;text-transform:uppercase;color:var(--muted)">All dates for T${s.track} F${s.frame} ${s.dir} (${all.length})</h2><div class="small" style="line-height:1.9">${all.map(x=>`<a href="#" data-go="${x.date}" class="badge ${x===s?'bNext':dayDiff(x.date)<0?'bPast':'b'+s.dir}" style="text-decoration:none">${x.date.slice(5)}</a>`).join(' ')}</div>
+  <div class="small muted" style="margin-top:6px">${fut.length} upcoming acquisitions of this geometry from today.</div>`;
+  $('dTitle').textContent=`${s.scene} · ${s.date}`; $('dBody').innerHTML=h; $('detail').style.display='block';
+  $('dBody').querySelectorAll('[data-go]').forEach(a=>a.onclick=e=>{e.preventDefault(); goScene(a.dataset.go,s);});
+  if($('backQ')) $('backQ').onclick=e=>{e.preventDefault(); hiLayer.clearLayers(); lastQuery();};
+  highlightRow();
+}
+function goScene(date,s){ st.date=date; render(false); const t=byDate[date].find(x=>x.dir===s.dir&&x.track===s.track&&x.frame===s.frame); if(t){ if(!visible().includes(t)){st.dir=t.dir;st.track='';$('trackSel').value='';render(false);} selectScene(t,false);} }
+
+// ---------- point & province query
+function pip(pt,ring){let x=pt[0],y=pt[1],ins=false;for(let i=0,j=ring.length-1;i<ring.length;j=i++){const xi=ring[i][0],yi=ring[i][1],xj=ring[j][0],yj=ring[j][1];if(((yi>y)!==(yj>y))&&(x<(xj-xi)*(y-yi)/(yj-yi)+xi))ins=!ins;}return ins;}
+function inGeom(pt,g){ const polys=g.type==='Polygon'?[g.coordinates]:g.type==='MultiPolygon'?g.coordinates:[]; return polys.some(p=>pip(pt,p[0])&&!p.slice(1).some(h=>pip(pt,h))); }
+let lastQuery=null;
+function passTable(list,title,sub){
+  lastQuery=()=>passTable(list,title,sub);
+  const dirs=st.dir==='AD'?['A','D']:[st.dir];
+  list=list.filter(s=>dirs.includes(s.dir)&&(st.noMode||!s.noMode)).sort((a,b)=>a.date<b.date?-1:a.date>b.date?1:a.dir.localeCompare(b.dir));
+  const fut=list.filter(s=>dayDiff(s.date)>=0);
+  const nA=list.filter(s=>s.dir==='A').length, nD=list.filter(s=>s.dir==='D').length;
+  const geoms=[...new Set(list.map(s=>s.dir+' T'+s.track+' F'+s.frame))];
+  let h=`<div class="small muted">${sub}</div><dl class="info"><dt>Passes in plan</dt><dd>${list.length} (Asc ${nA} · Desc ${nD})</dd><dt>Upcoming</dt><dd>${fut.length}${fut[0]?` — next <b>${fut[0].date}</b> (${fut[0].dir==='A'?'Asc':'Desc'}, in ${dayDiff(fut[0].date)} d)`:''}</dd><dt>Geometries</dt><dd>${geoms.join(', ')}</dd><dt>Avg revisit</dt><dd>${list.length>1?fmt1((parseD(list[list.length-1].date)-parseD(list[0].date))/864e5/(new Set(list.map(s=>s.date)).size-1))+' days':'–'}</dd></dl>
+  <div class="btns" style="margin:8px 0"><button id="qCsv">Export this list (CSV)</button></div>
+  <table><tr><th>Date</th><th>Dir</th><th>Track / frames</th><th>Pol</th><th></th></tr>${groups(list).map(g=>{const s=g[0],dd=dayDiff(s.date);return `<tr class="scene" data-i="${s.i}"><td>${s.date} <span class="muted small">${DOW[parseD(s.date).getDay()]}</span></td><td><span class="badge b${s.dir}">${s.dir}</span></td><td>T${s.track} F${g.map(x=>x.frame).join(',')}</td><td>${[...new Set(g.map(polSummary))].join(' ')}</td><td>${dd<0?'<span class="badge bPast">past</span>':dd===0?'<span class="badge bNext">today</span>':`<span class="muted small">+${dd}d</span>`}</td></tr>`;}).join('')}</table>`;
+  $('dTitle').textContent=title; $('dBody').innerHTML=h; $('detail').style.display='block';
+  $('dBody').querySelectorAll('tr[data-i]').forEach(r=>r.onclick=()=>{const s=scenes[+r.dataset.i]; st.date=s.date; if(st.dir!=='AD'&&st.dir!==s.dir) st.dir=s.dir; render(false); selectScene(s,false); });
+  $('qCsv').onclick=()=>download(title.replace(/[^\w]+/g,'_')+'.csv',toCSV(list),'text/csv');
+}
+function groups(list){ const m=new Map(); list.forEach(s=>{const k=s.date+s.dir+s.track; if(!m.has(k))m.set(k,[]); m.get(k).push(s);}); return [...m.values()]; }
+map.on('click',e=>{
+  const pt=[e.latlng.lng,e.latlng.lat];
+  const list=scenes.filter(s=>inGeom(pt,s.full));
+  qLayer.clearLayers(); hiLayer.clearLayers(); st.selScene=null; highlightRow();
+  L.circleMarker(e.latlng,{radius:6,color:'#facc15',weight:2,fillColor:'#facc15',fillOpacity:.5,pane:'labels'}).addTo(qLayer);
+  passTable(list,`Point ${e.latlng.lat.toFixed(4)}°N, ${e.latlng.lng.toFixed(4)}°E`,`All planned passes whose full footprint covers this point (direction filter: ${st.dir==='AD'?'both':st.dir==='A'?'ascending':'descending'}).`);
+});
+$('provSearch').onchange=e=>{
+  const n=e.target.value; const f=B.provinces.features.find(x=>x.properties.n.toLowerCase()===n.toLowerCase()); if(!f) return;
+  qLayer.clearLayers(); hiLayer.clearLayers();
+  const g=L.geoJSON(f,{pane:'foot',renderer:rFoot,style:{color:'#facc15',weight:2.5,fill:true,fillOpacity:.08},interactive:false}).addTo(qLayer); map.fitBounds(g.getBounds().pad(.3));
+  const list=scenes.filter(s=>s.prov.some(p=>p[0]===f.properties.n && p[2]>=1));
+  passTable(list,`Province: ${f.properties.n}`,`Passes covering ≥1% of ${esc(f.properties.n)} (${esc(f.properties.rg||'')} region).`);
+};
+
+// ---------- export
+function toCSV(list){
+  const hd=['scene_id','date','weekday','direction','track','frame','scene','source_id','overpass_local_approx','radar_mode','polarisation','overlap_km2','overlap_pct','next_repeat','provinces'];
+  const q=v=>`"${String(v).replace(/"/g,'""')}"`;
+  return [hd.join(',')].concat(list.map(s=>{const nr=nextRepeat(s);return [s.id,s.date,DOW[parseD(s.date).getDay()],s.dir==='A'?'Ascending':'Descending',s.track,s.frame,s.scene,s.src,s.dir==='A'?'~18:00':'~06:00',s.mode,[...new Set(decodeMode(s.mode).map(m=>m.band[0]+':'+m.pol))].join(' '),s.km2,s.pct,nr?nr.date:'',s.prov.map(p=>p[0]).join('; ')].map(q).join(',');})).join('\n');
+}
+function download(name,text,type){ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type})); a.download=name; document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},500); }
+const fname=ext=>`NISAR_${st.date}_${st.dir}${st.track?'_T'+st.track.slice(2):''}.${ext}`;
+$('expCsv').onclick=()=>download(fname('csv'),toCSV(visible()),'text/csv');
+$('expGeo').onclick=()=>download(fname('geojson'),JSON.stringify({type:'FeatureCollection',features:visible().map(s=>({type:'Feature',properties:{id:s.id,date:s.date,direction:s.dir==='A'?'Ascending':'Descending',track:s.track,frame:s.frame,scene:s.scene,radar_mode:s.mode,overlap_km2:s.km2,overlap_pct:s.pct},geometry:s.full}))}),'application/geo+json');
+$('expKml').onclick=()=>{
+  const ring=r=>r.map(c=>c[0]+','+c[1]+',0').join(' ');
+  const poly=p=>`<Polygon><outerBoundaryIs><LinearRing><coordinates>${ring(p[0])}</coordinates></LinearRing></outerBoundaryIs>${p.slice(1).map(h=>`<innerBoundaryIs><LinearRing><coordinates>${ring(h)}</coordinates></LinearRing></innerBoundaryIs>`).join('')}</Polygon>`;
+  const geom=g=>g.type==='Polygon'?poly(g.coordinates):`<MultiGeometry>${g.coordinates.map(poly).join('')}</MultiGeometry>`;
+  const kc=h=>{const c=h.replace('#','');return 'ff'+c.slice(4,6)+c.slice(2,4)+c.slice(0,2);};
+  const pm=visible().map(s=>`<Placemark><name>${s.id}</name><description><![CDATA[${s.date} ${s.dir==='A'?'Ascending':'Descending'} T${s.track} F${s.frame}<br>${s.mode||'no mode'}<br>${s.km2} km2 over Thailand]]></description><Style><LineStyle><color>${kc(colOf(s))}</color><width>2</width></LineStyle><PolyStyle><color>33${kc(colOf(s)).slice(2)}</color></PolyStyle></Style>${geom(s.full)}</Placemark>`).join('');
+  download(fname('kml'),`<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>NISAR ${st.date} ${st.dir}</name>${pm}</Document></kml>`,'application/vnd.google-earth.kml+xml');
+};
+
+render(true);
+})();
+</script>
+</body>
+</html>

@@ -49,7 +49,7 @@ class Config:  # Groups every tunable setting in one place instead of scattering
     # Build the full path relative to that directory
     AOI_SHAPEFILE = os.path.join(script_dir,
                              "Thailand_Admin",
-                             "tha_admbnda_adm1_rtsd_20190221.shp")  # Path to the shapefile defining the area of interest (AOI).
+                             "L05_Province_ESRI_2559.shp")  # Path to the shapefile defining the area of interest (AOI).
 
     # Mode 1 uses the manually configured dates below. Mode 2 ignores them and
     # searches from DATE_LOOKBACK_DAYS ago through the current date and time.
