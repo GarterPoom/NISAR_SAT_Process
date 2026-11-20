@@ -27,10 +27,16 @@ If a required channel is missing for a group, the group is reported and skipped.
 
 Input filename convention
 -------------------------
-<SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>_Processed_dB_<YYYYMMDD_HHMMSS>.tif
+<SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>[_RFI-<steps>]_Processed_dB_<YYYYMMDD_HHMMSS>.tif
+The optional RFI tag ("_RFI-notch", "_RFI-blob", "_RFI-notch-blob") is added by
+NISAR_Process.py when RFI mitigation runs. HH and HV must carry the same tag (or
+both none), so differently filtered channels are never mixed; the tag is kept in
+the output name.
 Example matching pair:
     sceneA_GCOV_frequencyA_HH_Processed_dB_20260904_120000.tif
     sceneA_GCOV_frequencyA_HV_Processed_dB_20260904_120000.tif
+    sceneA_GSLC_frequencyA_HH_RFI-notch_Processed_dB_20260904_120000.tif
+    sceneA_GSLC_frequencyA_HV_RFI-notch_Processed_dB_20260904_120000.tif
 An HV file ending in 20260905_120000.tif cannot match the example HH file.
 Temporary .part.tif and .native.part.tif files are excluded automatically.
 
@@ -94,10 +100,11 @@ TILE_SIZE = 512  # Process at most 512 by 512 pixels in each tile.
 OUTPUT_NODATA = -9999.0  # Represent invalid pixels consistently across all output bands.
 INPUT_PATTERN = re.compile(  # Describe the complete expected input filename.
     r"^(?P<scene>.+)_(?P<product>GSLC|GCOV)_(?P<frequency>frequency[^_]+)_"  # Capture source and grid.
-    r"(?P<pol>HH|HV)_Processed_dB_(?P<stamp>\d{8}_\d{6})\.tiff?$",  # Capture channel and export time.
+    r"(?P<pol>HH|HV)(?P<rfi>_RFI-[A-Za-z0-9-]+)?_Processed_dB_(?P<stamp>\d{8}_\d{6})\.tiff?$",  # Channel, optional RFI tag, export time.
     re.IGNORECASE,  # Accept uppercase or lowercase filename extensions and labels.
 )  # Finish compiling the filename pattern.
-IDENTITY_FIELDS = ("scene", "product", "frequency")  # Required pair matches (export time may differ).
+# Required pair matches (export time may differ). "rfi" keeps e.g. notch-filtered HH from pairing with unfiltered HV.
+IDENTITY_FIELDS = ("scene", "product", "frequency", "rfi")
 LOG = logging.getLogger("NISAR_Band_Stack")  # Use one logger for all script functions.
 
 
@@ -202,8 +209,18 @@ def filename_info(path: Path) -> dict[str, str] | None:  # Define the filename p
     info["export_date"] = exported.strftime("%Y-%m-%d")  # Record the export calendar date explicitly.
     info["pol"] = info["pol"].upper()  # Normalize HH/HV channel labels.
     info["product"] = info["product"].upper()  # Normalize GSLC/GCOV product labels.
+    info["rfi"] = (info["rfi"] or "").lower()  # RFI tag such as "_rfi-notch", or "" when no RFI step ran.
 
     return info  # Return all validated filename identifiers.
+
+
+def channels_rfi_tag(channels: dict[str, dict[str, Path]]) -> str:
+    """Return the RFI tag as written in a group's filenames (e.g. "_RFI-notch"), or "" if none."""
+    for runs in channels.values():  # Any file in the group carries the same tag (case aside).
+        for path in runs.values():
+            match = INPUT_PATTERN.fullmatch(path.name)  # Re-match to recover the original-case tag.
+            return match["rfi"] or ""  # Empty when the file has no RFI tag.
+    return ""  # Empty group (not expected).
 
 
 def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:  # Define pair discovery.
@@ -246,8 +263,9 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
     incomplete = 0  # Count exports lacking a required counterpart.
 
     for identity, channels in sorted(groups.items()):  # Examine each source independently.
-        scene, product, frequency = identity  # Unpack the shared identifiers.
-        label = f"{scene}_{product}_{frequency}"  # Describe this source in log messages.
+        scene, product, frequency, _ = identity  # Unpack the shared identifiers.
+        rfi_tag = channels_rfi_tag(channels)  # Original-case RFI tag (e.g. "_RFI-notch") or "".
+        label = f"{scene}_{product}_{frequency}{rfi_tag}"  # Describe this source; also keeps RFI variants' outputs distinct.
         hh_runs = channels.get("HH", {})  # HH exports by timestamp.
         hv_runs = channels.get("HV", {})  # HV exports by timestamp.
 
@@ -303,7 +321,7 @@ def validate_pair(hh_path: Path, hv_path: Path) -> dict[str, str]:  # Define the
     different = [field for field in IDENTITY_FIELDS if hh_info[field] != hv_info[field]]  # Compare pairing identifiers.
 
     if different:  # Reject cross-source input combinations.
-        raise ValueError("HH/HV must share source, product, and frequency; differing fields: " + ", ".join(different))  # Explain mismatch.
+        raise ValueError("HH/HV must share source, product, frequency, and RFI tag; differing fields: " + ", ".join(different))  # Explain mismatch.
 
     return hh_info  # Supply the validated pair metadata to the writer.
 
@@ -381,7 +399,7 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
                         SOURCE_PRODUCT=info["scene"],  # Preserve the source product and any acquisition identifiers.
                         SOURCE_HH_EXPORT_TIMESTAMP=info["stamp"],  # Record the HH processing run timestamp.
                         SOURCE_HV_EXPORT_TIMESTAMP=hv_info["stamp"],  # Record the HV processing run timestamp.
-                        PAIRING_RULE="Same source product, product type and frequency; export timestamps may differ",  # Describe matching.
+                        PAIRING_RULE="Same source product, product type, frequency and RFI tag; export timestamps may differ",  # Describe matching.
                         BAND_MAPPING="R=HV; G=HH; B=HH/HV",  # Document output band order.
                         BLUE_FORMULA="HH_dB - HV_dB",  # HH/HV ratio expressed as a dB difference.
                         VALIDITY="All bands valid only where both source bands are valid",  # Describe the shared footprint.
