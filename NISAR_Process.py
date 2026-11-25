@@ -21,23 +21,6 @@ HHHH and HVHV. Each tile is multilooked before dB conversion. The source covaria
 values are already radiometrically terrain corrected, so no additional DEM-based RTC
 is applied.
 
-Residual RFI suppression (optional)
------------------------------------
-NISAR products already have RFI mitigation applied on the raw data, but residual RFI
-can remain. Two optional steps clean it up during export:
-
-1. Spectral notch (GSLC only): each complex tile (plus a halo) is transformed with a
-   2D FFT; narrow spectral peaks far above the local spectral background, which is
-   how stripe/band-type RFI appears, are attenuated to the background level before
-   intensity conversion.
-2. Blob mask (GSLC and GCOV): after multilooking, pixels whose dB value is far above
-   a robust local background (median + MAD) are set to NoData. Disabled by default
-   because strong real targets (dense urban areas, ships, corner reflectors) are
-   flagged too; enable it for rural/forest/water scenes.
-
-Outputs carry a filename tag naming the active RFI steps ("_RFI-notch",
-"_RFI-blob" or "_RFI-notch-blob"), so runs with different settings never collide.
-
 """
 
 # --- IMPORT SECTION ---
@@ -80,9 +63,6 @@ import numpy as np
 
 # Import uniform_filter to perform spatial averaging (the "multi-looking" process)
 from scipy.ndimage import uniform_filter
-
-# Import median_filter and binary_dilation for the robust RFI blob mask
-from scipy.ndimage import binary_dilation, distance_transform_edt, median_filter
 
 # Import rasterio for handling geospatial raster data (reading DEMs and writing GeoTIFFs)
 import rasterio
@@ -180,7 +160,7 @@ SWATH_FREQUENCY_KEYS = (
 PROCESSING_PARAMETER_KEYS = (
     "azimuthIonosphericGeolocationCorrectionApplied", "rangeIonosphericGeolocationCorrectionApplied",
     "dryTroposphericGeolocationCorrectionApplied", "wetTroposphericGeolocationCorrectionApplied",
-    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied", "rfiMitigationApplied",
+    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied",
 )
 
 # Largest dataset (in elements) that is read into memory as metadata. Raster layers such as
@@ -197,63 +177,6 @@ MAX_METADATA_STRING = 300
 # correlated and the effective number of looks is well below the pixel count.  Increase
 # this value for smoother (less speckled) but blurrier results; decrease it to keep detail.
 MULTILOOK_WINDOW_METRES = 35.0
-
-
-# --- RFI SUPPRESSION SETTINGS ---
-
-# Apply the 2D-FFT notch filter to complex GSLC tiles before intensity conversion.
-RFI_NOTCH_ENABLED = True
-
-# A spectral bin is treated as RFI when its magnitude exceeds the local spectral
-# background by this factor. Lower = more aggressive (more residual RFI removed, but
-# more risk of removing real periodic structure such as regular urban grids).
-RFI_NOTCH_PEAK_RATIO = 8.0
-
-# Side length (in spectral bins) of the smoothing window that estimates the spectral
-# background around each bin.
-RFI_NOTCH_BACKGROUND_BINS = 31
-
-# Normalised radius around the spectrum centre that is never notched, protecting the
-# low-frequency scene content (0.5 = Nyquist edge).
-RFI_NOTCH_DC_RADIUS = 0.03
-
-# Upper bound on the fraction of spectral bins one tile may notch. If more bins pass
-# the threshold, only the strongest are notched (guards against notching the scene).
-RFI_NOTCH_MAX_FRACTION = 0.02
-
-# Extra pixels read around each tile for the FFT, on top of the multilook halo, so
-# FFT edge effects fall in the discarded halo rather than in the output tile.
-RFI_NOTCH_HALO_PIXELS = 64
-
-# Width (pixels) of the smooth taper applied at tile and swath edges before the FFT.
-# Must stay well below RFI_NOTCH_HALO_PIXELS so the output tile itself is untapered.
-RFI_NOTCH_EDGE_TAPER_PIXELS = 8
-
-# Lowest weight the RFI estimate is divided by near the swath edge. Lower values
-# remove more RFI in the outermost pixels but amplify estimation noise there.
-RFI_NOTCH_WEIGHT_FLOOR = 0.3
-
-# Tiles with less than this fraction of valid samples are not notched: too little
-# data remains to separate RFI peaks from the scene spectrum reliably.
-RFI_NOTCH_MIN_VALID_FRACTION = 0.1
-
-# Mask bright RFI blobs after multilooking (both GSLC and GCOV). Off by default:
-# strong real scatterers (cities, ships) are flagged too. Enable for rural scenes.
-RFI_BLOB_MASK_ENABLED = False
-
-# Robust z-score (in multilooked dB, relative to the local median/MAD) above which a
-# pixel is masked as RFI.
-RFI_BLOB_Z_THRESHOLD = 4.0
-
-# Ground size of the background window used for the blob mask's local median/MAD.
-# Must be clearly larger than the RFI blobs you want to catch.
-RFI_BLOB_BACKGROUND_METRES = 750.0
-
-# Lower bound on the local MAD (dB) so very homogeneous areas do not yield huge z-scores.
-RFI_BLOB_MIN_MAD_DB = 0.5
-
-# Number of dilation steps applied to the blob mask to also remove the blob fringes.
-RFI_BLOB_DILATION_ITERATIONS = 2
 
 
 # --- FUNCTION DEFINITIONS ---
@@ -912,204 +835,11 @@ def convert_to_decibels(intensity: np.ndarray) -> np.ndarray:
     return decibels
 
 
-# 2D-FFT notch filter that removes residual stripe/band RFI from one complex GSLC tile.
-def rfi_notch_filter(complex_tile: np.ndarray) -> tuple[np.ndarray, float | None]:
-    """
-    Suppress narrow-band / stripe RFI in one complex GSLC tile with a 2D-FFT notch.
-
-    RFI that survives the on-board/ground mitigation tends to concentrate its energy
-    in a few sharp peaks of the 2D spectrum, whereas the scene spectrum is broad and
-    smooth. Bins far above the smoothed log-magnitude background are attenuated to
-    that background, and the tile is transformed back. Invalid samples are restored
-    unchanged so NoData handling downstream is unaffected.
-
-    Args:
-        complex_tile: Complex GSLC samples (tile plus halo).
-
-    Returns:
-        (filtered tile, fraction of spectral bins notched). The fraction is None when
-        the tile was skipped (too few valid samples).
-    """
-    # Valid samples are finite and non-zero (zeros are swath-edge fill).
-    valid = np.isfinite(complex_tile) & (complex_tile != 0)
-    # Swath-edge tiles: the valid/zero boundary itself creates spectral lines.
-    if valid.mean() < RFI_NOTCH_MIN_VALID_FRACTION:
-        # Return the tile unchanged and None to mark it as skipped.
-        return complex_tile, None
-
-    # Zero the invalid samples so they add no energy to the FFT.
-    data = np.where(valid, complex_tile, 0).astype(np.complex64)
-    # Tile size in rows and columns.
-    rows, cols = data.shape
-
-    # Smooth weight that ramps 0 -> 1 away from every boundary (tile edges and the
-    # swath / NoData edge). A hard cut-off would spread RFI energy across the whole
-    # spectrum where no notch can catch it; with a smooth ramp it stays compact
-    # around the RFI peaks and is removed right up to the swath edge.
-    padded_valid = np.pad(valid, 1, constant_values=False)
-    # Distance (in pixels) of each valid pixel to the nearest boundary or invalid pixel.
-    distance = distance_transform_edt(padded_valid)[1:-1, 1:-1]
-    # Normalise the distance to 0..1 over the taper width.
-    ramp = np.clip(distance / RFI_NOTCH_EDGE_TAPER_PIXELS, 0.0, 1.0)
-    # Raised-cosine taper weight from 0 at the boundary to 1 inside.
-    weight = (0.5 - 0.5 * np.cos(np.pi * ramp)).astype(np.float32)
-
-    # 2D FFT of the tapered tile, shifted so zero frequency is in the centre.
-    spectrum = np.fft.fftshift(np.fft.fft2(data * weight))
-    # Log magnitude of the spectrum (log1p avoids log(0)).
-    log_mag = np.log1p(np.abs(spectrum))
-    # Smoothed spectral background around each bin (wraps around the spectrum edges).
-    background = uniform_filter(log_mag, size=RFI_NOTCH_BACKGROUND_BINS, mode="wrap")
-    # How far each bin rises above its local background.
-    excess = log_mag - background
-    # Candidate RFI bins: more than RFI_NOTCH_PEAK_RATIO times above the background.
-    peaks = excess > np.log(RFI_NOTCH_PEAK_RATIO)
-
-    # Never notch the low-frequency centre, where the true scene content lives.
-    yy, xx = np.ogrid[:rows, :cols]
-    # Normalised distance of each bin from the spectrum centre.
-    radius = np.hypot((yy - rows / 2) / rows, (xx - cols / 2) / cols)
-    # Exclude bins close to the centre (low frequencies).
-    peaks &= radius > RFI_NOTCH_DC_RADIUS
-
-    # Cap the notched fraction: keep only the strongest bins if too many qualify.
-    max_bins = int(RFI_NOTCH_MAX_FRACTION * peaks.size)
-    # Too many candidate bins.
-    if peaks.sum() > max_bins:
-        # Excess value of the max_bins-th strongest bin (infinity when no bins are allowed).
-        cutoff = np.partition(excess[peaks], -max_bins)[-max_bins] if max_bins > 0 else np.inf
-        # Keep only the bins at or above that cut-off.
-        peaks &= excess >= cutoff
-
-    # No RFI peaks found in this tile.
-    if not peaks.any():
-        # Return the tile unchanged with 0 bins notched.
-        return complex_tile, 0.0
-
-    # Widen each notch to catch the peak skirts left by the tapering.
-    peaks = binary_dilation(peaks, iterations=2)
-
-    # The RFI estimate is the part of each peak bin above the spectral background.
-    target = np.expm1(background)
-    # Per-bin scale factor that brings each bin down to the background level (never amplifies).
-    keep = np.minimum(target / np.maximum(np.abs(spectrum), 1e-12), 1.0)
-    # Spectral energy to remove: only in peak bins, the part above the background.
-    removed = np.where(peaks, spectrum * (1.0 - keep), 0)
-    # Transform the removed energy back to the image domain (still tapered).
-    rfi_weighted = np.fft.ifft2(np.fft.ifftshift(removed))
-
-    # Undo the weighting to get the RFI in source units, then subtract it. The floor
-    # keeps the division stable in the first pixel or two next to the swath edge.
-    rfi_estimate = rfi_weighted / np.maximum(weight, RFI_NOTCH_WEIGHT_FLOOR)
-    # Subtract the RFI estimate from the original samples.
-    filtered = (data - rfi_estimate).astype(np.complex64)
-
-    # Restore invalid samples exactly as they were in the source.
-    filtered[~valid] = complex_tile[~valid]
-    # Return the filtered tile and the fraction of spectral bins notched.
-    return filtered, float(peaks.mean())
-
-
-# Mask bright RFI blobs in a multilooked intensity tile using a robust local background.
-def rfi_blob_mask(
-    multilooked: np.ndarray,
-    looks: tuple[int, int],
-    background_pixels: tuple[int, int],
-) -> np.ndarray:
-    """
-    Flag bright RFI blobs in a multilooked intensity tile.
-
-    A robust local background (median and MAD of dB values) is computed on a grid
-    decimated by the multilook window, which keeps the large median filter cheap,
-    then upsampled back. Pixels whose robust z-score exceeds RFI_BLOB_Z_THRESHOLD are
-    flagged and the mask is dilated slightly to include blob fringes.
-
-    Args:
-        multilooked: Linear multilooked intensity (NaN = invalid).
-        looks: Multilook window (rows, columns) used as the decimation step.
-        background_pixels: Background window size (rows, columns) in source pixels.
-
-    Returns:
-        Boolean mask, True where the pixel is considered RFI.
-    """
-    # Valid pixels are finite and positive.
-    valid = np.isfinite(multilooked) & (multilooked > 0)
-    # Too few valid pixels for reliable statistics.
-    if valid.sum() < 100:
-        # Return an empty mask (nothing flagged).
-        return np.zeros(multilooked.shape, dtype=bool)
-
-    # Work in dB so the background statistics are robust to the intensity range.
-    decibels = convert_to_decibels(multilooked)
-    # Decimation steps equal to the multilook window (at least 1).
-    step_y, step_x = max(1, looks[0]), max(1, looks[1])
-
-    # Neighbouring multilooked pixels are highly correlated; decimating loses little.
-    coarse = decibels[::step_y, ::step_x]
-    # Median of the decimated dB values, used to fill gaps.
-    fill_value = np.nanmedian(coarse)
-    # Fill NaN gaps so the median filter does not propagate them.
-    coarse = np.where(np.isfinite(coarse), coarse, fill_value)
-
-    # Helper that turns a window size into an odd number of at least 3.
-    def odd(n: int) -> int:
-        """Return ``n`` rounded up to an odd integer, never smaller than 3.
-
-        Args:
-            n (int): Requested window size in pixels.
-
-        Returns:
-            int: Odd window size of at least 3 pixels, so the window stays centred on each pixel.
-        """
-        # Set the lowest bit to make the number odd, with a minimum of 3.
-        return max(3, n | 1)
-
-    # Background window size on the decimated grid, in (rows, columns).
-    size = (odd(background_pixels[0] // step_y), odd(background_pixels[1] // step_x))
-    # Local median of the dB values (robust background level).
-    median = median_filter(coarse, size=size, mode="reflect")
-    # Local median absolute deviation, scaled by 1.4826 to match a standard deviation.
-    mad = median_filter(np.abs(coarse - median), size=size, mode="reflect") * 1.4826
-
-    # Upsample the background statistics back to the full tile grid.
-    rows, cols = multilooked.shape
-    # Upsample the median back to the full tile size by repeating rows and columns.
-    median_full = np.repeat(np.repeat(median, step_y, axis=0), step_x, axis=1)[:rows, :cols]
-    # Upsample the MAD the same way.
-    mad_full = np.repeat(np.repeat(mad, step_y, axis=0), step_x, axis=1)[:rows, :cols]
-    # Floor the MAD so flat areas do not produce huge z-scores.
-    mad_full = np.maximum(mad_full, RFI_BLOB_MIN_MAD_DB)
-
-    # Robust z-score of each valid pixel above its local background.
-    z_score = np.where(valid, (decibels - median_full) / mad_full, 0.0)
-    # Flag pixels whose z-score is above the threshold.
-    mask = z_score > RFI_BLOB_Z_THRESHOLD
-    # Optionally grow the mask to include blob fringes.
-    if RFI_BLOB_DILATION_ITERATIONS > 0 and mask.any():
-        # Dilate the mask by the configured number of iterations.
-        mask = binary_dilation(mask, iterations=RFI_BLOB_DILATION_ITERATIONS)
-    # Return the mask, limited to valid pixels.
-    return mask & valid
-
-
-# Return which RFI steps apply: (notch on GSLC only, blob mask).
-def rfi_steps_active(product_type: str) -> tuple[bool, bool]:
-    """Return (notch active, blob mask active) for a product type."""
-    # The notch applies only to complex GSLC data; the blob mask setting applies to both products.
-    return (product_type == "GSLC" and RFI_NOTCH_ENABLED), RFI_BLOB_MASK_ENABLED
-
-
-# Build the filename prefix for a layer, including a tag for the active RFI steps.
+# Build the filename prefix for a layer.
 def output_prefix(source_file: Path, product_type: str, frequency: str, polarization: str) -> str:
-    """Filename prefix shared by the skip check and the export, tagged when RFI is applied."""
-    # Find which RFI steps are active for this product type.
-    notch, blob = rfi_steps_active(product_type)
-    # Name the active steps so changing the RFI configuration never reuses an old output.
-    steps = [name for name, on in (("notch", notch), ("blob", blob)) if on]
-    # Tag such as "_RFI-notch-blob", or empty when no RFI step is active.
-    rfi_tag = f"_RFI-{'-'.join(steps)}" if steps else ""
-    # Return the prefix: source stem, product, frequency, polarization and RFI tag.
-    return f"{source_file.stem}_{product_type}_{frequency}_{polarization}{rfi_tag}_Processed_dB_"
+    """Filename prefix shared by the skip check and the export."""
+    # Return the prefix: source stem, product, frequency and polarization.
+    return f"{source_file.stem}_{product_type}_{frequency}_{polarization}_Processed_dB_"
 
 
 # Find a finished GeoTIFF from an earlier run for this layer, if one exists.
@@ -1128,7 +858,7 @@ def completed_output_path(
     statistics all succeed; ``*.part.tif`` files are therefore never treated as
     completed results.
     """
-    # Filename prefix of every export of this layer with the current RFI settings.
+    # Filename prefix of every export of this layer.
     prefix = output_prefix(source_file, product_type, frequency, polarization)
     # Matching GeoTIFFs, newest first.
     candidates = sorted(
@@ -1306,55 +1036,12 @@ def export_layer(
         frequency, polarization, looks_y, looks_x, looks_y * pixel_y, looks_x * pixel_x,
     )
 
-    # Residual RFI suppression configuration for this layer.
-    rfi_notch_active, rfi_mask_active = rfi_steps_active(product_type)
-    # The FFT notch needs extra context so its edge effects fall in the discarded halo.
-    if rfi_notch_active:
-        # Add the notch halo to the row halo.
-        halo_y += RFI_NOTCH_HALO_PIXELS
-        # Add the notch halo to the column halo.
-        halo_x += RFI_NOTCH_HALO_PIXELS
-    # The blob mask's background window must also see neighbours across tile edges.
-    blob_background_pixels = (
-        max(1, round(RFI_BLOB_BACKGROUND_METRES / pixel_y)),
-        max(1, round(RFI_BLOB_BACKGROUND_METRES / pixel_x)),
-    )
-    # The blob mask needs a halo of at least half its background window.
-    if rfi_mask_active:
-        # Enlarge the row halo if needed.
-        halo_y = max(halo_y, blob_background_pixels[0] // 2)
-        # Enlarge the column halo if needed.
-        halo_x = max(halo_x, blob_background_pixels[1] // 2)
-    # Log which RFI steps are on and their main settings.
-    logger.info(
-        "%s/%s RFI suppression: notch=%s (peak ratio %.3g), blob mask=%s (z > %.3g, %.0f m background).",
-        frequency, polarization,
-        "on" if rfi_notch_active else "off", RFI_NOTCH_PEAK_RATIO,
-        "on" if rfi_mask_active else "off", RFI_BLOB_Z_THRESHOLD, RFI_BLOB_BACKGROUND_METRES,
-    )
-    # Per-layer RFI statistics reported after the last tile.
-    notch_tiles_filtered = 0
-    # Number of tiles skipped by the notch (too few valid samples).
-    notch_tiles_skipped = 0
-    # Sum of notched bin fractions, used to compute the mean.
-    notch_fraction_sum = 0.0
-    # Number of output pixels set to NoData by the blob mask.
-    rfi_masked_pixels = 0
-    # Number of valid output pixels written.
-    valid_output_pixels = 0
-
     # Count source windows so progress messages can report a meaningful completion percentage.
     total_tiles = ((height + TILE_SIZE - 1) // TILE_SIZE) * ((width + TILE_SIZE - 1) // TILE_SIZE)
     # Describe the actual processing performed in the output raster's band metadata.
     description = "Intensity Multilook RTC" if process_gslc else "Multilook RTC Gamma0 Covariance"
     # Add the multilook window size to the band description.
     description = f"{description} {looks_y}x{looks_x}"
-    # Add the active RFI steps to the band description.
-    if rfi_notch_active or rfi_mask_active:
-        # Names of the active RFI steps.
-        rfi_parts = [name for name, on in (("Notch", rfi_notch_active), ("BlobMask", rfi_mask_active)) if on]
-        # Append them, e.g. "RFI-Notch+BlobMask".
-        description = f"{description} RFI-{'+'.join(rfi_parts)}"
     try:
         # Create the native-grid staging GeoTIFF.
         with rasterio.open(native_temp_path, "w", **profile) as dst:
@@ -1389,20 +1076,6 @@ def export_layer(
                 # Convert each product's source samples to the linear measurement that
                 # will be multilooked: intensity for GSLC and covariance for GCOV.
                 if process_gslc:
-                    # Suppress residual stripe/band RFI on the complex samples first,
-                    # while the signal is still coherent and RFI is spectrally compact.
-                    if rfi_notch_active:
-                        # Apply the notch filter to the complex samples.
-                        tile_data, notch_fraction = rfi_notch_filter(tile_data)
-                        # The tile was skipped by the notch filter.
-                        if notch_fraction is None:
-                            # Count the skipped tile.
-                            notch_tiles_skipped += 1
-                        else:
-                            # Count the filtered tile.
-                            notch_tiles_filtered += 1
-                            # Add its notched fraction for the mean.
-                            notch_fraction_sum += notch_fraction
                     # Convert complex GSLC samples to intensity before multilooking.
                     processed_tile = calculate_intensity(tile_data)
                 else:
@@ -1411,16 +1084,6 @@ def export_layer(
 
                 # Apply the required multi-looking step to every supported product type.
                 processed_tile = apply_multilook(processed_tile, looks=(looks_y, looks_x))
-
-                # Mask bright RFI blobs on the full halo tile so the background window
-                # sees real neighbours; masked pixels become NoData on export.
-                if rfi_mask_active:
-                    # Compute the blob mask for the whole halo tile.
-                    blob_mask = rfi_blob_mask(processed_tile, (looks_y, looks_x), blob_background_pixels)
-                    # Set flagged pixels to NaN so they become NoData.
-                    processed_tile[blob_mask] = np.nan
-                    # Count only flagged pixels inside the output window.
-                    rfi_masked_pixels += int(blob_mask[crop].sum())
 
                 # Drop the halo so the tile matches the output window exactly.
                 processed_tile = processed_tile[crop]
@@ -1456,8 +1119,6 @@ def export_layer(
                 # Preserve invalid/edge samples as GeoTIFF NoData, not as an in-range
                 # dB value.  GIS renderers therefore leave the outside-swath edge blank.
                 valid_db = np.isfinite(db_tile)
-                # Count valid output pixels for the RFI statistics.
-                valid_output_pixels += int(valid_db.sum())
                 # Replace invalid pixels with the NoData value.
                 db_tile = np.where(valid_db, db_tile, OUTPUT_NODATA)
                 # Write this completed native-grid tile into the temporary GeoTIFF.
@@ -1483,43 +1144,6 @@ def export_layer(
         if dem_dataset is not None:
             # Release the DEM file handle.
             dem_dataset.close()
-
-    # Summarise what the RFI steps did, so over- or under-filtering is visible in the log.
-    rfi_tags = {"RFI_NOTCH": str(rfi_notch_active), "RFI_BLOB_MASK": str(rfi_mask_active)}
-    # Report the notch statistics and record them as tags.
-    if rfi_notch_active:
-        # Mean fraction of spectral bins notched per filtered tile.
-        mean_fraction = notch_fraction_sum / notch_tiles_filtered if notch_tiles_filtered else 0.0
-        # Log the notch statistics.
-        logger.info(
-            "%s/%s RFI notch: %d tiles filtered, %d edge tiles skipped, mean %.4f%% of spectral bins notched.",
-            frequency, polarization, notch_tiles_filtered, notch_tiles_skipped, 100 * mean_fraction,
-        )
-        # Store the notch settings and result in the GeoTIFF tags.
-        rfi_tags.update(RFI_NOTCH_PEAK_RATIO=str(RFI_NOTCH_PEAK_RATIO),
-                        RFI_NOTCH_MEAN_BIN_FRACTION=f"{mean_fraction:.6f}")
-    # Report the blob mask statistics and record them as tags.
-    if rfi_mask_active:
-        # All valid swath pixels, counting the masked ones.
-        total_pixels = valid_output_pixels + rfi_masked_pixels
-        # Percentage of the swath removed by the blob mask.
-        masked_percent = 100 * rfi_masked_pixels / total_pixels if total_pixels else 0.0
-        # Log the blob mask statistics.
-        logger.info(
-            "%s/%s RFI blob mask: %d pixels set to NoData (%.3f%% of valid swath).",
-            frequency, polarization, rfi_masked_pixels, masked_percent,
-        )
-        # More than 5% masked usually means real bright targets are being removed.
-        if masked_percent > 5.0:
-            # Warn and suggest raising the threshold or disabling the mask.
-            logger.warning(
-                "%s/%s blob mask removed more than 5%% of the swath; real bright targets are probably "
-                "being masked. Raise RFI_BLOB_Z_THRESHOLD or disable the mask for this scene.",
-                frequency, polarization,
-            )
-        # Store the blob mask settings and result in the GeoTIFF tags.
-        rfi_tags.update(RFI_BLOB_Z_THRESHOLD=str(RFI_BLOB_Z_THRESHOLD),
-                        RFI_BLOB_MASKED_PIXELS=str(rfi_masked_pixels))
 
     if source_has_target_pixel_size:
         # Native 5 m x 5 m grids need no resampling, so promote the staging GeoTIFF directly.
@@ -1563,8 +1187,6 @@ def export_layer(
         # Record the multilook window used, in pixels and metres.
         output_raster.update_tags(MULTILOOK_WINDOW_PIXELS=f"{looks_y}x{looks_x}",
                                   MULTILOOK_WINDOW_METRES=str(MULTILOOK_WINDOW_METRES))
-        # Record the RFI settings and statistics.
-        output_raster.update_tags(**rfi_tags)
         output_raster.statistics(1, approx=False)  # Compute exact band statistics so GDAL caches them with the file.
 
     # Atomically replace the final output path only after the temporary GeoTIFF is complete.

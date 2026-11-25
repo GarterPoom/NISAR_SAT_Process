@@ -25,7 +25,7 @@ Use both ``--low-date`` and ``--high-date`` to select known event dates instead.
 
 Input filename convention
 -------------------------
-``<NISAR_SOURCE>_<GSLC|GCOV>_<FREQUENCY>_HH[_RFI-<steps>]_Processed_dB_<EXPORT>.tif``
+``<NISAR_SOURCE>_<GSLC|GCOV>_<FREQUENCY>_HH_Processed_dB_<EXPORT>.tif``
 
 The NISAR source name must contain a leading numeric identifier, Track,
 direction, Frame, acquisition start, and acquisition end fields, for example:
@@ -94,7 +94,7 @@ TILE_SIZE = 512  # Bound each read and write operation to a manageable pixel til
 OUTPUT_NODATA = -9999.0  # Represent pixels invalid on either acquisition date.
 PROCESSED_PATTERN = re.compile(  # Describe the final processed GeoTIFF filename suffix.
     r"^(?P<scene>.+)_(?P<product>GSLC|GCOV)_(?P<frequency>frequency[^_]+)_"  # Capture source and grid labels.
-    r"(?P<pol>HH|HV)(?P<rfi>_RFI-[A-Za-z0-9-]+)?_Processed_dB_(?P<export_stamp>\d{8}_\d{6})\.tiff?$",  # Capture polarization and export time.
+    r"(?P<pol>HH|HV)_Processed_dB_(?P<export_stamp>\d{8}_\d{6})\.tiff?$",  # Capture polarization and export time.
     re.IGNORECASE,  # Accept case variations while normalizing important fields later.
 )  # Finish compiling the processed-filename pattern once at import time.
 SOURCE_PATTERN = re.compile(  # Describe identifiers embedded in a standard NISAR source-product name.
@@ -141,7 +141,6 @@ class SceneInfo:  # Define the complete parsed identity of one processed HH scen
     acquisition_start: datetime  # Order scenes by the source acquisition time.
     acquisition_end: datetime  # Record the complete acquisition interval.
     export_time: datetime  # Prefer the latest processing run for duplicate acquisitions.
-    rfi: str = ""  # RFI tag as written (e.g. "_RFI-notch"), or "" when no RFI step ran.
 
 
 @dataclass(frozen=True)  # Keep every planned composite stable after discovery.
@@ -230,7 +229,6 @@ def filename_info(path: Path) -> SceneInfo | None:  # Define parsing for one can
         acquisition_start=acquisition_start,  # Store the timestamp used for temporal ordering.
         acquisition_end=acquisition_end,  # Store the acquisition interval endpoint for provenance.
         export_time=export_time,  # Store the timestamp used to resolve repeated processing runs.
-        rfi=processed["rfi"] or "",  # Keep the optional RFI tag so differently filtered scenes are not mixed.
     )  # Finish constructing the parsed scene record.
 
 
@@ -252,7 +250,6 @@ def group_key(info: SceneInfo) -> tuple[str, ...]:  # Define the identity shared
         info.track,  # Enforce the user's same-Track requirement.
         info.frame,  # Enforce the user's same-Frame requirement.
         info.direction,  # Avoid combining opposite viewing geometries.
-        info.rfi.lower(),  # Require the same RFI mitigation tag (or none).
     )  # Finish the temporal matching key.
 
 
@@ -334,7 +331,7 @@ def discover_composites(  # Define directory scanning and temporal pairing.
     incomplete = 0  # Count groups that cannot satisfy the requested temporal pairing.
 
     for key, by_date in sorted(groups.items()):  # Resolve every compatible Track/Frame group independently.
-        level, mode, source_product, product, frequency_key, track, frame, direction, _ = key  # Unpack name fields.
+        level, mode, source_product, product, frequency_key, track, frame, direction = key  # Unpack name fields.
         available_dates = sorted(by_date)  # Order acquisitions using filename timestamps, never file dates.
 
         if low_date is None or high_date is None:  # Apply automatic earliest/latest selection.
@@ -374,7 +371,7 @@ def discover_composites(  # Define directory scanning and temporal pairing.
 
         name = (  # Build a readable, collision-resistant output filename stem.
             f"NISAR_Track{track}_Frame{frame}_{direction}_{level}_{mode}_{source_product}_"  # Record matching geometry.
-            f"{product}_{frequency}{low.rfi}_MultiTemporal_RGB_{selected_low_date:%Y%m%d}_{selected_high_date:%Y%m%d}"  # Record dates.
+            f"{product}_{frequency}_MultiTemporal_RGB_{selected_low_date:%Y%m%d}_{selected_high_date:%Y%m%d}"  # Record dates.
         )  # Finish the output name.
 
         composites.append(Composite(name=name, low=low, high=high))  # Store the validated pair for processing.
@@ -500,7 +497,7 @@ def stack_temporal_pair(low_path: Path, high_path: Path, output_path: Path) -> N
                         HIGH_ACQUISITION_END=high_info.acquisition_end.isoformat(),  # Record high-scene end time.
                         LOW_EXPORT_TIMESTAMP=low_info.export_time.isoformat(),  # Record low-scene processing run.
                         HIGH_EXPORT_TIMESTAMP=high_info.export_time.isoformat(),  # Record high-scene processing run.
-                        PAIRING_RULE="Same Track, Frame, direction, level, mode, product, frequency, and RFI tag; different dates",  # Explain.
+                        PAIRING_RULE="Same Track, Frame, direction, level, mode, product, and frequency; different dates",  # Explain.
                         BAND_MAPPING="R=low/non-flood HH; G=high-flood HH; B=low/non-flood HH",  # Document channels.
                         VALIDITY="All bands valid only where both temporal HH source pixels are valid",  # Explain mask.
                     )  # Finish writing dataset-level metadata.

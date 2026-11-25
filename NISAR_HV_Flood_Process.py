@@ -347,7 +347,7 @@ SWATH_FREQUENCY_KEYS = (
 PROCESSING_PARAMETER_KEYS = (
     "azimuthIonosphericGeolocationCorrectionApplied", "rangeIonosphericGeolocationCorrectionApplied",
     "dryTroposphericGeolocationCorrectionApplied", "wetTroposphericGeolocationCorrectionApplied",
-    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied", "rfiMitigationApplied",
+    "ellipsoidalFlatteningApplied", "topographicFlatteningApplied",
 )
 
 # Largest dataset (in elements) that is read into memory as metadata. Raster layers such as

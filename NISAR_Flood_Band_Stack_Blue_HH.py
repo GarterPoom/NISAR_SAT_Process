@@ -23,10 +23,7 @@ If a required channel is missing for a group, the group is reported and skipped.
 
 Input filename convention
 -------------------------
-<SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>[_RFI-<steps>]_Processed_dB_<YYYYMMDD_HHMMSS>.tif
-The optional RFI tag ("_RFI-notch", "_RFI-blob", "_RFI-notch-blob") is added by
-NISAR_Process.py when RFI mitigation runs. HH and HV must carry the same tag (or
-both none); the tag is kept in the output name.
+<SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>_Processed_dB_<YYYYMMDD_HHMMSS>.tif
 Example matching pair:
     sceneA_GCOV_frequencyA_HH_Processed_dB_20260904_120000.tif
     sceneA_GCOV_frequencyA_HV_Processed_dB_20260904_120000.tif
@@ -85,11 +82,10 @@ TILE_SIZE = 512  # Process at most 512 by 512 pixels in each tile.
 OUTPUT_NODATA = -9999.0  # Represent invalid pixels consistently across all output bands.
 INPUT_PATTERN = re.compile(  # Describe the complete expected input filename.
     r"^(?P<scene>.+)_(?P<product>GSLC|GCOV)_(?P<frequency>frequency[^_]+)_"  # Capture source and grid.
-    r"(?P<pol>HH|HV)(?P<rfi>_RFI-[A-Za-z0-9-]+)?_Processed_dB_(?P<stamp>\d{8}_\d{6})\.tiff?$",  # Channel, optional RFI tag, export time.
+    r"(?P<pol>HH|HV)_Processed_dB_(?P<stamp>\d{8}_\d{6})\.tiff?$",  # Capture channel and export time.
     re.IGNORECASE,  # Accept uppercase or lowercase filename extensions and labels.
 )  # Finish compiling the filename pattern.
-# Required pair matches. "rfi" keeps e.g. notch-filtered HH from pairing with unfiltered HV.
-IDENTITY_FIELDS = ("scene", "product", "frequency", "rfi", "export_date", "stamp")
+IDENTITY_FIELDS = ("scene", "product", "frequency", "export_date", "stamp")  # Required pair matches.
 LOG = logging.getLogger("NISAR_Flood_Band_Stack_Blue_HH")  # Use one logger for all script functions.
 
 
@@ -115,8 +111,6 @@ def filename_info(path: Path) -> dict[str, str] | None:  # Define the filename p
     info["export_date"] = exported.strftime("%Y-%m-%d")  # Record the export calendar date explicitly.
     info["pol"] = info["pol"].upper()  # Normalize HH/HV channel labels.
     info["product"] = info["product"].upper()  # Normalize GSLC/GCOV product labels.
-    info["rfi_tag"] = info["rfi"] or ""  # RFI tag as written (e.g. "_RFI-notch"), or "" when no RFI step ran.
-    info["rfi"] = info["rfi_tag"].lower()  # Case-insensitive form used for pairing.
 
     return info  # Return all validated filename identifiers.
 
@@ -157,9 +151,8 @@ def discover_pairs(input_dir: Path) -> tuple[list[tuple[str, Path, Path]], int]:
     incomplete = 0  # Count groups lacking a required channel.
 
     for identity, channels in sorted(groups.items()):  # Examine each source/run group independently.
-        scene, product, frequency, _, export_date, stamp = identity  # Unpack the shared identifiers.
-        rfi_tag = filename_info(next(iter(channels.values())))["rfi_tag"]  # Original-case RFI tag, or "".
-        name = f"{scene}_{product}_{frequency}{rfi_tag}_Flood_Bandstack_Blue_HH_{stamp}"  # Name the HH-blue output.
+        scene, product, frequency, export_date, stamp = identity  # Unpack the shared identifiers.
+        name = f"{scene}_{product}_{frequency}_Flood_Bandstack_Blue_HH_{stamp}"  # Name the HH-blue output.
         missing = {"HH", "HV"} - channels.keys()  # Determine whether either required channel is absent.
 
         if missing:  # Prevent combining incomplete groups with another date or run.
@@ -195,7 +188,7 @@ def validate_pair(hh_path: Path, hv_path: Path) -> dict[str, str]:  # Define the
     different = [field for field in IDENTITY_FIELDS if hh_info[field] != hv_info[field]]  # Compare pairing identifiers.
 
     if different:  # Reject cross-date, cross-source, or cross-run input combinations.
-        raise ValueError("HH/HV must share source, frequency, RFI tag, date, and run; differing fields: " + ", ".join(different))  # Explain mismatch.
+        raise ValueError("HH/HV must share source, frequency, date, and run; differing fields: " + ", ".join(different))  # Explain mismatch.
 
     return hh_info  # Supply the validated pair metadata to the writer.
 
@@ -269,7 +262,7 @@ def stack_pair(hh_path: Path, hv_path: Path, output_path: Path) -> None:  # Defi
                         SOURCE_PRODUCT=info["scene"],  # Preserve the source product and any acquisition identifiers.
                         SOURCE_EXPORT_DATE=info["export_date"],  # Record the common GeoTIFF export date.
                         SOURCE_EXPORT_TIMESTAMP=info["stamp"],  # Record the common processing run timestamp.
-                        PAIRING_RULE="Same source product, product type, frequency, RFI tag, export date and timestamp",  # Describe matching.
+                        PAIRING_RULE="Same source product, product type, frequency, export date and timestamp",  # Describe matching.
                         BAND_MAPPING="R=HH; G=HV; B=HH",  # Document output band order.
                         BLUE_SOURCE="HH_dB",  # Make the repeated blue-channel source explicit.
                         VALIDITY="All bands valid only where both source bands are valid",  # Describe the shared footprint.

@@ -22,7 +22,7 @@ does not resample scientific measurements.
 Input names must follow the final processed-raster convention produced by
 ``NISAR_Process.py``::
 
-    <NISAR_SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>[_RFI-<steps>]_Processed_dB_<EXPORT>.tif
+    <NISAR_SOURCE>_<GSLC|GCOV>_<FREQUENCY>_<HH|HV>_Processed_dB_<EXPORT>.tif
 
 HV is intentionally required for red/blue and HH is intentionally required for
 green.  Other polarizations, band stacks, temporary ``.part.tif`` files, and
@@ -72,7 +72,7 @@ OUTPUT_NODATA = -9999.0  # Store pixels invalid in either source as one float va
 
 PROCESSED_PATTERN = re.compile(  # Match the complete final GeoTIFF naming suffix.
     r"^(?P<scene>.+)_(?P<product>GSLC|GCOV)_(?P<frequency>frequency[^_]+)_"  # Capture source/product/frequency.
-    r"(?P<pol>HH|HV)(?P<rfi>_RFI-[A-Za-z0-9-]+)?_Processed_dB_(?P<export_stamp>\d{8}_\d{6})\.tiff?$",  # Capture polarization/export time.
+    r"(?P<pol>HH|HV)_Processed_dB_(?P<export_stamp>\d{8}_\d{6})\.tiff?$",  # Capture polarization/export time.
     re.IGNORECASE,  # Permit harmless filename case variations.
 )  # Compile the processed filename expression once at module import.
 
@@ -121,7 +121,6 @@ class SceneInfo:
     acquisition_start: datetime  # Order sources by acquisition date.
     acquisition_end: datetime  # Preserve full temporal provenance.
     export_time: datetime  # Resolve repeated exports of one acquisition.
-    rfi: str = ""  # RFI tag as written (e.g. "_RFI-notch"), or "" when no RFI step ran.
 
 
 @dataclass(frozen=True)  # Keep a discovered processing plan immutable.
@@ -209,7 +208,6 @@ def filename_info(path: Path) -> SceneInfo | None:
         acquisition_start=acquisition_start,  # Store temporal ordering timestamp.
         acquisition_end=acquisition_end,  # Store interval end for metadata.
         export_time=export_time,  # Store duplicate-resolution timestamp.
-        rfi=processed["rfi"] or "",  # Keep the optional RFI tag so differently filtered scenes are not mixed.
     )  # Finish the parsed scene record.
 
 
@@ -231,7 +229,6 @@ def group_key(info: SceneInfo) -> tuple[str, ...]:
         info.track,  # Match satellite Track.
         info.frame,  # Match Frame.
         info.direction,  # Match orbit direction.
-        info.rfi.lower(),  # Require the same RFI mitigation tag (or none).
     )  # Finish the compatibility key.
 
 
@@ -317,7 +314,7 @@ def discover_composites(
     incomplete = 0  # Count groups missing a safe HV-low/HH-high pair.
 
     for key, by_date in sorted(groups.items()):  # Resolve every group independently.
-        level, mode, source_product, product, _, track, frame, direction, _ = key  # Extract readable identity values.
+        level, mode, source_product, product, _, track, frame, direction = key  # Extract readable identity values.
         hv_dates = sorted(item_date for item_date, channels in by_date.items() if "HV" in channels)  # List HV availability.
         hh_dates = sorted(item_date for item_date, channels in by_date.items() if "HH" in channels)  # List HH availability.
 
@@ -349,7 +346,7 @@ def discover_composites(
 
         name = (  # Create a readable output stem that captures geometry and dates.
             f"NISAR_Track{track}_Frame{frame}_{direction}_{level}_{mode}_{source_product}_"  # Preserve group identity.
-            f"{product}_{low_hv.frequency}{low_hv.rfi}_HV_HH_MultiTemporal_RGB_{selected_low_date:%Y%m%d}_{selected_high_date:%Y%m%d}"  # Preserve mapping.
+            f"{product}_{low_hv.frequency}_HV_HH_MultiTemporal_RGB_{selected_low_date:%Y%m%d}_{selected_high_date:%Y%m%d}"  # Preserve mapping.
         )  # Finish output-stem construction.
 
         composites.append(Composite(name=name, low_hv=low_hv, high_hh=high_hh))  # Save the validated plan.
@@ -474,7 +471,7 @@ def stack_temporal_pair(low_hv_path: Path, high_hh_path: Path, output_path: Path
                         HIGH_HH_ACQUISITION_END=high_hh_info.acquisition_end.isoformat(),  # Record green end.
                         LOW_HV_EXPORT_TIMESTAMP=low_hv_info.export_time.isoformat(),  # Record red/blue export.
                         HIGH_HH_EXPORT_TIMESTAMP=high_hh_info.export_time.isoformat(),  # Record green export.
-                        PAIRING_RULE="Same Track, Frame, direction, level, mode, product, frequency, and RFI tag; HV low date before HH high date",  # Explain pair.
+                        PAIRING_RULE="Same Track, Frame, direction, level, mode, product, and frequency; HV low date before HH high date",  # Explain pair.
                         BAND_MAPPING="R=low/non-flood HV; G=high-flood HH; B=low/non-flood HV",  # Explain channels.
                         VALIDITY="All bands valid only where both HV and HH source pixels are valid and finite",  # Explain mask.
                     )  # Finish metadata update.
